@@ -40,6 +40,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/runtime"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/utils"
 )
 
 func main() {
@@ -54,6 +55,12 @@ func main() {
 	// Dotenv loading happens after the logger package initialized, so
 	// re-apply file-based LOG_LEVEL / LOG_PATH (mirrors cmd/desktop).
 	logger.ConfigureFromEnv()
+	// Fail closed on a malformed encryption key before anything can write
+	// secrets. An unset key is allowed (local development / desktop build);
+	// a key that is set but not decodable is a configuration error.
+	if _, err := utils.LoadAndValidateAESKey(); err != nil {
+		logger.Fatalf(context.Background(), "invalid SYSTEM_AES_KEY: %v", err)
+	}
 	// Set Gin mode
 	if os.Getenv("GIN_MODE") == "release" {
 		gin.SetMode(gin.ReleaseMode)

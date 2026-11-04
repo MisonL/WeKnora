@@ -1514,6 +1514,7 @@ export default {
       waiting: '等待中...',
       importInProgress: '导入正在进行中，请等待完成后再试',
       noFailedRecords: '暂无失败记录可下载'
+      failedEntriesExpired: '失败明细链接已过期，请重新导入以生成新的失败明细',
     }
   },
   agentEditor: {

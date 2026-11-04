@@ -8146,6 +8146,7 @@ export default {
       waiting: '待機中...',
       importInProgress: 'インポートを実行中です。完了までお待ちください',
       noFailedRecords: 'ダウンロードできる失敗レコードはありません'
+      failedEntriesExpired: 'The failed-entries link has expired. Re-import to regenerate it.',
     }
   },
   mermaid: {

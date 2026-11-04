@@ -375,7 +375,7 @@ func (s *knowledgeService) resolveFileService(ctx context.Context, kb *types.Kno
 
 	sec := tenant.StorageEngineConfig
 	baseDir := strings.TrimSpace(os.Getenv("LOCAL_STORAGE_BASE_DIR"))
-	svc, resolvedProvider, err := filesvc.NewFileServiceFromStorageConfig(provider, sec, baseDir)
+	svc, resolvedProvider, err := filesvc.NewFileServiceFromStorageConfig(provider, sec, baseDir, "tenant")
 	if err != nil {
 		logger.Errorf(ctx, "Failed to create %s file service from tenant config: %v, falling back to default", provider, err)
 		return s.fileSvc
