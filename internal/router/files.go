@@ -135,7 +135,7 @@ func resolveFileService(
 	if storageResolver != nil {
 		return storageResolver.ResolveFileService(ctx, tenant, backendID, provider, absDir)
 	}
-	return filesvc.NewFileServiceFromStorageConfig(provider, tenant.StorageEngineConfig, absDir)
+	return filesvc.NewFileServiceFromStorageConfig(provider, tenant.StorageEngineConfig, absDir, "tenant")
 }
 
 // streamStoredFile writes the shared success response of every file proxy:

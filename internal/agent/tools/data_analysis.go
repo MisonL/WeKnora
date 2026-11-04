@@ -1063,7 +1063,7 @@ func (t *DataAnalysisTool) resolveFileServiceForKnowledge(ctx context.Context, k
 	// instead of the configured path and therefore fail to locate files (#1040).
 	baseDir := t.localBaseDir
 
-	resolvedSvc, resolvedProvider, err := filesvc.NewFileServiceFromStorageConfig(provider, storageConfig, baseDir)
+	resolvedSvc, resolvedProvider, err := filesvc.NewFileServiceFromStorageConfig(provider, storageConfig, baseDir, "tenant")
 	if err != nil {
 		logger.Warnf(ctx, "[Tool][DataAnalysis][storage] create file service failed, fallback default: session_id=%s knowledge_id=%s kb_id=%s provider=%s err=%v",
 			t.sessionID, knowledge.ID, kbID, provider, err)

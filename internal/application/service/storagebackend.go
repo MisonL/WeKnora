@@ -216,7 +216,7 @@ func (s *StorageBackendService) Test(ctx context.Context, backend *types.Storage
 	c := backend.Config
 	switch backend.Provider {
 	case "local":
-		fileService, _, err := filesvc.NewFileServiceFromStorageConfig("local", backend.ToStorageEngineConfig(), "")
+		fileService, _, err := filesvc.NewFileServiceFromStorageConfig("local", backend.ToStorageEngineConfig(), "", backend.Source)
 		if err != nil {
 			return err
 		}
@@ -332,7 +332,7 @@ func (s *StorageBackendService) ResolveFileService(ctx context.Context, tenant *
 		return nil, "", err
 	}
 	if backend != nil {
-		inner, provider, err := filesvc.NewFileServiceFromStorageConfig(backend.Provider, backend.ToStorageEngineConfig(), localBaseDir)
+		inner, provider, err := filesvc.NewFileServiceFromStorageConfig(backend.Provider, backend.ToStorageEngineConfig(), localBaseDir, backend.Source)
 		if err != nil {
 			return nil, provider, err
 		}
@@ -340,11 +340,15 @@ func (s *StorageBackendService) ResolveFileService(ctx context.Context, tenant *
 		return filesvc.NewResourceCatalogFileService(scoped, s.resourceCatalog), provider, nil
 	}
 	sec := tenant.StorageEngineConfig
+	// Workspace config is untrusted; only a config that came from the
+	// environment snapshot may carry role credentials.
+	source := "tenant"
 	if strings.TrimSpace(provider) == "" && storageEngineDefaultProvider(sec) == "" {
 		if env := types.StorageBackendFromEnvironment(tenant.ID); env != nil {
 			provider = env.Provider
 			if sec == nil {
 				sec = env.ToStorageEngineConfig()
+				source = types.StorageBackendSourceEnv
 			}
 		}
 	}
@@ -352,6 +356,7 @@ func (s *StorageBackendService) ResolveFileService(ctx context.Context, tenant *
 		provider,
 		sec,
 		localBaseDir,
+		source,
 	)
 	if err != nil {
 		return nil, resolvedProvider, err

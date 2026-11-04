@@ -13,10 +13,15 @@ import (
 // NewFileServiceFromStorageConfig builds a provider-specific FileService from tenant storage config.
 // provider can be empty; in that case it falls back to sec.DefaultProvider.
 // Returns the resolved provider name together with the service.
+// source identifies where sec came from. Only the process-wide environment
+// backend (types.StorageBackendSourceEnv) may carry RAM role credentials;
+// anything else is rejected so a workspace administrator cannot inject an
+// environment-scoped identity through tenant configuration.
 func NewFileServiceFromStorageConfig(
 	provider string,
 	sec *types.StorageEngineConfig,
 	localBaseDir string,
+	source string,
 ) (interfaces.FileService, string, error) {
 	p := strings.ToLower(strings.TrimSpace(provider))
 	if p == "" && sec != nil {
@@ -138,27 +143,39 @@ func NewFileServiceFromStorageConfig(
 		return svc, p, err
 
 	case "oss":
-		if sec == nil || sec.OSS == nil || sec.OSS.Endpoint == "" || sec.OSS.Region == "" || sec.OSS.AccessKey == "" || sec.OSS.SecretKey == "" || sec.OSS.BucketName == "" {
+		if sec == nil || sec.OSS == nil || sec.OSS.Endpoint == "" || sec.OSS.Region == "" || sec.OSS.BucketName == "" {
+			return nil, p, fmt.Errorf("incomplete oss config")
+		}
+		authType := types.NormalizeOSSAuthType(sec.OSS.AuthType)
+		if authType == types.OSSAuthTypeRAMRoleARN && source != types.StorageBackendSourceEnv {
+			return nil, p, fmt.Errorf("oss ram_role_arn is only allowed on the environment storage backend")
+		}
+		if sec.OSS.AccessKey == "" || sec.OSS.SecretKey == "" {
 			return nil, p, fmt.Errorf("incomplete oss config")
 		}
 		pathPrefix := strings.TrimSpace(sec.OSS.PathPrefix)
 		if pathPrefix == "" {
 			pathPrefix = "weknora/"
 		}
-		var svc interfaces.FileService
-		var err error
-		if sec.OSS.UseTempBucket && sec.OSS.TempBucketName != "" {
-			svc, err = NewOssFileServiceWithTempBucket(
-				sec.OSS.Endpoint, sec.OSS.Region, sec.OSS.AccessKey, sec.OSS.SecretKey,
-				sec.OSS.BucketName, pathPrefix,
-				sec.OSS.TempBucketName, sec.OSS.TempRegion,
-			)
-		} else {
-			svc, err = NewOssFileService(
-				sec.OSS.Endpoint, sec.OSS.Region, sec.OSS.AccessKey, sec.OSS.SecretKey,
-				sec.OSS.BucketName, pathPrefix,
-			)
-		}
+		svc, err := NewOssFileServiceWithAuthConfig(OSSAuthConfig{
+			Endpoint:     sec.OSS.Endpoint,
+			Region:       sec.OSS.Region,
+			AccessKey:    sec.OSS.AccessKey,
+			SecretKey:    sec.OSS.SecretKey,
+			BucketName:   sec.OSS.BucketName,
+			PathPrefix:   pathPrefix,
+			TempBucket:   sec.OSS.TempBucketName,
+			TempRegion:   sec.OSS.TempRegion,
+			AuthType:     authType,
+			RoleARN:      sec.OSS.RoleARN,
+			SessionName:  sec.OSS.RoleSessionName,
+			STSEndpoint:  sec.OSS.STSEndpoint,
+			Policy:       sec.OSS.Policy,
+			ExternalID:   sec.OSS.ExternalID,
+			Expiration:   sec.OSS.RoleSessionExpiration,
+			PresignTTL:   sec.OSS.PresignTTLSeconds,
+			EnsureBucket: authType != types.OSSAuthTypeRAMRoleARN,
+		})
 		return svc, p, err
 
 	case "ks3":
