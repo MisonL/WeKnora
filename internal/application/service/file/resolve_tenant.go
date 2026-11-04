@@ -27,6 +27,13 @@ func ResolveTenantFileServiceWithFallback(
 	globalFileService interfaces.FileService,
 ) (fileSvc interfaces.FileService, resolvedProvider string, ok bool) {
 	var err error
+	if tenant == nil {
+		// Callers normally load the tenant before resolving; a nil tenant here
+		// means the request has no workspace context at all, so neither a
+		// tenant-scoped nor a global fallback is safe.
+		logger.Warnf(ctx, "[Router] %s resolve file service with nil tenant", logTag)
+		return nil, "", false
+	}
 	if storageResolver != nil {
 		fileSvc, resolvedProvider, err = storageResolver.ResolveFileService(ctx, tenant, backendID, provider, absDir)
 	} else if tenant.StorageEngineConfig != nil {

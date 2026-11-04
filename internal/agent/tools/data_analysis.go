@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1041,6 +1042,13 @@ func (t *DataAnalysisTool) resolveFileServiceForKnowledge(ctx context.Context, k
 	baseDir := t.localBaseDir
 
 	resolvedSvc, resolvedProvider, err := filesvc.NewFileServiceFromStorageConfig(provider, storageConfig, baseDir, "tenant")
+	if errors.Is(err, filesvc.ErrStorageRoleNotAllowed) {
+		// Never fall back to the process-global service for a rejected role
+		// config: that would substitute a different identity.
+		logger.Warnf(ctx, "[Tool][DataAnalysis][storage] reject role credentials in tenant storage config: session_id=%s knowledge_id=%s kb_id=%s provider=%s",
+			t.sessionID, knowledge.ID, kbID, provider)
+		return filesvc.NewRejectedFileService(err)
+	}
 	if err != nil {
 		logger.Warnf(ctx, "[Tool][DataAnalysis][storage] create file service failed, fallback default: session_id=%s knowledge_id=%s kb_id=%s provider=%s err=%v",
 			t.sessionID, knowledge.ID, kbID, provider, err)

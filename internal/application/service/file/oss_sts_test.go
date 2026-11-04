@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
 	credproviders "github.com/aliyun/credentials-go/credentials/providers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -88,4 +89,79 @@ func TestOssStsProviderConcurrentRefreshIsSingleFlight(t *testing.T) {
 	}
 	wg.Wait()
 	assert.EqualValues(t, 1, src.calls.Load(), "concurrent callers must share one STS call")
+}
+
+type panicSTSSource struct{}
+
+func (panicSTSSource) GetCredentials() (*credproviders.Credentials, error) {
+	panic("boom")
+}
+
+func TestOssStsProviderRecoversFromSourcePanic(t *testing.T) {
+	p := &ossStsProvider{src: panicSTSSource{}, ttl: time.Hour}
+
+	_, err := p.GetCredentials(context.Background())
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "boom", "internal panic details must not leak")
+
+	// A panic must not leave the provider stuck in the refreshing state.
+	p.mu.Lock()
+	refreshing := p.refreshing
+	p.mu.Unlock()
+	assert.False(t, refreshing)
+}
+
+type blockingSTSSource struct {
+	entered chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (b *blockingSTSSource) GetCredentials() (*credproviders.Credentials, error) {
+	b.calls.Add(1)
+	close(b.entered)
+	<-b.release
+	return &credproviders.Credentials{AccessKeyId: "STS.new", AccessKeySecret: "secret", SecurityToken: "token"}, nil
+}
+
+func TestOssStsProviderDoesNotBlockWaitersWithValidCredentials(t *testing.T) {
+	src := &blockingSTSSource{entered: make(chan struct{}), release: make(chan struct{})}
+	p := &ossStsProvider{src: src, ttl: time.Hour}
+	p.cached = credentials.Credentials{AccessKeyID: "STS.old", AccessKeySecret: "secret", SecurityToken: "old"}
+	p.expiresAt = time.Now().Add(30 * time.Second) // inside the refresh margin, still valid
+
+	// Start the refresh in the background; it blocks inside GetCredentials.
+	go func() { _, _ = p.GetCredentials(context.Background()) }()
+	<-src.entered
+
+	// A concurrent request must return the still-valid credential immediately
+	// instead of waiting for the slow STS call.
+	done := make(chan struct{})
+	var creds credentials.Credentials
+	go func() {
+		creds, _ = p.GetCredentials(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+		assert.Equal(t, "STS.old", creds.AccessKeyID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter blocked although valid credentials existed")
+	}
+	close(src.release)
+}
+
+func TestOssStsProviderBacksOffAfterFailure(t *testing.T) {
+	src := &fakeSTSSource{err: errors.New("sts down")}
+	p := &ossStsProvider{src: src, ttl: time.Hour}
+
+	_, err := p.GetCredentials(context.Background())
+	require.Error(t, err)
+	require.EqualValues(t, 1, src.calls.Load())
+
+	// The next call inside the backoff window must fail fast, without another
+	// STS request.
+	_, err = p.GetCredentials(context.Background())
+	require.Error(t, err)
+	assert.EqualValues(t, 1, src.calls.Load(), "backoff must suppress repeated STS calls")
 }

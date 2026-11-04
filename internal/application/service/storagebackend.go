@@ -238,7 +238,20 @@ func (s *StorageBackendService) Test(ctx context.Context, backend *types.Storage
 	case "s3":
 		return filesvc.CheckS3ConnectivityWithOptions(ctx, c.Endpoint, c.AccessKeyID, c.SecretAccessKey, c.BucketName, c.Region, c.ForcePathStyle)
 	case "oss":
-		return filesvc.CheckOssConnectivity(ctx, c.Endpoint, c.Region, c.AccessKeyID, c.SecretAccessKey, c.BucketName)
+		return filesvc.CheckOssConnectivityWithConfig(ctx, filesvc.OSSAuthConfig{
+			Endpoint:    c.Endpoint,
+			Region:      c.Region,
+			AccessKey:   c.AccessKeyID,
+			SecretKey:   c.SecretAccessKey,
+			BucketName:  c.BucketName,
+			AuthType:    types.NormalizeOSSAuthType(c.AuthType),
+			RoleARN:     c.RoleARN,
+			SessionName: c.RoleSessionName,
+			STSEndpoint: c.STSEndpoint,
+			Policy:      c.Policy,
+			ExternalID:  c.ExternalID,
+			Expiration:  c.RoleSessionExpiration,
+		})
 	case "ks3":
 		return filesvc.CheckKS3Connectivity(ctx, c.Endpoint, c.Region, c.AccessKeyID, c.SecretAccessKey, c.BucketName)
 	case "obs":

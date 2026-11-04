@@ -76,6 +76,17 @@ func (b *StorageBackend) Validate() error {
 	if b.Status != StorageBackendStatusActive && b.Status != StorageBackendStatusDisabled {
 		return errors.NewValidationError("status must be active or disabled")
 	}
+	// Only the two known origins are accepted. This keeps a request from
+	// claiming an unrecognized source that a downstream gate might treat
+	// loosely; role credentials are only ever allowed for "env".
+	if b.Source == "" {
+		b.Source = StorageBackendSourceUser
+	}
+	switch b.Source {
+	case StorageBackendSourceUser, StorageBackendSourceEnv:
+	default:
+		return errors.NewValidationError(fmt.Sprintf("unsupported storage backend source: %q", b.Source))
+	}
 	return b.Config.ValidateForProvider(b.Provider)
 }
 

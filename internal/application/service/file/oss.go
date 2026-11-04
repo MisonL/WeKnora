@@ -133,7 +133,7 @@ func NewOssFileServiceWithAuthConfig(cfg OSSAuthConfig) (interfaces.FileService,
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize OSS temp client: %w", err)
 		}
-		if cfg.AuthType == ossAuthTypeRAMRoleARN {
+		if cfg.AuthType == ossAuthTypeRAMRoleARN || !cfg.EnsureBucket {
 			if err := ossEnsureBucketReadOnly(tempClient, cfg.TempBucket); err != nil {
 				return nil, err
 			}
@@ -225,6 +225,18 @@ func parseOssFilePath(filePath string) (bucketName string, objectKey string, err
 func (s *ossFileService) CheckConnectivity(ctx context.Context) error {
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+
+	if s.roleScoped {
+		// GetBucketAcl is not granted for role credentials; use ListObjectsV2
+		// so a missing or inaccessible bucket surfaces as an error.
+		if _, err := s.client.ListObjectsV2(checkCtx, &oss.ListObjectsV2Request{
+			Bucket:  oss.Ptr(s.bucketName),
+			MaxKeys: 1,
+		}); err != nil {
+			return fmt.Errorf("failed to access OSS bucket %q: %w", s.bucketName, err)
+		}
+		return nil
+	}
 
 	exists, err := s.client.IsBucketExist(checkCtx, s.bucketName)
 	if err != nil {
