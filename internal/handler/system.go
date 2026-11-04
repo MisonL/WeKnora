@@ -1157,8 +1157,22 @@ func (h *SystemHandler) checkOSS(c *gin.Context, ctx context.Context, cfg *types
 		c.JSON(200, gin.H{"code": 0, "data": StorageCheckResponse{OK: false, Message: "Bucket 名称格式不正确，仅允许字母、数字、点、连字符"}})
 		return
 	}
+	// RAM role credentials are only allowed on the process-wide environment
+	// backend. This endpoint is reachable by workspace admins, so it must never
+	// act as an STS probe for tenant-supplied role configuration.
+	if types.NormalizeOSSAuthType(cfg.AuthType) == types.OSSAuthTypeRAMRoleARN {
+		c.JSON(200, gin.H{"code": 0, "data": StorageCheckResponse{OK: false, Message: "RAM 角色模式仅支持通过服务端环境变量配置，无法在此检测"}})
+		return
+	}
 
-	err := file.CheckOssConnectivity(ctx, endpoint, cfg.Region, accessKey, secretKey, cfg.BucketName)
+	err := file.CheckOssConnectivityWithConfig(ctx, file.OSSAuthConfig{
+		Endpoint:   endpoint,
+		Region:     cfg.Region,
+		AccessKey:  accessKey,
+		SecretKey:  secretKey,
+		BucketName: cfg.BucketName,
+		AuthType:   types.OSSAuthTypeAccessKey,
+	})
 	if err != nil {
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "AccessDenied") {
