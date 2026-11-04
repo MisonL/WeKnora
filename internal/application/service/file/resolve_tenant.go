@@ -2,6 +2,7 @@ package file
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"strings"
@@ -35,6 +36,14 @@ func ResolveTenantFileServiceWithFallback(
 	}
 	if err == nil {
 		return fileSvc, resolvedProvider, true
+	}
+	if errors.Is(err, ErrStorageRoleNotAllowed) {
+		// Never fall back to the global identity for a rejected role config:
+		// the global service would either use long-lived static credentials or
+		// belong to a different scope than the caller asked for.
+		logger.Warnf(ctx, "[Router] %s refusing global fallback for rejected role config: tenant_id=%d provider=%s",
+			logTag, tenant.ID, provider)
+		return nil, "", false
 	}
 
 	globalStorageType := strings.ToLower(strings.TrimSpace(os.Getenv("STORAGE_TYPE")))

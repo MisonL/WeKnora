@@ -1,6 +1,7 @@
 package file
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -17,6 +18,12 @@ import (
 // backend (types.StorageBackendSourceEnv) may carry RAM role credentials;
 // anything else is rejected so a workspace administrator cannot inject an
 // environment-scoped identity through tenant configuration.
+// ErrStorageRoleNotAllowed marks a rejection based on the config source, not
+// on the config contents. Callers must not fall back to a process-global file
+// service when they see this error: doing so would substitute a different
+// identity (and, in role deployments, static long-lived credentials).
+var ErrStorageRoleNotAllowed = errors.New("storage role credentials are not allowed for workspace configuration")
+
 func NewFileServiceFromStorageConfig(
 	provider string,
 	sec *types.StorageEngineConfig,
@@ -148,7 +155,7 @@ func NewFileServiceFromStorageConfig(
 		}
 		authType := types.NormalizeOSSAuthType(sec.OSS.AuthType)
 		if authType == types.OSSAuthTypeRAMRoleARN && source != types.StorageBackendSourceEnv {
-			return nil, p, fmt.Errorf("oss ram_role_arn is only allowed on the environment storage backend")
+			return nil, p, fmt.Errorf("%w: oss ram_role_arn is only allowed on the environment storage backend", ErrStorageRoleNotAllowed)
 		}
 		if sec.OSS.AccessKey == "" || sec.OSS.SecretKey == "" {
 			return nil, p, fmt.Errorf("incomplete oss config")
