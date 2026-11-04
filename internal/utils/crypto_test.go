@@ -157,3 +157,53 @@ func TestGetAESKey(t *testing.T) {
 		assert.Nil(t, key)
 	})
 }
+
+func TestParseAESKey(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantLen int
+		wantErr bool
+	}{
+		{"unset", "", 0, false},
+		{"exact 32 bytes", "0123456789abcdef0123456789abcdef", 32, false},
+		{"32-character hex stays raw", "0123456789abcdef0123456789abcdef", 32, false},
+		{"64-character hex decodes", strings.Repeat("ab", 32), 32, false},
+		{"base64 of 32 bytes", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", 32, false},
+		{"too short", "short", 0, true},
+		{"too long", strings.Repeat("x", 65), 0, true},
+		{"64 non-hex characters", strings.Repeat("z", 64), 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			key, err := parseAESKey(tc.raw)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Len(t, key, tc.wantLen)
+		})
+	}
+}
+
+func TestLoadAndValidateAESKey(t *testing.T) {
+	t.Setenv("SYSTEM_AES_KEY", "")
+	key, err := LoadAndValidateAESKey()
+	require.NoError(t, err)
+	assert.Nil(t, key)
+
+	t.Setenv("SYSTEM_AES_KEY", "invalid")
+	_, err = LoadAndValidateAESKey()
+	require.Error(t, err)
+
+	// A 64-character hex value (openssl rand -hex 32) must be accepted.
+	t.Setenv("SYSTEM_AES_KEY", strings.Repeat("ab", 32))
+	key, err = LoadAndValidateAESKey()
+	require.NoError(t, err)
+	assert.Len(t, key, 32)
+
+	// GetAESKey must agree with validation, so the runtime and startup paths
+	// cannot diverge.
+	assert.Len(t, GetAESKey(), 32)
+}

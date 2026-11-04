@@ -5,7 +5,9 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -14,14 +16,52 @@ import (
 // EncPrefix marks a string as AES-256-GCM encrypted
 const EncPrefix = "enc:v1:"
 
-// GetAESKey reads the 32-byte AES key from SYSTEM_AES_KEY env.
-// Returns nil if not set or not exactly 32 bytes.
+// GetAESKey reads the 32-byte AES key from SYSTEM_AES_KEY.
+// Returns nil if unset or if the value cannot be decoded into exactly 32 bytes.
 func GetAESKey() []byte {
-	key := []byte(os.Getenv("SYSTEM_AES_KEY"))
-	if len(key) == 32 {
-		return key
+	key, err := parseAESKey(os.Getenv("SYSTEM_AES_KEY"))
+	if err != nil {
+		return nil
 	}
-	return nil
+	return key
+}
+
+// LoadAndValidateAESKey validates SYSTEM_AES_KEY for the startup fail-closed
+// check. An unset key returns (nil, nil) because local development and the
+// desktop build intentionally run without encryption. A key that is set but
+// cannot be decoded into 32 bytes is an error: starting anyway would silently
+// persist every secret in plaintext.
+func LoadAndValidateAESKey() ([]byte, error) {
+	return parseAESKey(os.Getenv("SYSTEM_AES_KEY"))
+}
+
+// parseAESKey accepts, in order:
+//  1. exactly 32 raw bytes (this must win: a 32-character hex string is a
+//     valid raw key and must not be decoded);
+//  2. 64 hex characters decoding to 32 bytes (the openssl rand -hex 32 shape);
+//  3. standard or unpadded base64 decoding to 32 bytes.
+//
+// A 64-character hex string is also syntactically valid base64, but it decodes
+// to 48 bytes, so trying hex first is unambiguous.
+func parseAESKey(raw string) ([]byte, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	if len(raw) == 32 {
+		return []byte(raw), nil
+	}
+	if len(raw) == 64 {
+		if decoded, err := hex.DecodeString(raw); err == nil && len(decoded) == 32 {
+			return decoded, nil
+		}
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(raw); err == nil && len(decoded) == 32 {
+		return decoded, nil
+	}
+	if decoded, err := base64.RawStdEncoding.DecodeString(raw); err == nil && len(decoded) == 32 {
+		return decoded, nil
+	}
+	return nil, fmt.Errorf("SYSTEM_AES_KEY must be 32 raw bytes, 64 hex characters, or base64 of 32 bytes (got %d characters)", len(raw))
 }
 
 // EncryptAESGCM encrypts plaintext with AES-256-GCM.
