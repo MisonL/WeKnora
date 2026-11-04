@@ -8358,7 +8358,7 @@ export default {
       importFailed: 'Import Failed',
       waiting: 'Waiting...',
       importInProgress: 'Import is in progress, please wait for it to complete',
-      noFailedRecords: 'No failed records available for download'
+      noFailedRecords: 'No failed records available for download',
       failedEntriesExpired: 'The failed-entries link has expired. Re-import to regenerate it.',
     }
   },
