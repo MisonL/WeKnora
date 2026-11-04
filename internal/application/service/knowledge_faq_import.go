@@ -307,14 +307,13 @@ func (s *knowledgeService) generateFailedEntriesCSV(ctx context.Context,
 		return "", fmt.Errorf("failed to save CSV file: %w", err)
 	}
 
-	// 获取下载 URL
-	fileURL, err := s.fileSvc.GetFileURL(ctx, filePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to get file URL: %w", err)
-	}
-
-	logger.Infof(ctx, "Generated failed entries CSV: %s, entries: %d", fileURL, len(failedEntries))
-	return fileURL, nil
+	// Return the object path, not a presigned URL. A presigned URL embeds the
+	// STS security token, is written to logs and persisted in the knowledge
+	// JSON column, and expires (at most the token TTL) with no way to re-sign
+	// later. The frontend downloads through the authenticated /files proxy,
+	// which resolves the current storage backend on every request.
+	logger.Infof(ctx, "Generated failed entries CSV at object path: %s, entries: %d", filePath, len(failedEntries))
+	return filePath, nil
 }
 
 // csvEscape 转义 CSV 字段
