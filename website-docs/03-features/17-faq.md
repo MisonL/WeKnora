@@ -65,7 +65,7 @@ flowchart TB
     K --> L["GET /faq/import/progress/:task_id 轮询 FAQImportProgress"]
 ```
 
-进度对象 `FAQImportProgress` 的统计字段：`success_count` / `failed_count` / `partial_failed_count`（相似问或反例被剔除但条目仍导入）/ `skipped_count`（重复跳过）/ `merged_count` / `added_count`、`failed_entries[]`（含失败原因与原始内容）与 `failed_entries_url`、`import_mode`、`processing_time`；任务状态 `pending → processing → completed / failed`。
+进度对象 `FAQImportProgress` 的统计字段：`success_count` / `failed_count` / `partial_failed_count`（相似问或反例被剔除但条目仍导入）/ `skipped_count`（重复跳过）/ `merged_count` / `added_count`、`failed_entries[]`（含失败原因与原始内容）与 `failed_entries_url`（存储对象路径，须经 `/files` 鉴权代理下载）、`import_mode`、`processing_time`；任务状态 `pending → processing → completed / failed`。
 
 导出支持两种格式：CSV（列：分类、问题、相似问题、反例问题、机器人回答、是否全部回复、是否停用、是否禁止被推荐；含 BOM 保证 Excel UTF-8 兼容）与 JSON（`FAQExportEntry`，与导入 payload 兼容，支持"导出 → 编辑 → 重新导入"闭环）。
 
