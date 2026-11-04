@@ -1562,7 +1562,15 @@ func (h *TenantHandler) updateTenantStorageEngineConfigInternal(c *gin.Context) 
 		c.Error(errors.NewBadRequestError("Workspace is empty"))
 		return
 	}
+	if err := cfg.OSS.ValidateForTenantWrite(); err != nil {
+		c.Error(errors.NewValidationError("oss config rejected").WithDetails(err.Error()))
+		return
+	}
 	merged := types.MergeStorageEngineConfigForUpdate(&cfg, tenant.StorageEngineConfig)
+	if err := merged.OSS.ValidateForTenantWrite(); err != nil {
+		c.Error(errors.NewValidationError("oss config rejected").WithDetails(err.Error()))
+		return
+	}
 	tenant.StorageEngineConfig = merged
 	updatedTenant, err := h.service.UpdateTenant(ctx, tenant)
 	if err != nil {

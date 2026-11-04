@@ -166,6 +166,12 @@ func (s *tenantService) UpdateTenant(ctx context.Context, tenant *types.Tenant) 
 
 	logger.Infof(ctx, "Updating tenant, ID: %d, name: %s", tenant.ID, tenant.Name)
 
+	if tenant.StorageEngineConfig != nil && tenant.StorageEngineConfig.OSS != nil {
+		if err := tenant.StorageEngineConfig.OSS.ValidateForTenantWrite(); err != nil {
+			logger.ErrorWithFields(ctx, err, map[string]interface{}{"tenant_id": tenant.ID})
+			return nil, err
+		}
+	}
 	if err := s.validateStorageBucketUniqueness(ctx, tenant); err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"tenant_id": tenant.ID,

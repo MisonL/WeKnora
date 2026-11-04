@@ -1266,9 +1266,18 @@ func migrateLegacyStorageBackends(db *gorm.DB) {
 				// later gains an explicit legacy config, promote the alias to user
 				// source and stop automatic refreshes.
 				if existing.Source == types.StorageBackendSourceEnv {
-					desired := types.StorageBackendFromLegacy(tenant.ID, provider, legacy)
-					if desired == nil && provider == defaultProvider {
+					// Role-backed environment rows are always recomputed from the
+					// environment. FromLegacy never carries role fields, so letting a
+					// workspace legacy config win here would silently downgrade the
+					// row to static credentials and drop the STS identity.
+					var desired *types.StorageBackend
+					if types.NormalizeOSSAuthType(existing.Config.AuthType) == types.OSSAuthTypeRAMRoleARN {
 						desired = types.StorageBackendFromEnvironment(tenant.ID)
+					} else {
+						desired = types.StorageBackendFromLegacy(tenant.ID, provider, legacy)
+						if desired == nil && provider == defaultProvider {
+							desired = types.StorageBackendFromEnvironment(tenant.ID)
+						}
 					}
 					if desired != nil && desired.Provider == provider {
 						_ = db.Model(&types.StorageBackend{}).
