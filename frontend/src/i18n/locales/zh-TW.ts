@@ -1513,7 +1513,8 @@ export default {
       importFailed: '匯入失敗',
       waiting: '等待中...',
       importInProgress: '匯入正在進行中，請等待完成後再試',
-      noFailedRecords: '暫無失敗記錄可下載'
+      noFailedRecords: '暫無失敗記錄可下載',
+      failedEntriesExpired: '失敗明細連結已過期，請重新匯入以產生新的失敗明細',
     }
   },
   agentEditor: {
