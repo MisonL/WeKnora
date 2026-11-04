@@ -30389,7 +30389,7 @@ const docTemplate = `{
                     }
                 },
                 "failed_entries_url": {
-                    "description": "失败条目CSV下载URL（大量时返回URL）",
+                    "description": "失败条目CSV的对象存储路径（大量时返回）；需走 /files 鉴权代理下载",
                     "type": "string"
                 },
                 "import_mode": {
