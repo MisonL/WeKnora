@@ -252,6 +252,9 @@ func (s *ossFileService) CheckConnectivity(ctx context.Context) error {
 func (s *ossFileService) SaveFile(ctx context.Context,
 	file *multipart.FileHeader, tenantID uint64, knowledgeID string,
 ) (string, error) {
+	if file == nil {
+		return "", errors.New("file header is nil")
+	}
 	ext := filepath.Ext(file.Filename)
 	objectName := fmt.Sprintf("%s%d/%s/%s%s", s.pathPrefix, tenantID, knowledgeID, uuid.New().String(), ext)
 
