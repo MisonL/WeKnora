@@ -500,7 +500,11 @@ func (c *ParserEngineConfig) Value() (driver.Value, error) {
 	if c == nil {
 		return nil, nil
 	}
-	return json.Marshal(c)
+	cp := *c
+	if err := encryptParserEngineCredentials(&cp); err != nil {
+		return nil, err
+	}
+	return json.Marshal(cp)
 }
 
 // Scan implements the sql.Scanner interface for ParserEngineConfig
@@ -512,7 +516,11 @@ func (c *ParserEngineConfig) Scan(value interface{}) error {
 	if !ok {
 		return nil
 	}
-	return json.Unmarshal(b, c)
+	if err := json.Unmarshal(b, c); err != nil {
+		return err
+	}
+	decryptParserEngineCredentials(c)
+	return nil
 }
 
 // StorageEngineConfig holds tenant-level storage engine parameters for Local, MinIO, COS, TOS, S3, OSS, KS3, and OBS.
@@ -648,7 +656,11 @@ func (c *StorageEngineConfig) Value() (driver.Value, error) {
 	if c == nil {
 		return nil, nil
 	}
-	return json.Marshal(c)
+	cp := *c
+	if err := encryptStorageEngineCredentials(&cp); err != nil {
+		return nil, err
+	}
+	return json.Marshal(cp)
 }
 
 // Scan implements the sql.Scanner interface for StorageEngineConfig
@@ -660,7 +672,11 @@ func (c *StorageEngineConfig) Scan(value interface{}) error {
 	if !ok {
 		return nil
 	}
-	return json.Unmarshal(b, c)
+	if err := json.Unmarshal(b, c); err != nil {
+		return err
+	}
+	decryptStorageEngineCredentials(c)
+	return nil
 }
 
 // TenantSandboxConfig is one named sandbox backend a workspace maintains.
