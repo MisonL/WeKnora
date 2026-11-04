@@ -190,3 +190,51 @@ func TestOssStsProviderBackoffStillServesValidCredentials(t *testing.T) {
 	require.NoError(t, err, "backoff must not hide still-valid credentials")
 	assert.Equal(t, "STS.test", creds.AccessKeyID)
 }
+
+func TestOssStsProviderTreatsNilCredentialsAsFailure(t *testing.T) {
+	src := &nilSTSSource{}
+	p := &ossStsProvider{src: src, ttl: time.Hour}
+
+	_, err := p.GetCredentials(context.Background())
+	require.Error(t, err, "nil credentials with nil error must not be cached")
+	assert.Empty(t, p.cached.AccessKeyID)
+}
+
+type nilSTSSource struct{}
+
+func (nilSTSSource) GetCredentials() (*credproviders.Credentials, error) { return nil, nil }
+
+func TestOssStsProviderCancelledCallerDoesNotLeakRefreshSlot(t *testing.T) {
+	src := &blockingSTSSource{entered: make(chan struct{}), release: make(chan struct{})}
+	p := &ossStsProvider{src: src, ttl: time.Hour}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_, _ = p.GetCredentials(ctx)
+		close(done)
+	}()
+	<-src.entered
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled caller kept blocking on the STS fetch")
+	}
+
+	// The in-flight fetch still completes in the background and publishes its
+	// result, so the next call is served from the cache with no extra STS call.
+	close(src.release)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		creds, err := p.GetCredentials(context.Background())
+		if err == nil && creds.AccessKeyID == "STS.new" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background refresh did not publish credentials: err=%v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.EqualValues(t, 1, src.calls.Load(), "the background completion must reuse the single fetch")
+}
