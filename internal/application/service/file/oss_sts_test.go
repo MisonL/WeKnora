@@ -165,3 +165,28 @@ func TestOssStsProviderBacksOffAfterFailure(t *testing.T) {
 	require.Error(t, err)
 	assert.EqualValues(t, 1, src.calls.Load(), "backoff must suppress repeated STS calls")
 }
+
+func TestOssStsProviderBackoffStillServesValidCredentials(t *testing.T) {
+	src := &fakeSTSSource{}
+	p := &ossStsProvider{src: src, ttl: time.Hour}
+
+	_, err := p.GetCredentials(context.Background())
+	require.NoError(t, err)
+
+	// Move into the refresh margin so the next call attempts a refresh, then
+	// make the source fail: the still-valid cached credential must be served.
+	p.mu.Lock()
+	p.expiresAt = time.Now().Add(30 * time.Second)
+	p.mu.Unlock()
+	src.err = errors.New("sts down")
+
+	creds, err := p.GetCredentials(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "STS.test", creds.AccessKeyID)
+
+	// The failed refresh armed the backoff. A later call must still return the
+	// valid cached credential rather than failing fast.
+	creds, err = p.GetCredentials(context.Background())
+	require.NoError(t, err, "backoff must not hide still-valid credentials")
+	assert.Equal(t, "STS.test", creds.AccessKeyID)
+}

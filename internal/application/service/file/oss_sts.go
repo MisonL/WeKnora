@@ -164,7 +164,13 @@ func (p *ossStsProvider) GetCredentials(ctx context.Context) (credentials.Creden
 		return credentials.Credentials{}, p.unavailableLocked()
 	}
 	if !p.retryAfter.IsZero() && time.Now().Before(p.retryAfter) {
-		// A recent refresh failed; fail fast instead of hammering STS.
+		// A recent refresh failed. Keep serving still-valid credentials;
+		// otherwise fail fast instead of hammering STS.
+		if p.validLocked(0) {
+			creds := p.cached
+			p.mu.Unlock()
+			return creds, nil
+		}
 		err := p.unavailableLocked()
 		p.mu.Unlock()
 		return credentials.Credentials{}, err
