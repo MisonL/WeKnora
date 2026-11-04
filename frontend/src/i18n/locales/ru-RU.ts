@@ -1591,7 +1591,7 @@ export default {
       waiting: 'Ожидание...',
       importInProgress: 'Импорт выполняется, дождитесь завершения',
       noFailedRecords: 'Нет записей с ошибками для скачивания',
-      failedEntriesExpired: 'The failed-entries link has expired. Re-import to regenerate it.',
+      failedEntriesExpired: 'Срок действия ссылки на список ошибок истёк. Повторите импорт, чтобы создать новую ссылку.',
     }
   },
   agentEditor: {

@@ -443,7 +443,7 @@ type FAQImportProgress struct {
 	PartialFailedCount int                 `json:"partial_failed_count,omitempty"` // 部分失败的条目数（相似问/反例被移除）
 	SkippedCount       int                 `json:"skipped_count,omitempty"`        // 跳过的条目数（如重复等）
 	FailedEntries      []FAQFailedEntry    `json:"failed_entries,omitempty"`       // 失败条目详情（少量时直接返回）
-	FailedEntriesURL   string              `json:"failed_entries_url,omitempty"`   // 失败条目CSV下载URL（大量时返回URL）
+	FailedEntriesURL   string              `json:"failed_entries_url,omitempty"`   // 失败条目CSV的对象存储路径（大量时返回）；需走 /files 鉴权代理下载
 	SuccessEntries     []FAQSuccessEntry   `json:"success_entries,omitempty"`      // 成功条目简单信息（少量时直接返回）
 	ValidEntryIndices  []int               `json:"valid_entry_indices,omitempty"`  // 验证通过的条目索引（用于重试时跳过验证）
 	MergeEntryIndices  []int               `json:"merge_entry_indices,omitempty"`  // 需要合并的条目索引（内部使用，用于重试时跳过识别）
@@ -488,8 +488,8 @@ type FAQImportResult struct {
 	ImportedAt time.Time `json:"imported_at"` // 导入完成时间
 	TaskID     string    `json:"task_id"`     // 导入任务ID
 
-	// 失败详情URL（失败条目较多时提供下载链接）
-	FailedEntriesURL string `json:"failed_entries_url,omitempty"` // 失败条目CSV下载URL
+	// 失败详情对象路径（失败条目较多时提供下载）
+	FailedEntriesURL string `json:"failed_entries_url,omitempty"` // 失败条目CSV的对象存储路径；需走 /files 鉴权代理下载
 
 	// 显示控制
 	DisplayStatus string `json:"display_status"` // 显示状态：open 或 close
