@@ -77,6 +77,14 @@ func ValidateOSSRoleAuth(roleARN, sessionName, stsEndpoint, policy string, expir
 	return nil
 }
 
+// OSSRoleExternalIDFromEnv returns the configured ExternalId, accepting the
+// newer OSS_EXTERNAL_ID name and the earlier OSS_ROLE_EXTERNAL_ID spelling.
+// Both environment and tenant-derived storage configs call this so they never
+// disagree about which value is in effect.
+func OSSRoleExternalIDFromEnv() string {
+	return firstNonEmpty(os.Getenv("OSS_EXTERNAL_ID"), os.Getenv("OSS_ROLE_EXTERNAL_ID"))
+}
+
 // envInt parses an optional integer environment value, returning 0 when unset
 // or malformed (validation happens later against the effective value).
 func envInt(name string) int {
