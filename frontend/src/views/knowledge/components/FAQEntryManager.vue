@@ -2302,14 +2302,21 @@ const downloadFailedEntries = async () => {
   }
   const request = buildProtectedFileRequest(raw, { mode: 'tenant' })
   if (!request) {
-    window.open(raw, '_blank', 'noopener')
+    // A non-provider value (e.g. a pre-migration presigned URL) is opened
+    // directly, but only for http(s) targets; anything else (javascript:,
+    // data:, exotic schemes) is refused.
+    if (/^https?:\/\//i.test(raw)) {
+      window.open(raw, '_blank', 'noopener')
+      return
+    }
+    MessagePlugin.error(t('faqManager.import.failedEntriesExpired'))
     return
   }
   try {
     const resp = await fetch(request.url, { headers: request.headers, credentials: 'include' })
     if (!resp.ok) {
       MessagePlugin.error(
-        resp.status === 403 || resp.status === 404
+        resp.status === 404
           ? t('faqManager.import.failedEntriesExpired')
           : `HTTP ${resp.status}`,
       )
@@ -2323,7 +2330,8 @@ const downloadFailedEntries = async () => {
     document.body.appendChild(a)
     a.click()
     a.remove()
-    URL.revokeObjectURL(blobURL)
+    // Revoke after the click has been processed so the download actually starts.
+    setTimeout(() => URL.revokeObjectURL(blobURL), 1000)
   } catch (error) {
     console.error('Failed to download failed entries:', error)
     MessagePlugin.error(t('faqManager.import.failedEntriesExpired'))
