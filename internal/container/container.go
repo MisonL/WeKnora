@@ -1489,7 +1489,7 @@ func initRawFileService(_ *config.Config) (interfaces.FileService, error) {
 			SessionName:  os.Getenv("OSS_ROLE_SESSION_NAME"),
 			STSEndpoint:  os.Getenv("OSS_STS_ENDPOINT"),
 			Policy:       os.Getenv("OSS_POLICY"),
-			ExternalID:   os.Getenv("OSS_EXTERNAL_ID"),
+			ExternalID:   types.OSSRoleExternalIDFromEnv(),
 			Expiration:   envIntValue("OSS_ROLE_SESSION_EXPIRATION"),
 			PresignTTL:   envIntValue("OSS_PRESIGN_TTL_SECONDS"),
 			EnsureBucket: authType == types.OSSAuthTypeAccessKey,
