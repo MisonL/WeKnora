@@ -53,9 +53,17 @@ const (
 
 	// stsRefreshMargin is how long before expiry a refresh is attempted.
 	stsRefreshMargin = 2 * time.Minute
+	// stsExpirySafety shortens the locally computed expiry. credentials-go
+	// discards the STS Expiration, so the local deadline must not overrun a
+	// server-granted shorter TTL.
+	stsExpirySafety = 60 * time.Second
 	// Failure backoff so a broken STS endpoint is not retried on every request.
 	stsMinRetryBackoff = 5 * time.Second
 	stsMaxRetryBackoff = 60 * time.Second
+	// ossProviderCacheLimit bounds the process-wide provider cache. Config
+	// rotation should reuse one entry; the limit only guards against unbounded
+	// growth from repeatedly changing credentials.
+	ossProviderCacheLimit = 16
 )
 
 // stsCredentialSource is the seam used by ossStsProvider. The production
@@ -81,6 +89,8 @@ type stsCredentialSource interface {
 type ossStsProvider struct {
 	src stsCredentialSource
 	ttl time.Duration
+
+	createdAt time.Time
 
 	mu         sync.Mutex
 	cached     credentials.Credentials
@@ -131,7 +141,7 @@ func newOSSStsProvider(cfg OSSAuthConfig) (*ossStsProvider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure RAM role provider: %w", err)
 	}
-	return &ossStsProvider{src: src, ttl: time.Duration(duration) * time.Second}, nil
+	return &ossStsProvider{src: src, ttl: time.Duration(duration) * time.Second, createdAt: time.Now()}, nil
 }
 
 // GetCredentials implements credentials.CredentialsProvider.
@@ -177,20 +187,58 @@ func (p *ossStsProvider) GetCredentials(ctx context.Context) (credentials.Creden
 	}
 	p.refreshing = true
 	p.done = make(chan struct{})
-	done := p.done
 	p.mu.Unlock()
 
-	// Anchor the expiry to the moment the request started so the computed
-	// deadline is never later than the token's real one.
+	// Fetch in a goroutine so a caller can stop waiting on ctx, while the
+	// in-flight call still finishes and publishes its result. That keeps the
+	// single-flight slot occupied only for the real duration of the STS call
+	// and lets other callers benefit from the outcome.
+	resultCh := make(chan stsFetchOutcome, 1)
+	go func() {
+		creds, err := p.safeFetch()
+		resultCh <- stsFetchOutcome{creds: creds, err: err}
+	}()
+
 	start := time.Now()
-	cc, err := p.safeFetch()
+	select {
+	case res := <-resultCh:
+		return p.completeRefresh(ctx, start, res)
+	case <-ctx.Done():
+		go func() {
+			p.completeRefresh(ctx, start, <-resultCh)
+		}()
+		return credentials.Credentials{}, ctx.Err()
+	}
+}
+
+// stsFetchOutcome is the result of one credentials fetch.
+type stsFetchOutcome struct {
+	creds *credproviders.Credentials
+	err   error
+}
+
+// completeRefresh publishes the result of a fetch and releases waiters. It is
+// always called exactly once per refresh, including when the initiating caller
+// stopped waiting.
+func (p *ossStsProvider) completeRefresh(
+	ctx context.Context, start time.Time, res stsFetchOutcome,
+) (credentials.Credentials, error) {
+	cc, err := res.creds, res.err
+	if err == nil && (cc == nil || strings.TrimSpace(cc.AccessKeyId) == "" ||
+		strings.TrimSpace(cc.AccessKeySecret) == "" || strings.TrimSpace(cc.SecurityToken) == "") {
+		// A provider returning nil or partial credentials must be treated as a
+		// failure; caching them would surface as opaque 403s on every request.
+		err = errors.New("sts provider returned incomplete credentials")
+	}
 	latency := time.Since(start)
-	exp := start.Add(p.ttl)
+	// Anchor expiry to the fetch start and keep a small margin: credentials-go
+	// discards the STS Expiration field, so this is a conservative local bound.
+	exp := start.Add(p.ttl - stsExpirySafety)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.refreshing = false
-	close(done)
+	close(p.done)
 	if err != nil {
 		code := stsErrorCode(err)
 		recordSTSFailure(code, latency)
@@ -347,6 +395,21 @@ func getOrCreateStsProvider(cfg OSSAuthConfig) (*ossStsProvider, error) {
 	p, err := newOSSStsProvider(cfg)
 	if err != nil {
 		return nil, err
+	}
+	if len(ossProviderCache) >= ossProviderCacheLimit {
+		// Evict the least recently created entry. Rotation should keep this
+		// cache at one or two entries; the limit only prevents unbounded
+		// growth when credentials keep changing.
+		var oldestKey ossClientKey
+		var oldest *ossStsProvider
+		for k, v := range ossProviderCache {
+			if oldest == nil || v.createdAt.Before(oldest.createdAt) {
+				oldestKey, oldest = k, v
+			}
+		}
+		if oldest != nil {
+			delete(ossProviderCache, oldestKey)
+		}
 	}
 	ossProviderCache[key] = p
 	return p, nil
