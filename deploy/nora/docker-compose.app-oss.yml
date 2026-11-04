@@ -1,0 +1,11 @@
+services:
+  # Point both fork-modified services at locally built images. This file is
+  # NOT a Compose default filename: every `docker compose` invocation must
+  # include it explicitly with -f (see bin/nora-up.sh). Omitting it silently
+  # restores the official images, which do not contain the STS/G0 fixes.
+  app:
+    image: weknora-app:v0.9.0-oss-sts
+    pull_policy: never
+  frontend:
+    image: weknora-ui:v0.9.0-oss-sts
+    pull_policy: never

@@ -376,6 +376,13 @@ func (s *knowledgeService) resolveFileService(ctx context.Context, kb *types.Kno
 	sec := tenant.StorageEngineConfig
 	baseDir := strings.TrimSpace(os.Getenv("LOCAL_STORAGE_BASE_DIR"))
 	svc, resolvedProvider, err := filesvc.NewFileServiceFromStorageConfig(provider, sec, baseDir, "tenant")
+	if errors.Is(err, filesvc.ErrStorageRoleNotAllowed) {
+		// A workspace admin supplied role credentials in tenant config. Never
+		// fall back to the process-global service: that would swap in a
+		// different (possibly static) identity. Fail every operation instead.
+		logger.Warnf(ctx, "[storage] reject role credentials in tenant storage config: kb=%s provider=%s", kb.ID, provider)
+		return filesvc.NewRejectedFileService(err)
+	}
 	if err != nil {
 		logger.Errorf(ctx, "Failed to create %s file service from tenant config: %v, falling back to default", provider, err)
 		return s.fileSvc
