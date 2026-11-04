@@ -29,7 +29,7 @@ func ResolveTenantFileServiceWithFallback(
 	if storageResolver != nil {
 		fileSvc, resolvedProvider, err = storageResolver.ResolveFileService(ctx, tenant, backendID, provider, absDir)
 	} else if tenant.StorageEngineConfig != nil {
-		fileSvc, resolvedProvider, err = NewFileServiceFromStorageConfig(provider, tenant.StorageEngineConfig, absDir)
+		fileSvc, resolvedProvider, err = NewFileServiceFromStorageConfig(provider, tenant.StorageEngineConfig, absDir, "tenant")
 	} else {
 		err = http.ErrMissingFile
 	}

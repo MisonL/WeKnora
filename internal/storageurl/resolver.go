@@ -205,7 +205,7 @@ func BuildFileServiceForProvider(
 		sec = tenant.StorageEngineConfig
 	}
 
-	svc, _, err := filesvc.NewFileServiceFromStorageConfig(provider, sec, baseDir)
+	svc, _, err := filesvc.NewFileServiceFromStorageConfig(provider, sec, baseDir, "tenant")
 	if err == nil {
 		return svc
 	}
