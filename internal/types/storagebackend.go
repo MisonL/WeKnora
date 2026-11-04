@@ -416,7 +416,7 @@ func StorageBackendFromEnvironment(tenantID uint64) *StorageBackend {
 			RoleSessionExpiration: envInt("OSS_ROLE_SESSION_EXPIRATION"),
 			STSEndpoint:           os.Getenv("OSS_STS_ENDPOINT"),
 			Policy:                os.Getenv("OSS_POLICY"),
-			ExternalID:            firstNonEmpty(os.Getenv("OSS_EXTERNAL_ID"), os.Getenv("OSS_ROLE_EXTERNAL_ID")),
+			ExternalID:            OSSRoleExternalIDFromEnv(),
 			PresignTTLSeconds:     envInt("OSS_PRESIGN_TTL_SECONDS"),
 		}
 	case "obs":
