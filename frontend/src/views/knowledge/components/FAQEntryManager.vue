@@ -873,6 +873,8 @@ import AssistantActionButton from '@/components/assistant/AssistantActionButton.
 import { ref, reactive, watch, onMounted, computed, nextTick, onUnmounted, h } from 'vue'
 import KnowledgeTagFilter from './KnowledgeTagFilter.vue'
 import { MessagePlugin, Icon as TIcon } from 'tdesign-vue-next'
+import { buildProtectedFileRequest } from '@/utils/protectedFileAccess'
+import { responseFileName } from '@/utils/protectedResource'
 import { useConfirmDelete } from '@/components/settings/useConfirmDelete'
 import type { FormRules, FormInstanceFunctions } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
@@ -2289,13 +2291,43 @@ const closeImportResult = async () => {
 }
 
 // 下载失败条目原因
-const downloadFailedEntries = () => {
-  if (!importResult.value?.failed_entries_url) {
+// 新记录里 failed_entries_url 存的是存储对象路径（resource:// 或 oss://），
+// 必须经鉴权代理下载：window.open 无法携带 Authorization 头，直接打开必然 401。
+// 存量记录可能是旧的预签名 URL（会过期），此时只能原样打开。
+const downloadFailedEntries = async () => {
+  const raw = importResult.value?.failed_entries_url
+  if (!raw) {
     MessagePlugin.warning(t('faqManager.import.noFailedRecords'))
     return
   }
-  // 直接打开下载链接
-  window.open(importResult.value.failed_entries_url, '_blank')
+  const request = buildProtectedFileRequest(raw, { mode: 'tenant' })
+  if (!request) {
+    window.open(raw, '_blank', 'noopener')
+    return
+  }
+  try {
+    const resp = await fetch(request.url, { headers: request.headers, credentials: 'include' })
+    if (!resp.ok) {
+      MessagePlugin.error(
+        resp.status === 403 || resp.status === 404
+          ? t('faqManager.import.failedEntriesExpired')
+          : `HTTP ${resp.status}`,
+      )
+      return
+    }
+    const blob = await resp.blob()
+    const blobURL = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = blobURL
+    a.download = responseFileName(resp.headers.get('Content-Disposition'), 'faq_failed_entries.csv')
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(blobURL)
+  } catch (error) {
+    console.error('Failed to download failed entries:', error)
+    MessagePlugin.error(t('faqManager.import.failedEntriesExpired'))
+  }
 }
 
 // 格式化导入时间
