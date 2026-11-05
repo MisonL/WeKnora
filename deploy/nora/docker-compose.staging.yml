@@ -1,0 +1,55 @@
+# Staging rehearsal overlay for the QDAMA Nora ECS (2C4G, production co-hosted).
+#
+# Purpose: rehearse the v0.9.0 + OSS/STS deployment on the production ECS with
+# an isolated compose project, without touching the running production stack.
+# The caller AK is IP-bound to this server, so a rehearsal elsewhere cannot
+# pass STS (see plan G2).
+#
+# NOT auto-loaded. Run it like this (staging reads the SAME secret file as
+# production via a symlink so no secret is ever duplicated on the host):
+#
+#   sudo install -d /opt/nora-stg
+#   sudo ln -sfn /opt/nora/.env /opt/nora-stg/.env
+#   sudo cp -a /opt/nora/config /opt/nora-stg/config
+#   # copy docker-compose.yml and this file from the repo
+#   sudo -E env APP_PORT=8001 FRONTEND_PORT=8002 \
+#        OSS_PATH_PREFIX=weknora-stg/ OSS_ROLE_SESSION_NAME=weknora-stg \
+#     docker compose -p nora-stg \
+#       -f docker-compose.yml \
+#       -f deploy/nora/docker-compose.staging.yml up -d
+#
+#   # Rehearsal is finished with:
+#   docker compose -p nora-stg -f docker-compose.yml \
+#     -f deploy/nora/docker-compose.staging.yml down -v   # volumes are nora-stg_*
+#   sudo rm -rf /opt/nora-stg
+#
+# Safety notes:
+#   - Ports: the base file publishes ${APP_PORT}/${FRONTEND_PORT}; passing
+#     APP_PORT/FRONTEND_PORT in the shell environment re-binds staging to
+#     8001/8002 (shell env wins over the .env file for interpolation), so it
+#     cannot collide with the running production containers.
+#   - Volumes and the compose network are project-scoped (nora-stg_*), so no
+#     shared state with the production project is possible.
+#   - OSS objects go under OSS_PATH_PREFIX=weknora-stg/ with a distinct
+#     OSS_ROLE_SESSION_NAME so rehearsal artifacts are easy to find and clean.
+services:
+  frontend:
+    image: weknora-ui:v0.9.0-oss-sts
+    pull_policy: never
+    container_name: NoraStg-frontend
+  app:
+    image: weknora-app:v0.9.0-oss-sts
+    pull_policy: never
+    container_name: NoraStg-app
+  docreader:
+    image: docker.m.daocloud.io/wechatopenai/weknora-docreader:v0.9.0
+    pull_policy: never
+    container_name: NoraStg-docreader
+  postgres:
+    image: docker.m.daocloud.io/paradedb/paradedb:v0.25.11-pg17
+    pull_policy: never
+    container_name: NoraStg-postgres
+  redis:
+    image: docker.m.daocloud.io/library/redis:7.0-alpine
+    pull_policy: never
+    container_name: NoraStg-redis
