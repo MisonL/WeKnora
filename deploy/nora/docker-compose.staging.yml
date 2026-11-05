@@ -50,6 +50,6 @@ services:
     pull_policy: never
     container_name: NoraStg-postgres
   redis:
-    image: docker.m.daocloud.io/library/redis:7.0-alpine
+    image: docker.m.daocloud.io/library/redis:7.4.6-alpine
     pull_policy: never
     container_name: NoraStg-redis
