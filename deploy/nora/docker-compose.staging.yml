@@ -41,6 +41,23 @@ services:
     image: weknora-app:v0.9.0-oss-sts
     pull_policy: never
     container_name: NoraStg-app
+    volumes:
+      # Declarative built-in models. Production mounts this through its own
+      # override file; the base compose leaves the line commented out. Without
+      # it the models table stays empty and FAQ import fails on a missing
+      # embedding model, so the rehearsal must mount it too.
+      - ./config/builtin_models.yaml:/app/config/builtin_models.yaml:ro
+    environment:
+      # v0.9.0 validates every model base URL at runtime (chat/embedding/rerank
+      # transports), unlike v0.8.3. The builtin models point at the 81.4 relay
+      # (172.16.81.4) because the direct model hosts are unreachable over SAG,
+      # so the relay must be whitelisted or every model call fails with
+      # "direct IP address access is not allowed".
+      #
+      # This is also the production fix: 172.16.81.4 must join SSRF_WHITELIST
+      # in /opt/nora/.env BEFORE the v0.9.0 cutover. Staging overrides it here
+      # so the rehearsal never edits the shared .env.
+      - SSRF_WHITELIST=10.0.90.200,172.16.84.251,172.16.81.4
   docreader:
     image: docker.m.daocloud.io/wechatopenai/weknora-docreader:v0.9.0
     pull_policy: never
