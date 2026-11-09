@@ -97,7 +97,7 @@ done
 manifest() {
   docker run --rm --entrypoint sh "$1" -c \
     'cd / && find . -xdev \( -path ./proc -o -path ./sys -o -path ./dev -o -path ./tmp \) -prune -o -print' \
-    | sort
+    | LC_ALL=C sort
 }
 manifest "$NEW_IMAGE" > "$WORK/new.manifest"
 manifest "$BASE_IMAGE" > "$WORK/base.manifest"
@@ -170,7 +170,7 @@ ssh "$HOST" "set -e
   tar xzf delta.tar.gz
   rm -f delta.tar.gz
   sudo -n docker build ${EXTRA_ARGS[*]:-} -t '$TARGET_TAG' . >/dev/null
-  sudo -n docker run --rm --entrypoint sh '$TARGET_TAG' -c 'cd / && find . -xdev \( -path ./proc -o -path ./sys -o -path ./dev -o -path ./tmp \) -prune -o -print' | sort > actual.manifest
+  sudo -n docker run --rm --entrypoint sh '$TARGET_TAG' -c 'cd / && find . -xdev \( -path ./proc -o -path ./sys -o -path ./dev -o -path ./tmp \) -prune -o -print' | LC_ALL=C sort > actual.manifest
   if ! diff -q expected.manifest actual.manifest >/dev/null; then
     echo 'build-delta: BUILT IMAGE DOES NOT MATCH THE SOURCE IMAGE' >&2
     diff expected.manifest actual.manifest | head -30 >&2
