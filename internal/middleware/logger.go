@@ -52,12 +52,20 @@ func (r loggerResponseBodyWriter) Write(b []byte) (int, error) {
 
 // sensitiveFieldRegex 匹配 JSON 中的敏感字段（不区分大小写，兼容 snake_case / camelCase / PascalCase）。
 // $1 捕获原始字段名（包括两侧引号），保持日志中的字段名不变，仅将值替换为 "***"。
+//
+// IM 渠道的凭证不走 api_key/secret 命名（见 internal/im/*/factory.go 读取的
+// creds key），例如企业微信长连接的 bot_secret、飞书 app_secret、钉钉
+// app_secret/signing_secret、Telegram bot_token、Slack signing_secret 等，
+// 因此必须逐个列出，否则创建渠道时的请求体会把明文密钥写进访问日志。
 var sensitiveFieldRegex = regexp.MustCompile(
 	`(?i)("(?:new[_-]?password|old[_-]?password|password|passwd|ticket|token|access[_-]?token|` +
 		`refresh[_-]?token|next[_-]?token|device[_-]?token|pending[_-]?token|pairing[_-]?link|` +
 		`id[_-]?token|authorization|auth[_-]?token|api[_-]?key|` +
 		`api[_-]?secret|secret[_-]?key|client[_-]?secret|private[_-]?key|secret|` +
-		`authorization[_-]?url|authorization[_-]?attempt|assertion)")\s*:\s*"[^"]*"`,
+		`authorization[_-]?url|authorization[_-]?attempt|assertion|` +
+		`bot[_-]?secret|bot[_-]?token|app[_-]?secret|app[_-]?token|agent[_-]?secret|` +
+		`encoding[_-]?aes[_-]?key|encrypt[_-]?key|verification[_-]?token|signing[_-]?secret|` +
+		`outgoing[_-]?token|secret[_-]?token|webhook[_-]?secret)")\s*:\s*"[^"]*"`,
 )
 
 // dataURIRegex matches an inline data URI whose payload is base64. Request logs

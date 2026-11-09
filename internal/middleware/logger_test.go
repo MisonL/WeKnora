@@ -74,6 +74,16 @@ func TestSanitizeBody(t *testing.T) {
 			want: `{"assertion":"***","redirect_uri":"https://example.com/cb"}`,
 		},
 		{
+			name: "IM channel credentials",
+			in:   `{"platform":"wecom","credentials":{"bot_id":"aib-1","bot_secret":"s3","bot_name":"小科"},"name":"x"}`,
+			want: `{"platform":"wecom","credentials":{"bot_id":"aib-1","bot_secret":"***","bot_name":"小科"},"name":"x"}`,
+		},
+		{
+			name: "other IM platform secrets",
+			in:   `{"app_secret":"a","app_token":"b","agent_secret":"c","encoding_aes_key":"d","encrypt_key":"e","verification_token":"f","signing_secret":"g","outgoing_token":"h","secret_token":"i","webhook_secret":"j"}`,
+			want: `{"app_secret":"***","app_token":"***","agent_secret":"***","encoding_aes_key":"***","encrypt_key":"***","verification_token":"***","signing_secret":"***","outgoing_token":"***","secret_token":"***","webhook_secret":"***"}`,
+		},
+		{
 			name: "non sensitive fields untouched",
 			in:   `{"baseUrl":"https://example.com","modelName":"gpt"}`,
 			want: `{"baseUrl":"https://example.com","modelName":"gpt"}`,

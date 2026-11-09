@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -17,7 +16,7 @@ func TestSummarizeIMChannel_OmitsCredentials(t *testing.T) {
 		Platform:    "feishu",
 		Name:        "support",
 		Locale:      "ko-KR",
-		Credentials: types.JSON(`{"app_secret":"top-secret"}`),
+		Credentials: CredentialsJSON(`{"app_secret":"top-secret"}`),
 	}
 
 	summary := SummarizeIMChannel(ch)
@@ -31,6 +30,6 @@ func TestSummarizeIMChannel_OmitsCredentials(t *testing.T) {
 }
 
 func TestSummarizeIMChannel_EmptyCredentialsNotConfigured(t *testing.T) {
-	summary := SummarizeIMChannel(IMChannel{Credentials: types.JSON("{}")})
+	summary := SummarizeIMChannel(IMChannel{Credentials: CredentialsJSON("{}")})
 	assert.False(t, summary.CredentialsConfigured)
 }

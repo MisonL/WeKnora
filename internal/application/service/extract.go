@@ -14,6 +14,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/application/access"
 	"github.com/Tencent/WeKnora/internal/application/repository"
 	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
+	filesvc "github.com/Tencent/WeKnora/internal/application/service/file"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -633,6 +634,11 @@ func (s *DataTableSummaryService) resolveFileServiceForKnowledge(ctx context.Con
 
 	resolvedSvc, resolvedProvider, err := s.storageResolver.ResolveFileService(ctx, resources.tenant, backendID, provider, baseDir)
 	if err != nil {
+		// A role-backed config that does not come from the environment must not
+		// fall back to the process-global identity; fail closed instead.
+		if errors.Is(err, filesvc.ErrStorageRoleNotAllowed) {
+			return filesvc.NewRejectedFileService(err)
+		}
 		logger.Warnf(ctx, "[TableSummary] Failed to resolve file service for provider=%s, fallback to default: %v", provider, err)
 		return s.fileService
 	}

@@ -111,13 +111,7 @@ func NewOssFileServiceWithAuthConfig(cfg OSSAuthConfig) (interfaces.FileService,
 		return nil, err
 	}
 
-	if cfg.AuthType == ossAuthTypeRAMRoleARN || !cfg.EnsureBucket {
-		// Role credentials are scoped to the bucket; creating it is not an
-		// option, so probing must surface errors instead of swallowing them.
-		if err := ossEnsureBucketReadOnly(client, cfg.BucketName); err != nil {
-			return nil, err
-		}
-	} else if err := ossEnsureBucket(client, cfg.BucketName); err != nil {
+	if err := probeOSSAtStartup(client, cfg, cfg.BucketName); err != nil {
 		return nil, err
 	}
 
@@ -133,11 +127,7 @@ func NewOssFileServiceWithAuthConfig(cfg OSSAuthConfig) (interfaces.FileService,
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize OSS temp client: %w", err)
 		}
-		if cfg.AuthType == ossAuthTypeRAMRoleARN || !cfg.EnsureBucket {
-			if err := ossEnsureBucketReadOnly(tempClient, cfg.TempBucket); err != nil {
-				return nil, err
-			}
-		} else if err := ossEnsureBucket(tempClient, cfg.TempBucket); err != nil {
+		if err := probeOSSAtStartup(tempClient, cfg, cfg.TempBucket); err != nil {
 			return nil, err
 		}
 	}

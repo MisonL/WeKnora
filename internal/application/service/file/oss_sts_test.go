@@ -3,11 +3,13 @@ package file
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
 	credproviders "github.com/aliyun/credentials-go/credentials/providers"
 	"github.com/stretchr/testify/assert"
@@ -237,4 +239,175 @@ func TestOssStsProviderCancelledCallerDoesNotLeakRefreshSlot(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	assert.EqualValues(t, 1, src.calls.Load(), "the background completion must reuse the single fetch")
+}
+
+func TestNormalizeSTSEndpoint(t *testing.T) {
+	cases := map[string]string{
+		"sts.cn-hangzhou.aliyuncs.com":          "sts.cn-hangzhou.aliyuncs.com",
+		"https://sts.cn-hangzhou.aliyuncs.com":  "sts.cn-hangzhou.aliyuncs.com",
+		"https://sts.cn-hangzhou.aliyuncs.com/": "sts.cn-hangzhou.aliyuncs.com",
+		"  STS.aliyuncs.com  ":                  "sts.aliyuncs.com",
+		"sts.aliyuncs.com/path":                 "sts.aliyuncs.com",
+		"":                                      "",
+	}
+	for in, want := range cases {
+		if got := normalizeSTSEndpoint(in); got != want {
+			t.Errorf("normalizeSTSEndpoint(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSummarizeSTSErrorRedactsNonJSONCredentials(t *testing.T) {
+	err := errors.New(`sts request failed: 403 AccessKeyId=LTAI5tEXAMPLE Signature=abc123&SignatureNonce=xyz SecurityToken=secrettoken`)
+	got := summarizeSTSError(err)
+	for _, leaked := range []string{"LTAI5tEXAMPLE", "abc123", "secrettoken"} {
+		if strings.Contains(got, leaked) {
+			t.Errorf("summarizeSTSError leaked %q in %q", leaked, got)
+		}
+	}
+}
+
+func TestSummarizeSTSErrorRedactsJSONBody(t *testing.T) {
+	err := errors.New(`{"Code":"NoPermission","Message":"x","RequestId":"rid-1","AccessKeyId":"LTAI5tEXAMPLE"}`)
+	got := summarizeSTSError(err)
+	if !strings.Contains(got, "NoPermission") || !strings.Contains(got, "rid-1") {
+		t.Errorf("summarizeSTSError lost the diagnostic fields: %q", got)
+	}
+	if strings.Contains(got, "LTAI5tEXAMPLE") {
+		t.Errorf("summarizeSTSError leaked the access key id: %q", got)
+	}
+}
+
+// stableSTSSource returns the same AccessKeyId on every call, the way
+// credentials-go behaves while its own 180-second renewal threshold has not
+// passed: it answers from its cache instead of calling STS.
+type stableSTSSource struct{ calls atomic.Int32 }
+
+func (s *stableSTSSource) GetCredentials() (*credproviders.Credentials, error) {
+	s.calls.Add(1)
+	return &credproviders.Credentials{
+		AccessKeyId:     "STS.stable",
+		AccessKeySecret: "secret",
+		SecurityToken:   "token",
+	}, nil
+}
+
+// rotatingSTSSource mints a new AccessKeyId per call, like a real AssumeRole.
+type rotatingSTSSource struct{ calls atomic.Int32 }
+
+func (s *rotatingSTSSource) GetCredentials() (*credproviders.Credentials, error) {
+	n := s.calls.Add(1)
+	return &credproviders.Credentials{
+		AccessKeyId:     "STS." + string(rune('0'+n)),
+		AccessKeySecret: "secret",
+		SecurityToken:   "token",
+	}, nil
+}
+
+// credentials-go only renews inside its own 180-second window, which is wider
+// than our two-minute margin, so a refresh attempt can come back with the token
+// we already hold. Re-anchoring the deadline to that attempt would stretch the
+// same token's local lifetime by up to a full TTL past its real expiry, which
+// surfaces as intermittent OSS 403s.
+func TestOssStsProviderDoesNotExtendUnchangedToken(t *testing.T) {
+	src := &stableSTSSource{}
+	p := &ossStsProvider{src: src, ttl: time.Hour}
+	ctx := context.Background()
+
+	_, err := p.GetCredentials(ctx)
+	require.NoError(t, err)
+
+	forced := time.Now().Add(30 * time.Second)
+	p.mu.Lock()
+	p.expiresAt = forced
+	p.mu.Unlock()
+
+	creds, err := p.GetCredentials(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, "STS.stable", creds.AccessKeyID)
+	assert.EqualValues(t, 2, src.calls.Load(), "the provider still asks; it just must not trust the answer")
+	require.NotNil(t, creds.Expires)
+	assert.WithinDuration(t, forced, *creds.Expires, time.Second,
+		"an unchanged token keeps its original deadline")
+	assert.WithinDuration(t, forced, p.expiresAt, time.Second)
+
+	// Repeat attempts inside the unchanged window must not call STS again.
+	for i := 0; i < 3; i++ {
+		_, err := p.GetCredentials(ctx)
+		require.NoError(t, err)
+	}
+	assert.EqualValues(t, 2, src.calls.Load(),
+		"an unchanged answer must not re-ask on every request")
+}
+
+// A genuinely renewed token does move the deadline forward.
+func TestOssStsProviderExtendsDeadlineForRenewedToken(t *testing.T) {
+	src := &rotatingSTSSource{}
+	p := &ossStsProvider{src: src, ttl: time.Hour}
+	ctx := context.Background()
+
+	_, err := p.GetCredentials(ctx)
+	require.NoError(t, err)
+
+	forced := time.Now().Add(30 * time.Second)
+	p.mu.Lock()
+	p.expiresAt = forced
+	p.mu.Unlock()
+
+	before := time.Now()
+	creds, err := p.GetCredentials(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, "STS.2", creds.AccessKeyID)
+	assert.True(t, p.expiresAt.After(before.Add(50*time.Minute)),
+		"a new AccessKeyId must re-anchor the deadline to this fetch, got %s", p.expiresAt)
+}
+
+// A credentials provider that always fails lets the startup probe fail at the
+// signing step, without any network traffic.
+type failingCredProvider struct{ calls atomic.Int32 }
+
+func (f *failingCredProvider) GetCredentials(context.Context) (credentials.Credentials, error) {
+	f.calls.Add(1)
+	return credentials.Credentials{}, errors.New("sts unavailable")
+}
+
+func newFailingProbeClient() (*oss.Client, *failingCredProvider) {
+	provider := &failingCredProvider{}
+	cfg := oss.LoadDefaultConfig().
+		WithCredentialsProvider(provider).
+		WithRegion("cn-hangzhou").
+		WithEndpoint("oss-cn-hangzhou.aliyuncs.com")
+	return oss.NewClient(cfg), provider
+}
+
+// A storage probe that fails while the process is starting must not be fatal:
+// initFileService is registered with must(), so an STS outage at boot would
+// crash-loop the container and take chat and retrieval down with it. Per-KB
+// backends keep failing so a request reports a broken configuration at once.
+func TestProbeOSSAtStartupOnlySwallowsWhenTolerated(t *testing.T) {
+	previous := ossProbeRetryInterval
+	ossProbeRetryInterval = 0
+	t.Cleanup(func() { ossProbeRetryInterval = previous })
+
+	client, _ := newFailingProbeClient()
+
+	err := probeOSSAtStartup(client, OSSAuthConfig{}, "probe-bucket")
+	require.Error(t, err, "a per-KB backend must still report the failure")
+
+	err = probeOSSAtStartup(client, OSSAuthConfig{TolerateProbeFailure: true}, "probe-bucket")
+	require.NoError(t, err, "the process bootstrap must survive a failed probe")
+}
+
+// The tolerant path retries before it gives up, but not indefinitely.
+func TestProbeOSSAtStartupRetriesThenGivesUp(t *testing.T) {
+	previous := ossProbeRetryInterval
+	ossProbeRetryInterval = 0
+	t.Cleanup(func() { ossProbeRetryInterval = previous })
+
+	client, provider := newFailingProbeClient()
+	cfg := OSSAuthConfig{TolerateProbeFailure: true}
+
+	require.NoError(t, probeOSSAtStartup(client, cfg, "probe-bucket"))
+	assert.EqualValues(t, ossProbeAttempts, provider.calls.Load(),
+		"the tolerant probe must retry the configured number of attempts")
 }
