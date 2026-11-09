@@ -411,7 +411,7 @@ func (g *pgRepository) VectorRetrieve(ctx context.Context,
 		whereParts = append(whereParts, fmt.Sprintf(
 			"NOT (knowledge_base_id IN (%s) AND %s)",
 			strings.Join(placeholders, ", "),
-			types.GeneratedQuestionRowPredicate(""),
+			types.GeneratedQuestionRowPredicateParadeDB(""),
 		))
 	}
 
@@ -790,6 +790,17 @@ func (g *pgRepository) BatchUpdateChunkTagID(ctx context.Context, chunkTagMap ma
 	return nil
 }
 
+// generatedQuestionExclusionClause keeps generated-question index rows out of
+// recall for knowledge bases whose question generation is switched off.
+//
+// The predicate must not compare two columns. ParadeDB's BM25 scan rejects a
+// top-K query whose filter contains such a comparison — ORDER BY
+// paradedb.score() together with `source_id <> chunk_id` raises "Unsupported
+// query shape" (SQLSTATE XX000) — so keyword retrieval failed outright for
+// every document KB with the switch off. It also has to stay a plain filter
+// rather than a correlated anti-join: the anti-join blocks the top-K pushdown,
+// dropping the scan from TopKScanExecState to NormalScanExecState plus an
+// explicit Sort, so its cost grows with the match count instead of the limit.
 func generatedQuestionExclusionClause(kbIDs []string) clause.Expression {
 	if len(kbIDs) == 0 {
 		return nil
@@ -804,7 +815,7 @@ func generatedQuestionExclusionClause(kbIDs []string) clause.Expression {
 		SQL: fmt.Sprintf(
 			"NOT (knowledge_base_id IN (%s) AND %s)",
 			strings.Join(placeholders, ", "),
-			types.GeneratedQuestionRowPredicate(""),
+			types.GeneratedQuestionRowPredicateParadeDB(""),
 		),
 		Vars: vars,
 	}

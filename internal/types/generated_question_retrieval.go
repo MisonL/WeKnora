@@ -52,6 +52,32 @@ func GeneratedQuestionRowPredicate(alias string) string {
 	)
 }
 
+// GeneratedQuestionRowPredicateParadeDB is the keyword-search form of
+// GeneratedQuestionRowPredicate for ParadeDB pg_search. Its BM25 scan cannot
+// plan a top-K query whose filter compares two columns — ORDER BY
+// paradedb.score() together with `source_id <> chunk_id` or the substr form
+// raises "Unsupported query shape" (SQLSTATE XX000) — so the prefix test uses
+// starts_with with the delimiter folded into the needle. That is the same
+// condition as IsGeneratedQuestionSource: the row must start with chunk_id
+// followed by '-', which already implies the two differ. This has to stay a
+// plain predicate rather than a correlated anti-join, because an anti-join
+// blocks the top-K pushdown and falls back to a full scan plus Sort.
+// SQLite has no starts_with and keeps GeneratedQuestionRowPredicate.
+func GeneratedQuestionRowPredicateParadeDB(alias string) string {
+	col := func(name string) string {
+		if alias == "" {
+			return name
+		}
+		return alias + "." + name
+	}
+	return fmt.Sprintf(
+		"%s = %d AND %s <> '' AND starts_with(%s, %s || '-')",
+		col("source_type"), int(ChunkSourceType),
+		col("chunk_id"),
+		col("source_id"), col("chunk_id"),
+	)
+}
+
 // SearchResultKnowledgeBaseIDs returns the distinct knowledge base IDs on results.
 func SearchResultKnowledgeBaseIDs(results []*SearchResult) []string {
 	seen := make(map[string]struct{}, len(results))

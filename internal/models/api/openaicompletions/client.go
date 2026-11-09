@@ -3,6 +3,7 @@ package openaicompletions
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -404,9 +405,16 @@ func (c *Client) processStream(
 		}
 		event, err := reader.ReadEvent()
 		if err != nil {
-			if err == io.EOF {
+			switch {
+			case err == io.EOF:
 				finish(assembler.EndAtEOF)
-			} else {
+			case errors.Is(err, context.Canceled) && assembler.Finished():
+				// The answer already carried its finish_reason; the caller
+				// cancelled only because it has everything it needs. Closing as
+				// a normal end keeps the usage record and hands the consumer no
+				// spurious error chunk.
+				finish(assembler.EndAtEOF)
+			default:
 				assembler.Fail(ch, err)
 			}
 			return

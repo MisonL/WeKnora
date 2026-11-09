@@ -53,6 +53,11 @@ func (s *StorageBackendService) Create(ctx context.Context, backend *types.Stora
 	if err := backend.Validate(); err != nil {
 		return err
 	}
+	// Role-backed backend that is not sourced from the environment is
+	// rejected before the connectivity check.
+	if err := rejectUserRoleBackend(backend); err != nil {
+		return err
+	}
 	if err := validateStorageBackendEndpoint(backend); err != nil {
 		return err
 	}
@@ -189,12 +194,22 @@ func (s *StorageBackendService) SetDefault(ctx context.Context, tenantID uint64,
 		if backend.Status != types.StorageBackendStatusActive {
 			return apperrors.NewBadRequestError("only an active storage backend can be the default")
 		}
+		// Making a row the default promotes it onto every unresolvable KB, so
+		// the credential-source gate has to run here as well, not only on write.
+		if err := rejectUserRoleBackend(&backend); err != nil {
+			return apperrors.NewBadRequestError("storage backend cannot be the default").WithDetails(err.Error())
+		}
 		return tx.Model(&types.Tenant{}).Where("id = ?", tenantID).Update("default_storage_backend_id", id).Error
 	})
 }
 
 func (s *StorageBackendService) Test(ctx context.Context, backend *types.StorageBackend) error {
 	if err := backend.Validate(); err != nil {
+		return err
+	}
+	// Role-backed backend that is not sourced from the environment is
+	// rejected before the connectivity check.
+	if err := rejectUserRoleBackend(backend); err != nil {
 		return err
 	}
 	if err := validateStorageBackendEndpoint(backend); err != nil {
@@ -313,6 +328,9 @@ func (s *StorageBackendService) ResolveBackend(ctx context.Context, tenant *type
 	if backendID == "" && provider != "" {
 		backend, err := s.repo.FindLegacyAlias(ctx, tenant.ID, provider)
 		if err != nil || backend != nil {
+			if err := rejectUserRoleBackend(backend); err != nil {
+				return nil, err
+			}
 			return backend, err
 		}
 	}
@@ -327,12 +345,31 @@ func (s *StorageBackendService) ResolveBackend(ctx context.Context, tenant *type
 		if backend == nil {
 			return nil, fmt.Errorf("storage backend not found")
 		}
+		// Check the credential source before the status so a disabled user
+		// role row is still rejected with the distinguishable sentinel.
+		if err := rejectUserRoleBackend(backend); err != nil {
+			return nil, err
+		}
 		if backend.Status != types.StorageBackendStatusActive {
 			return nil, fmt.Errorf("storage backend is not active")
 		}
 		return backend, nil
 	}
 	return nil, nil
+}
+
+// rejectUserRoleBackend refuses a role-backed backend unless it came from the
+// environment snapshot. Returning the sentinel lets every resolver keep the
+// rejection instead of silently falling back to another identity.
+func rejectUserRoleBackend(backend *types.StorageBackend) error {
+	if backend == nil {
+		return nil
+	}
+	if types.NormalizeOSSAuthType(backend.Config.AuthType) == types.OSSAuthTypeRAMRoleARN &&
+		backend.Source != types.StorageBackendSourceEnv {
+		return fmt.Errorf("%w: storage backend %s carries role credentials outside the environment", filesvc.ErrStorageRoleNotAllowed, backend.ID)
+	}
+	return nil
 }
 
 func (s *StorageBackendService) ResolveFileService(ctx context.Context, tenant *types.Tenant, backendID, provider, localBaseDir string) (interfaces.FileService, string, error) {

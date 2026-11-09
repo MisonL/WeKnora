@@ -31,6 +31,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/storageurl"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
@@ -1011,6 +1012,7 @@ func (s *Service) LoadAndStartChannels() error {
 	s.startChannelConfigSubscriber()
 
 	ctx := context.Background()
+	s.encryptLegacyChannelCredentials(ctx)
 	var channels []IMChannel
 	if err := s.db.Where("enabled = ? AND deleted_at IS NULL", true).Find(&channels).Error; err != nil {
 		return fmt.Errorf("load im channels: %w", err)
@@ -1037,6 +1039,52 @@ func (s *Service) LoadAndStartChannels() error {
 
 	logger.Infof(ctx, "[IM] Loaded %d enabled channels", len(channels))
 	return nil
+}
+
+// encryptLegacyChannelCredentials rewrites channels whose credentials were
+// stored before CredentialsJSON encrypted them.
+//
+// Scan keeps such rows usable, but only a write re-encrypts them: a channel
+// that is never edited again would stay in plaintext forever. jsonb_typeof is
+// 'object' exactly for the legacy shape, because the encrypted wrapper is a
+// JSON string scalar.
+func (s *Service) encryptLegacyChannelCredentials(ctx context.Context) {
+	if utils.GetAESKey() == nil || s.db.Dialector.Name() != "postgres" {
+		// SQLite (desktop) has no jsonb_typeof and normally runs without a key.
+		return
+	}
+
+	var ids []string
+	if err := s.db.WithContext(ctx).
+		Raw(`SELECT id FROM im_channels WHERE deleted_at IS NULL AND jsonb_typeof(credentials) = 'object'`).
+		Scan(&ids).Error; err != nil {
+		logger.Warnf(ctx, "[IM] Legacy credential scan failed, leaving rows as-is: %v", err)
+		return
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	encrypted := 0
+	for _, id := range ids {
+		var ch IMChannel
+		if err := s.db.WithContext(ctx).Where("id = ?", id).First(&ch).Error; err != nil {
+			logger.Warnf(ctx, "[IM] Legacy credential re-encrypt skipped for %s: %v", id, err)
+			continue
+		}
+		// UpdateColumn skips BeforeSave: the hook recomputes bot_identity from
+		// the model's credentials, and this model carries none.
+		if err := s.db.WithContext(ctx).Model(&IMChannel{}).Where("id = ?", id).
+			UpdateColumn("credentials", ch.Credentials).Error; err != nil {
+			logger.Warnf(ctx, "[IM] Legacy credential re-encrypt failed for %s: %v", id, err)
+			continue
+		}
+		encrypted++
+		logger.Infof(ctx, "[IM] Encrypted stored credentials for channel %s", id)
+	}
+	if encrypted > 0 {
+		logger.Infof(ctx, "[IM] Encrypted credentials of %d legacy channel(s)", encrypted)
+	}
 }
 
 // startChannelConfigSubscriber listens for durable channel mutations made by
@@ -1641,7 +1689,7 @@ func sameChannelRuntimeConfig(cached, fresh *IMChannel) bool {
 		equalChannelCredentials(cached.Credentials, fresh.Credentials)
 }
 
-func equalChannelCredentials(left, right types.JSON) bool {
+func equalChannelCredentials(left, right CredentialsJSON) bool {
 	var leftValue, rightValue any
 	if err := json.Unmarshal(left, &leftValue); err != nil {
 		return string(left) == string(right)

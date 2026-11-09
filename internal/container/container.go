@@ -1493,6 +1493,11 @@ func initRawFileService(_ *config.Config) (interfaces.FileService, error) {
 			Expiration:   envIntValue("OSS_ROLE_SESSION_EXPIRATION"),
 			PresignTTL:   envIntValue("OSS_PRESIGN_TTL_SECONDS"),
 			EnsureBucket: authType == types.OSSAuthTypeAccessKey,
+			// initFileService is registered with must(); a failed probe here
+			// would crash-loop the process and take chat and retrieval down
+			// with it. Retry briefly, then start and let the first storage
+			// request report the failure.
+			TolerateProbeFailure: true,
 		}
 		return file.NewOssFileServiceWithAuthConfig(cfg)
 	case "local":

@@ -58,6 +58,27 @@ services:
       # in /opt/nora/.env BEFORE the v0.9.0 cutover. Staging overrides it here
       # so the rehearsal never edits the shared .env.
       - SSRF_WHITELIST=10.0.90.200,172.16.84.251,172.16.81.4
+      # ---- OSS/STS rehearsal -------------------------------------------
+      # The base compose only forwards the eight legacy OSS_* variables, and
+      # staging shares production's .env through a symlink, so the role
+      # variables cannot come from the file without editing production. They
+      # are set here instead; only the caller AK/SK are interpolated from the
+      # shell so no secret is written to this file.
+      #
+      # Production does not need this block: once OSS_* live in
+      # /opt/nora/.env, the service-level `env_file: .env` delivers them.
+      - STORAGE_TYPE=oss
+      - OSS_AUTH_TYPE=ram_role_arn
+      - OSS_ROLE_ARN=acs:ram::1645446608222577:role/nora-prd-br
+      - OSS_ROLE_SESSION_NAME=weknora-stg
+      - OSS_ROLE_SESSION_EXPIRATION=3600
+      - OSS_ENDPOINT=oss-cn-hangzhou.aliyuncs.com
+      - OSS_REGION=cn-hangzhou
+      - OSS_BUCKET_NAME=noraoss01
+      - OSS_PATH_PREFIX=weknora-stg/
+      - OSS_PRESIGN_TTL_SECONDS=3000
+      - OSS_ACCESS_KEY=${OSS_ACCESS_KEY:-}
+      - OSS_SECRET_KEY=${OSS_SECRET_KEY:-}
   docreader:
     image: docker.m.daocloud.io/wechatopenai/weknora-docreader:v0.9.0
     pull_policy: never

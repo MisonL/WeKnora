@@ -87,6 +87,12 @@ func (b *StorageBackend) Validate() error {
 	default:
 		return errors.NewValidationError(fmt.Sprintf("unsupported storage backend source: %q", b.Source))
 	}
+	// Role credentials may only come from the environment snapshot. This is a
+	// whitelist (not an equality check against "user") so that any future or
+	// misspelled source cannot slip a role config through.
+	if NormalizeOSSAuthType(b.Config.AuthType) == OSSAuthTypeRAMRoleARN && b.Source != StorageBackendSourceEnv {
+		return errors.NewValidationError("oss ram_role_arn is only allowed on the environment storage backend")
+	}
 	return b.Config.ValidateForProvider(b.Provider)
 }
 

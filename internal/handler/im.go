@@ -61,15 +61,15 @@ func (h *IMHandler) CreateIMChannel(c *gin.Context) {
 	}
 
 	var req struct {
-		Platform        string     `json:"platform" binding:"required"`
-		Name            string     `json:"name"`
-		Mode            string     `json:"mode"`
-		OutputMode      string     `json:"output_mode"`
-		Locale          string     `json:"locale"`
-		SessionMode     string     `json:"session_mode"`
-		KnowledgeBaseID string     `json:"knowledge_base_id"`
-		Credentials     types.JSON `json:"credentials"`
-		Enabled         *bool      `json:"enabled"`
+		Platform        string             `json:"platform" binding:"required"`
+		Name            string             `json:"name"`
+		Mode            string             `json:"mode"`
+		OutputMode      string             `json:"output_mode"`
+		Locale          string             `json:"locale"`
+		SessionMode     string             `json:"session_mode"`
+		KnowledgeBaseID string             `json:"knowledge_base_id"`
+		Credentials     im.CredentialsJSON `json:"credentials"`
+		Enabled         *bool              `json:"enabled"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -128,7 +128,7 @@ func (h *IMHandler) CreateIMChannel(c *gin.Context) {
 		}
 	}
 	if channel.Credentials == nil {
-		channel.Credentials = types.JSON("{}")
+		channel.Credentials = im.CredentialsJSON("{}")
 	}
 
 	if err := h.imService.CreateChannel(channel); err != nil {
@@ -222,15 +222,15 @@ func (h *IMHandler) UpdateIMChannel(c *gin.Context) {
 	}
 
 	var req struct {
-		Name            *string    `json:"name"`
-		Mode            *string    `json:"mode"`
-		OutputMode      *string    `json:"output_mode"`
-		Locale          *string    `json:"locale"`
-		SessionMode     *string    `json:"session_mode"`
-		KnowledgeBaseID *string    `json:"knowledge_base_id"`
-		Credentials     types.JSON `json:"credentials"`
-		Enabled         *bool      `json:"enabled"`
-		AgentID         *string    `json:"agent_id"`
+		Name            *string            `json:"name"`
+		Mode            *string            `json:"mode"`
+		OutputMode      *string            `json:"output_mode"`
+		Locale          *string            `json:"locale"`
+		SessionMode     *string            `json:"session_mode"`
+		KnowledgeBaseID *string            `json:"knowledge_base_id"`
+		Credentials     im.CredentialsJSON `json:"credentials"`
+		Enabled         *bool              `json:"enabled"`
+		AgentID         *string            `json:"agent_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

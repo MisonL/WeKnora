@@ -94,6 +94,13 @@ func (a *StreamAssembler) emit(ch chan<- types.StreamResponse, resp types.Stream
 // check it to stop reading instead of decoding a stream nobody listens to.
 func (a *StreamAssembler) Aborted() bool { return a.aborted }
 
+// Finished reports whether the vendor already reported a finish_reason. A
+// consumer that cancels the context after the message ended — the IM reply path
+// returns as soon as it sees the natural stop — then surfaces that cancellation
+// as context.Canceled on the next read. That is a completed stream, not a
+// broken one, so callers treat it as EOF instead of failing the turn.
+func (a *StreamAssembler) Finished() bool { return a.LastFinishReason != "" }
+
 // NewStreamAssembler creates an assembler for one stream.
 func NewStreamAssembler(ctx context.Context, model string) *StreamAssembler {
 	return &StreamAssembler{

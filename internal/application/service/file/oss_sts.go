@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -41,6 +42,13 @@ type OSSAuthConfig struct {
 	Expiration   int // seconds; STS session duration
 	PresignTTL   int // seconds; presigned URL lifetime
 	EnsureBucket bool
+	// TolerateProbeFailure turns a failed startup bucket probe into a warning
+	// instead of an error. The process bootstrap sets it because
+	// initFileService is registered with must(): an STS outage at boot would
+	// otherwise crash-loop the container and take chat and retrieval down with
+	// it. Per-knowledge-base backends leave it false so a broken configuration
+	// still fails the request that needs it.
+	TolerateProbeFailure bool
 }
 
 const (
@@ -60,6 +68,10 @@ const (
 	// Failure backoff so a broken STS endpoint is not retried on every request.
 	stsMinRetryBackoff = 5 * time.Second
 	stsMaxRetryBackoff = 60 * time.Second
+	// ossUnchangedRetryInterval spaces attempts after credentials-go answered
+	// with the token it already holds, so one renewal window does not turn into
+	// a refresh attempt (and a log line) on every storage call.
+	ossUnchangedRetryInterval = 15 * time.Second
 	// ossProviderCacheLimit bounds the process-wide provider cache. Config
 	// rotation should reuse one entry; the limit only guards against unbounded
 	// growth from repeatedly changing credentials.
@@ -102,6 +114,22 @@ type ossStsProvider struct {
 	done       chan struct{}
 }
 
+// normalizeSTSEndpoint reduces an STS endpoint to the bare host that
+// credentials-go expects; it appends the region suffix to whatever it is given,
+// so a value carrying a scheme or a path would otherwise produce a broken host.
+func normalizeSTSEndpoint(endpoint string) string {
+	host := strings.ToLower(strings.TrimSpace(endpoint))
+	if strings.Contains(host, "://") {
+		if parsed, err := url.Parse(host); err == nil && parsed.Hostname() != "" {
+			return parsed.Hostname()
+		}
+	}
+	if i := strings.IndexByte(host, '/'); i >= 0 {
+		host = host[:i]
+	}
+	return host
+}
+
 // newOSSStsProvider builds a provider that assumes roleARN with the caller
 // access key. The returned value is safe for concurrent use.
 func newOSSStsProvider(cfg OSSAuthConfig) (*ossStsProvider, error) {
@@ -128,7 +156,7 @@ func newOSSStsProvider(cfg OSSAuthConfig) (*ossStsProvider, error) {
 		builder = builder.WithRoleSessionName(cfg.SessionName)
 	}
 	if cfg.STSEndpoint != "" {
-		builder = builder.WithStsEndpoint(cfg.STSEndpoint)
+		builder = builder.WithStsEndpoint(normalizeSTSEndpoint(cfg.STSEndpoint))
 	}
 	if cfg.Policy != "" {
 		builder = builder.WithPolicy(cfg.Policy)
@@ -258,6 +286,27 @@ func (p *ossStsProvider) completeRefresh(
 		return credentials.Credentials{}, p.unavailableLocked()
 	}
 	recordSTSSuccess(latency)
+	// credentials-go only renews once less than 180 seconds remain on its own
+	// copy, which is wider than this layer's two-minute refresh margin. When it
+	// hands back the token it already holds, re-anchoring the deadline to this
+	// attempt would push the same token's local lifetime a whole TTL past its
+	// real expiry — the process then signs OSS requests with an expired token
+	// and gets intermittent 403s. A new AccessKeyId is the only proof of an
+	// actual renewal (each AssumeRole mints a fresh one).
+	renewed := p.cached.AccessKeyID == "" || p.cached.AccessKeyID != cc.AccessKeyId
+	if !renewed {
+		if !p.expiresAt.IsZero() {
+			exp = p.expiresAt
+		}
+		// Until credentials-go's own 180-second window opens it keeps answering
+		// from its cache, so asking again on the very next request would only
+		// repeat this outcome. Hold off briefly instead of logging on every
+		// storage call; the credentials stay usable in the meantime.
+		p.retryAfter = time.Now().Add(ossUnchangedRetryInterval)
+		logger.Infof(ctx,
+			"metric=sts_refresh_total result=unchanged latency_ms=%d access_key_id=%s expires_at=%s",
+			latency.Milliseconds(), cc.AccessKeyId, exp.Format(time.RFC3339))
+	}
 	p.cached = credentials.Credentials{
 		AccessKeyID:     cc.AccessKeyId,
 		AccessKeySecret: cc.AccessKeySecret,
@@ -268,8 +317,13 @@ func (p *ossStsProvider) completeRefresh(
 	p.failures = 0
 	p.retryAfter = time.Time{}
 	p.lastErr = nil
-	logger.Infof(ctx, "metric=sts_refresh_total result=success latency_ms=%d expires_in_s=%d",
-		latency.Milliseconds(), int64(p.ttl.Seconds()))
+	if !renewed {
+		p.retryAfter = time.Now().Add(ossUnchangedRetryInterval)
+	}
+	if renewed {
+		logger.Infof(ctx, "metric=sts_refresh_total result=success latency_ms=%d expires_in_s=%d",
+			latency.Milliseconds(), int64(p.ttl.Seconds()))
+	}
 	return p.cached, nil
 }
 
@@ -351,8 +405,16 @@ func summarizeSTSError(err error) string {
 	if len(msg) > 200 {
 		msg = msg[:200] + "..."
 	}
-	return msg
+	return stsCredentialParamPattern.ReplaceAllString(msg, "$1<redacted>")
 }
+
+// stsCredentialParamPattern scrubs credential-bearing query or form parameters
+// from STS errors that are not JSON (transport failures, XML responses). These
+// errors are the only remaining place a caller key or signature could surface
+// in a log line.
+var stsCredentialParamPattern = regexp.MustCompile(
+	`(?i)\b(AccessKeyId|AccessKeySecret|SecurityToken|Signature|SignatureNonce|X-Amz-Security-Token)=([^&\s"]+)`,
+)
 
 // ossClientKey identifies a cached credential provider. Only fields that
 // affect the STS call are included, so rotating an unrelated setting (bucket,
@@ -382,7 +444,7 @@ func getOrCreateStsProvider(cfg OSSAuthConfig) (*ossStsProvider, error) {
 		secretKeyHash:  hex.EncodeToString(secretHash[:]),
 		roleARN:        cfg.RoleARN,
 		sessionName:    cfg.SessionName,
-		stsEndpoint:    cfg.STSEndpoint,
+		stsEndpoint:    normalizeSTSEndpoint(cfg.STSEndpoint),
 		policy:         cfg.Policy,
 		externalID:     cfg.ExternalID,
 		expirationSecs: cfg.Expiration,
@@ -487,6 +549,54 @@ func ossEnsureBucketReadOnly(client *oss.Client, bucketName string) error {
 		return fmt.Errorf("failed to access OSS bucket %q: %w", bucketName, err)
 	}
 	return nil
+}
+
+// ossProbeRetryInterval spaces the startup probe retries; a variable so tests
+// do not wait.
+var ossProbeRetryInterval = 2 * time.Second
+
+// ossProbeAttempts bounds the tolerant startup probe. STS is an external
+// dependency; three attempts ride out a short blip without holding boot open.
+const ossProbeAttempts = 3
+
+// probeBucketReadOnly runs the read-only bucket probe up to attempts times.
+// Only the tolerant startup path retries: a transient STS blip should not even
+// produce the warning.
+func probeBucketReadOnly(client *oss.Client, bucketName string, attempts int) error {
+	err := ossEnsureBucketReadOnly(client, bucketName)
+	for attempt := 1; attempt < attempts && err != nil; attempt++ {
+		time.Sleep(ossProbeRetryInterval)
+		err = ossEnsureBucketReadOnly(client, bucketName)
+	}
+	return err
+}
+
+// probeOSSAtStartup verifies the bucket is reachable while the service is being
+// constructed.
+//
+// Role credentials are scoped to the bucket, so the bucket cannot be created and
+// the probe is read-only. A probe failure is normally fatal — a wrong bucket or
+// role should surface at construction, not on the first upload. The process
+// bootstrap opts out (TolerateProbeFailure) because initFileService is built
+// with must(): an STS outage at boot would crash-loop the container and take
+// chat and retrieval down with it. In that mode the probe retries briefly and
+// then only warns; the first storage request reports the failure.
+func probeOSSAtStartup(client *oss.Client, cfg OSSAuthConfig, bucketName string) error {
+	if cfg.AuthType != ossAuthTypeRAMRoleARN && cfg.EnsureBucket {
+		return ossEnsureBucket(client, bucketName)
+	}
+	attempts := 1
+	if cfg.TolerateProbeFailure {
+		attempts = ossProbeAttempts
+	}
+	err := probeBucketReadOnly(client, bucketName, attempts)
+	if err != nil && cfg.TolerateProbeFailure {
+		logger.Warnf(context.Background(),
+			"OSS bucket probe failed; starting anyway and retrying on first use (bucket=%s): %s",
+			bucketName, summarizeSTSError(err))
+		return nil
+	}
+	return err
 }
 
 // presignTTL returns the configured lifetime for presigned URLs. In role mode
