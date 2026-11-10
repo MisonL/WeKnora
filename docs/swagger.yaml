@@ -617,6 +617,7 @@ definitions:
     - 2200
     - 2201
     - 2300
+    - 2400
     type: integer
     x-enum-varnames:
     - ErrBadRequest
@@ -643,6 +644,7 @@ definitions:
     - ErrVectorStoreBindingInvalid
     - ErrVectorStoreUnavailable
     - ErrModelInUse
+    - ErrImportPrerequisiteMissing
   github_com_Tencent_WeKnora_internal_handler_dto.CredentialFieldMetadata:
     properties:
       configured:
@@ -1022,6 +1024,8 @@ definitions:
       updated_at:
         type: string
     type: object
+  github_com_Tencent_WeKnora_internal_im.CredentialsJSON:
+    type: object
   github_com_Tencent_WeKnora_internal_im.IMChannel:
     properties:
       agent_id:
@@ -1031,7 +1035,7 @@ definitions:
       created_at:
         type: string
       credentials:
-        type: object
+        $ref: '#/definitions/github_com_Tencent_WeKnora_internal_im.CredentialsJSON'
       deleted_at:
         $ref: '#/definitions/gorm.DeletedAt'
       enabled:
@@ -4262,9 +4266,7 @@ definitions:
     properties:
       attrs:
         additionalProperties: {}
-        description: |-
-          Attrs is the observed attribute map (e.g. contain.text, contain.data_visual)
-          produced by the attribute pipeline. Absent keys mean "not observed".
+        description: Attrs 包含模型观察属性和解析器的 source.* 来源位置；缺少来源键表示未知。
         type: object
       caption:
         description: Caption is the model-generated image description.
@@ -6742,15 +6744,35 @@ definitions:
     properties:
       access_key:
         type: string
+      auth_type:
+        description: |-
+          RAM role authentication. Only the environment-sourced backend may carry
+          these fields; workspace-level config is rejected at write time and at
+          service construction.
+        type: string
       bucket_name:
         type: string
       endpoint:
         type: string
+      external_id:
+        type: string
       path_prefix:
         type: string
+      policy:
+        type: string
+      presign_ttl_seconds:
+        type: integer
       region:
         type: string
+      role_arn:
+        type: string
+      role_session_expiration:
+        type: integer
+      role_session_name:
+        type: string
       secret_key:
+        type: string
+      sts_endpoint:
         type: string
       temp_bucket_name:
         type: string
@@ -8574,9 +8596,16 @@ definitions:
         type: string
       app_id:
         type: string
+      auth_type:
+        description: |-
+          OSS RAM role authentication (aliyun only). AuthType is empty or
+          "access_key" for static credentials; "ram_role_arn" enables STS.
+        type: string
       bucket_name:
         type: string
       endpoint:
+        type: string
+      external_id:
         type: string
       force_path_style:
         type: boolean
@@ -8584,9 +8613,21 @@ definitions:
         type: string
       path_prefix:
         type: string
+      policy:
+        type: string
+      presign_ttl_seconds:
+        type: integer
       region:
         type: string
+      role_arn:
+        type: string
+      role_session_expiration:
+        type: integer
+      role_session_name:
+        type: string
       secret_access_key:
+        type: string
+      sts_endpoint:
         type: string
       temp_bucket_name:
         type: string
@@ -11711,7 +11752,14 @@ definitions:
   internal_handler.KBModelConfigRequest:
     properties:
       asr_config:
-        $ref: '#/definitions/github_com_Tencent_WeKnora_internal_types.ASRConfig'
+        properties:
+          enabled:
+            type: boolean
+          language:
+            type: string
+          model_id:
+            type: string
+        type: object
       documentSplitting:
         description: 文档分块配置
         properties:
@@ -11801,7 +11849,24 @@ definitions:
         description: 存储引擎选择（"local" | "minio" | "cos"），影响文档上传与文档内图片存储，参数从全局设置读取
         type: string
       vlm_config:
-        $ref: '#/definitions/github_com_Tencent_WeKnora_internal_types.VLMConfig'
+        properties:
+          api_key:
+            type: string
+          base_url:
+            type: string
+          custom_instructions:
+            type: string
+          description_language:
+            type: string
+          enabled:
+            type: boolean
+          interface_type:
+            type: string
+          model_id:
+            type: string
+          model_name:
+            type: string
+        type: object
     required:
     - llmModelId
     type: object
@@ -28513,6 +28578,20 @@ paths:
       summary: 获取平台审计日志
       tags:
       - 审计日志
+  /system/admin/diagnostics/sts:
+    get:
+      description: 仅限系统管理员；返回 STS 刷新计数、最近成功/失败时间、凭证明细剩余寿命与错误码
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+      summary: 查看 OSS STS 凭证刷新诊断信息
+      tags:
+      - 系统管理
   /system/admin/list:
     get:
       description: |-
