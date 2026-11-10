@@ -501,10 +501,13 @@ func newOSSClientWithConfig(cfg OSSAuthConfig) (*oss.Client, error) {
 		provider = credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")
 	}
 
+	// Keep the scheme: the SDK only honors a plain-HTTP endpoint when the
+	// scheme is present, otherwise it silently upgrades to https and any
+	// non-TLS endpoint (local MinIO, test servers) fails the bucket probe.
 	ossCfg := oss.LoadDefaultConfig().
 		WithCredentialsProvider(provider).
 		WithRegion(cfg.Region).
-		WithEndpoint(strings.TrimPrefix(strings.TrimPrefix(endpoint, "https://"), "http://")).
+		WithEndpoint(endpoint).
 		WithHttpClient(objectStorageHTTPClient())
 	return oss.NewClient(ossCfg), nil
 }
