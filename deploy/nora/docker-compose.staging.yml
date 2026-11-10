@@ -34,11 +34,11 @@
 #     OSS_ROLE_SESSION_NAME so rehearsal artifacts are easy to find and clean.
 services:
   frontend:
-    image: weknora-ui:v0.9.0-oss-sts
+    image: weknora-ui:${NORA_IMAGE_TAG:-v0.9.0-oss-sts-r9}
     pull_policy: never
     container_name: NoraStg-frontend
   app:
-    image: weknora-app:v0.9.0-oss-sts
+    image: weknora-app:${NORA_IMAGE_TAG:-v0.9.0-oss-sts-r9}
     pull_policy: never
     container_name: NoraStg-app
     volumes:

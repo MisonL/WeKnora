@@ -66,6 +66,6 @@ go test ./internal/handler -run TestUpdateKBConfigPartial -v   # 11 场景必须
 
 镜像 `weknora-app:v0.9.0-oss-sts-rN`。本机直连 `mirrors.tencent.com:80` 会被 DNS 劫持（198.18.x），**构建必须走代理** `127.0.0.1:7890`（构建参数 `host.docker.internal:7890`）。增量发布用 `deploy/nora/build-delta.sh`，生产回滚备份/保留策略见 [[nora-image-rotation-policy]]。
 
-> 注意：仓库里的 `deploy/nora/docker-compose.app-oss.yml` 写的是不带序号的 `weknora-app:v0.9.0-oss-sts`，而生产实际使用 `-r9`（服务器上的副本已改过）。从仓库直接部署前必须先把 tag 改成目标 `-rN`，否则会指向不存在的镜像。
+compose 里的镜像 tag 统一写成 `weknora-app:${NORA_IMAGE_TAG:-v0.9.0-oss-sts-r9}`：默认跟随当前生产版本，发新版本时在 `/opt/nora/.env` 里设 `NORA_IMAGE_TAG=v0.9.0-oss-sts-rN` 即可，不必改 compose 文件。
 
 相关：[[nora-r9-pr5223-released]]、[[weknora-partial-update-field-wipe]]、[[nora-fork-independent-development]]

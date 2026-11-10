@@ -3,9 +3,13 @@ services:
   # NOT a Compose default filename: every `docker compose` invocation must
   # include it explicitly with -f (see bin/nora-up.sh). Omitting it silently
   # restores the official images, which do not contain the STS/G0 fixes.
+  #
+  # The tag must carry the release sequence (rN): the image is rebuilt per
+  # release and only the tagged build is what production actually runs.
+  # Override NORA_IMAGE_TAG in /opt/nora/.env to pin a different build.
   app:
-    image: weknora-app:v0.9.0-oss-sts
+    image: weknora-app:${NORA_IMAGE_TAG:-v0.9.0-oss-sts-r9}
     pull_policy: never
   frontend:
-    image: weknora-ui:v0.9.0-oss-sts
+    image: weknora-ui:${NORA_IMAGE_TAG:-v0.9.0-oss-sts-r9}
     pull_policy: never
