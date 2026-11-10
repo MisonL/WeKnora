@@ -21284,6 +21284,27 @@ const docTemplate = `{
                 }
             }
         },
+        "/system/admin/diagnostics/sts": {
+            "get": {
+                "description": "仅限系统管理员；返回 STS 刷新计数、最近成功/失败时间、凭证明细剩余寿命与错误码",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "系统管理"
+                ],
+                "summary": "查看 OSS STS 凭证刷新诊断信息",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
         "/system/admin/list": {
             "get": {
                 "description": "Retrieve a paginated list of users with system administrator\nprivileges (SystemAdmin only). Supports ` + "`" + `offset` + "`" + ` (default 0)\nand ` + "`" + `limit` + "`" + ` (default 50, max 200) query parameters. Walks the\npartial-friendly idx_users_is_system_admin index.",
@@ -26379,7 +26400,8 @@ const docTemplate = `{
                 2103,
                 2200,
                 2201,
-                2300
+                2300,
+                2400
             ],
             "x-enum-varnames": [
                 "ErrBadRequest",
@@ -26405,7 +26427,8 @@ const docTemplate = `{
                 "ErrAgentInvalidTemperature",
                 "ErrVectorStoreBindingInvalid",
                 "ErrVectorStoreUnavailable",
-                "ErrModelInUse"
+                "ErrModelInUse",
+                "ErrImportPrerequisiteMissing"
             ]
         },
         "github_com_Tencent_WeKnora_internal_handler_dto.CredentialFieldMetadata": {
@@ -26956,6 +26979,9 @@ const docTemplate = `{
                 }
             }
         },
+        "github_com_Tencent_WeKnora_internal_im.CredentialsJSON": {
+            "type": "object"
+        },
         "github_com_Tencent_WeKnora_internal_im.IMChannel": {
             "type": "object",
             "properties": {
@@ -26969,7 +26995,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "credentials": {
-                    "type": "object"
+                    "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_im.CredentialsJSON"
                 },
                 "deleted_at": {
                     "$ref": "#/definitions/gorm.DeletedAt"
@@ -30389,7 +30415,7 @@ const docTemplate = `{
                     }
                 },
                 "failed_entries_url": {
-                    "description": "失败条目CSV下载URL（大量时返回URL）",
+                    "description": "失败条目CSV的对象存储路径（大量时返回）；需走 /files 鉴权代理下载",
                     "type": "string"
                 },
                 "import_mode": {
@@ -31007,7 +31033,7 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "attrs": {
-                    "description": "Attrs is the observed attribute map (e.g. contain.text, contain.data_visual)\nproduced by the attribute pipeline. Absent keys mean \"not observed\".",
+                    "description": "Attrs 包含模型观察属性和解析器的 source.* 来源位置；缺少来源键表示未知。",
                     "type": "object",
                     "additionalProperties": {}
                 },
@@ -34082,19 +34108,44 @@ const docTemplate = `{
                 "access_key": {
                     "type": "string"
                 },
+                "auth_type": {
+                    "description": "RAM role authentication. Only the environment-sourced backend may carry\nthese fields; workspace-level config is rejected at write time and at\nservice construction.",
+                    "type": "string"
+                },
                 "bucket_name": {
                     "type": "string"
                 },
                 "endpoint": {
                     "type": "string"
                 },
+                "external_id": {
+                    "type": "string"
+                },
                 "path_prefix": {
                     "type": "string"
+                },
+                "policy": {
+                    "type": "string"
+                },
+                "presign_ttl_seconds": {
+                    "type": "integer"
                 },
                 "region": {
                     "type": "string"
                 },
+                "role_arn": {
+                    "type": "string"
+                },
+                "role_session_expiration": {
+                    "type": "integer"
+                },
+                "role_session_name": {
+                    "type": "string"
+                },
                 "secret_key": {
+                    "type": "string"
+                },
+                "sts_endpoint": {
                     "type": "string"
                 },
                 "temp_bucket_name": {
@@ -36390,10 +36441,17 @@ const docTemplate = `{
                 "app_id": {
                     "type": "string"
                 },
+                "auth_type": {
+                    "description": "OSS RAM role authentication (aliyun only). AuthType is empty or\n\"access_key\" for static credentials; \"ram_role_arn\" enables STS.",
+                    "type": "string"
+                },
                 "bucket_name": {
                     "type": "string"
                 },
                 "endpoint": {
+                    "type": "string"
+                },
+                "external_id": {
                     "type": "string"
                 },
                 "force_path_style": {
@@ -36405,10 +36463,28 @@ const docTemplate = `{
                 "path_prefix": {
                     "type": "string"
                 },
+                "policy": {
+                    "type": "string"
+                },
+                "presign_ttl_seconds": {
+                    "type": "integer"
+                },
                 "region": {
                     "type": "string"
                 },
+                "role_arn": {
+                    "type": "string"
+                },
+                "role_session_expiration": {
+                    "type": "integer"
+                },
+                "role_session_name": {
+                    "type": "string"
+                },
                 "secret_access_key": {
+                    "type": "string"
+                },
+                "sts_endpoint": {
                     "type": "string"
                 },
                 "temp_bucket_name": {
@@ -40466,7 +40542,18 @@ const docTemplate = `{
             ],
             "properties": {
                 "asr_config": {
-                    "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_types.ASRConfig"
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean"
+                        },
+                        "language": {
+                            "type": "string"
+                        },
+                        "model_id": {
+                            "type": "string"
+                        }
+                    }
                 },
                 "documentSplitting": {
                     "description": "文档分块配置",
@@ -40592,7 +40679,33 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "vlm_config": {
-                    "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_types.VLMConfig"
+                    "type": "object",
+                    "properties": {
+                        "api_key": {
+                            "type": "string"
+                        },
+                        "base_url": {
+                            "type": "string"
+                        },
+                        "custom_instructions": {
+                            "type": "string"
+                        },
+                        "description_language": {
+                            "type": "string"
+                        },
+                        "enabled": {
+                            "type": "boolean"
+                        },
+                        "interface_type": {
+                            "type": "string"
+                        },
+                        "model_id": {
+                            "type": "string"
+                        },
+                        "model_name": {
+                            "type": "string"
+                        }
+                    }
                 }
             }
         },

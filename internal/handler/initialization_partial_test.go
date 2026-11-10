@@ -14,6 +14,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// PUT /initialization/config used to rewrite every optional section from the
+// zero value of fields the payload omitted, so a model-only request cleared
+// VLM/ASR, chunking, graph and question settings (upstream #5218, PR #5223).
+// The request is now merged field by field: absent means "no change", while an
+// explicit false/0/empty value still clears.
 func TestUpdateKBConfigPartial(t *testing.T) {
 	for _, tc := range []struct {
 		name, fields string
@@ -97,13 +102,28 @@ func TestUpdateKBConfigPartial(t *testing.T) {
 		{"VLM explicit disable", `,"vlm_config":{"enabled":false}`, func(t *testing.T, kb *types.KnowledgeBase) {
 			require.False(t, kb.VLMConfig.IsEnabled())
 		}},
+		// Omitted vlm_config never touches legacy APIKey/ModelName/BaseURL.
+		{"omitted vlm keeps legacy binding", `,"multimodal":{"enabled":true}`, func(t *testing.T, kb *types.KnowledgeBase) {
+			require.Equal(t, "legacy", kb.VLMConfig.ModelName)
+			require.Equal(t, "http://legacy", kb.VLMConfig.BaseURL)
+			require.Equal(t, "legacy-key", kb.VLMConfig.APIKey)
+		}},
+		{"ASR explicit disable clears model", `,"asr_config":{"enabled":false}`, func(t *testing.T, kb *types.KnowledgeBase) {
+			require.False(t, kb.ASRConfig.Enabled)
+			require.Empty(t, kb.ASRConfig.ModelID)
+		}},
+		// Disabling question generation must preserve an omitted count, too.
+		{"disable keeps count", `,"questionGeneration":{"enabled":false}`, func(t *testing.T, kb *types.KnowledgeBase) {
+			require.False(t, kb.QuestionGenerationConfig.Enabled)
+			require.Equal(t, 7, kb.QuestionGenerationConfig.QuestionCount)
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			kb := &types.KnowledgeBase{
 				ID: "kb", TenantID: 7, EmbeddingModelID: "embedding",
 				VLMConfig: types.VLMConfig{
 					Enabled: true, ModelID: "vision", DescriptionLanguage: "en",
-					ModelName: "legacy", BaseURL: "http://legacy",
+					ModelName: "legacy", BaseURL: "http://legacy", APIKey: "legacy-key",
 				},
 				ASRConfig: types.ASRConfig{Enabled: true, ModelID: "audio", Language: "en"},
 				ChunkingConfig: types.ChunkingConfig{

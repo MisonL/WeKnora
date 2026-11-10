@@ -133,13 +133,17 @@ func LogStartupEnv(ctx context.Context) {
 		logger.Infof(ctx, "[startup-env]   %s=%s", s.name, formatEnvValue(s, val))
 	}
 
-	// Targeted warnings for footguns. SYSTEM_AES_KEY set to wrong length
-	// is the most common one — utils.GetAESKey() silently falls back to
-	// nil (== "no encryption") when len != 32.
-	if k := os.Getenv("SYSTEM_AES_KEY"); k != "" && len(k) != 32 {
-		logger.Warnf(ctx,
-			"[startup-env] SYSTEM_AES_KEY is set but %d bytes long; AES-256 requires exactly 32 bytes — encryption is DISABLED",
-			len(k))
+	// Targeted warnings for footguns. The only reliable test is the one the
+	// crypto layer itself uses: a 64-character hex key (the `openssl rand
+	// -hex 32` shape) and base64 of 32 bytes are as valid as 32 raw bytes, so
+	// counting characters would report those as disabled when they are not.
+	if k := os.Getenv("SYSTEM_AES_KEY"); k != "" {
+		if _, err := utils.LoadAndValidateAESKey(); err != nil {
+			logger.Warnf(ctx,
+				"[startup-env] SYSTEM_AES_KEY is set but unusable (%v) — encryption is DISABLED; "+
+					"accepted shapes are 32 raw bytes, 64 hex characters, or base64 of 32 bytes",
+				err)
+		}
 	}
 	// Upgrades from example configs keep the published example AES key,
 	// which SystemHMACKey rejects — embed sessions and presigned links then

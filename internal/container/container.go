@@ -1266,9 +1266,18 @@ func migrateLegacyStorageBackends(db *gorm.DB) {
 				// later gains an explicit legacy config, promote the alias to user
 				// source and stop automatic refreshes.
 				if existing.Source == types.StorageBackendSourceEnv {
-					desired := types.StorageBackendFromLegacy(tenant.ID, provider, legacy)
-					if desired == nil && provider == defaultProvider {
+					// Role-backed environment rows are always recomputed from the
+					// environment. FromLegacy never carries role fields, so letting a
+					// workspace legacy config win here would silently downgrade the
+					// row to static credentials and drop the STS identity.
+					var desired *types.StorageBackend
+					if types.NormalizeOSSAuthType(existing.Config.AuthType) == types.OSSAuthTypeRAMRoleARN {
 						desired = types.StorageBackendFromEnvironment(tenant.ID)
+					} else {
+						desired = types.StorageBackendFromLegacy(tenant.ID, provider, legacy)
+						if desired == nil && provider == defaultProvider {
+							desired = types.StorageBackendFromEnvironment(tenant.ID)
+						}
 					}
 					if desired != nil && desired.Provider == provider {
 						_ = db.Model(&types.StorageBackend{}).
@@ -1478,27 +1487,44 @@ func initRawFileService(_ *config.Config) (interfaces.FileService, error) {
 			obsPathPrefix,
 		)
 	case "oss":
+		authType := types.NormalizeOSSAuthType(os.Getenv("OSS_AUTH_TYPE"))
 		if os.Getenv("OSS_ENDPOINT") == "" ||
 			os.Getenv("OSS_REGION") == "" ||
-			os.Getenv("OSS_ACCESS_KEY") == "" ||
-			os.Getenv("OSS_SECRET_KEY") == "" ||
 			os.Getenv("OSS_BUCKET_NAME") == "" {
+			return nil, fmt.Errorf("missing OSS configuration")
+		}
+		if authType == types.OSSAuthTypeAccessKey && (os.Getenv("OSS_ACCESS_KEY") == "" || os.Getenv("OSS_SECRET_KEY") == "") {
 			return nil, fmt.Errorf("missing OSS configuration")
 		}
 		pathPrefix := os.Getenv("OSS_PATH_PREFIX")
 		if pathPrefix == "" {
 			pathPrefix = "weknora/"
 		}
-		return file.NewOssFileServiceWithTempBucket(
-			os.Getenv("OSS_ENDPOINT"),
-			os.Getenv("OSS_REGION"),
-			os.Getenv("OSS_ACCESS_KEY"),
-			os.Getenv("OSS_SECRET_KEY"),
-			os.Getenv("OSS_BUCKET_NAME"),
-			pathPrefix,
-			os.Getenv("OSS_TEMP_BUCKET_NAME"),
-			os.Getenv("OSS_TEMP_REGION"),
-		)
+		cfg := file.OSSAuthConfig{
+			Endpoint:     os.Getenv("OSS_ENDPOINT"),
+			Region:       os.Getenv("OSS_REGION"),
+			AccessKey:    os.Getenv("OSS_ACCESS_KEY"),
+			SecretKey:    os.Getenv("OSS_SECRET_KEY"),
+			BucketName:   os.Getenv("OSS_BUCKET_NAME"),
+			PathPrefix:   pathPrefix,
+			TempBucket:   os.Getenv("OSS_TEMP_BUCKET_NAME"),
+			TempRegion:   os.Getenv("OSS_TEMP_REGION"),
+			AuthType:     authType,
+			RoleARN:      os.Getenv("OSS_ROLE_ARN"),
+			SessionName:  os.Getenv("OSS_ROLE_SESSION_NAME"),
+			STSEndpoint:  os.Getenv("OSS_STS_ENDPOINT"),
+			Policy:       os.Getenv("OSS_POLICY"),
+			ExternalID:   types.OSSRoleExternalIDFromEnv(),
+			Expiration:   envIntValue("OSS_ROLE_SESSION_EXPIRATION"),
+			PresignTTL:   envIntValue("OSS_PRESIGN_TTL_SECONDS"),
+			EnsureBucket: authType == types.OSSAuthTypeAccessKey,
+			// initFileService is registered with must(); a failed probe here
+			// would crash-loop the process and take chat and retrieval down
+			// with it. Retry briefly, then start and let the first storage
+			// request report the failure.
+			TolerateProbeFailure: true,
+		}
+		return file.NewOssFileServiceWithAuthConfig(cfg)
 	case "local":
 		baseDir := os.Getenv("LOCAL_STORAGE_BASE_DIR")
 		if baseDir == "" {
@@ -2329,4 +2355,18 @@ func startAuditLogRetention(
 		runner.StopWithin(cleanupStepTimeout)
 		return nil
 	})
+}
+
+// envIntValue parses an optional integer environment value; malformed or unset
+// values return 0 and are validated later against the effective config.
+func envIntValue(name string) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return 0
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0
+	}
+	return v
 }

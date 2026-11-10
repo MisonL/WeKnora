@@ -332,6 +332,12 @@ func RegisterSystemAdminRoutes(
 
 		adminRoutes.GET("/settings-summary", handler.ListSystemSettingSummaries)
 
+		// OSS STS credential diagnostics (auth mode, refresh counters, token
+		// lifetime, last error code). Intentionally system-admin only: the
+		// /system group's Admin() guard bypasses for API-key principals and
+		// is skipped entirely when tenant RBAC is disabled.
+		adminRoutes.GET("/diagnostics/sts", handler.GetSTSDiagnostics)
+
 		// P1: platform-wide system settings (DB-backed runtime tunables).
 		// Reads return raw model rows / arrays (no `gin.H{"data":...}`
 		// wrapping), matching the project's axios interceptor convention

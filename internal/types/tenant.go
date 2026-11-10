@@ -500,7 +500,11 @@ func (c *ParserEngineConfig) Value() (driver.Value, error) {
 	if c == nil {
 		return nil, nil
 	}
-	return json.Marshal(c)
+	cp := *c
+	if err := encryptParserEngineCredentials(&cp); err != nil {
+		return nil, err
+	}
+	return json.Marshal(cp)
 }
 
 // Scan implements the sql.Scanner interface for ParserEngineConfig
@@ -512,7 +516,11 @@ func (c *ParserEngineConfig) Scan(value interface{}) error {
 	if !ok {
 		return nil
 	}
-	return json.Unmarshal(b, c)
+	if err := json.Unmarshal(b, c); err != nil {
+		return err
+	}
+	decryptParserEngineCredentials(c)
+	return nil
 }
 
 // StorageEngineConfig holds tenant-level storage engine parameters for Local, MinIO, COS, TOS, S3, OSS, KS3, and OBS.
@@ -593,6 +601,33 @@ type OSSEngineConfig struct {
 	UseTempBucket  bool   `json:"use_temp_bucket"`
 	TempBucketName string `json:"temp_bucket_name"`
 	TempRegion     string `json:"temp_region"`
+	// RAM role authentication. Only the environment-sourced backend may carry
+	// these fields; workspace-level config is rejected at write time and at
+	// service construction.
+	AuthType              string `json:"auth_type,omitempty"`
+	RoleARN               string `json:"role_arn,omitempty"`
+	RoleSessionName       string `json:"role_session_name,omitempty"`
+	RoleSessionExpiration int    `json:"role_session_expiration,omitempty"`
+	STSEndpoint           string `json:"sts_endpoint,omitempty"`
+	Policy                string `json:"policy,omitempty"`
+	ExternalID            string `json:"external_id,omitempty"`
+	PresignTTLSeconds     int    `json:"presign_ttl_seconds,omitempty"`
+}
+
+// ValidateForTenantWrite rejects OSS auth modes that must never be persisted
+// through workspace-level configuration: role credentials are allowed only on
+// the environment backend, because that path is not user-editable.
+func (c *OSSEngineConfig) ValidateForTenantWrite() error {
+	if c == nil {
+		return nil
+	}
+	if NormalizeOSSAuthType(c.AuthType) != OSSAuthTypeAccessKey {
+		return fmt.Errorf("oss auth_type %q cannot be configured per workspace", c.AuthType)
+	}
+	if c.RoleARN != "" || c.RoleSessionName != "" || c.STSEndpoint != "" || c.Policy != "" || c.ExternalID != "" || c.RoleSessionExpiration != 0 {
+		return fmt.Errorf("oss role fields cannot be configured per workspace")
+	}
+	return nil
 }
 
 // KS3EngineConfig is for Kingsoft Cloud KS3 object storage.
@@ -621,7 +656,11 @@ func (c *StorageEngineConfig) Value() (driver.Value, error) {
 	if c == nil {
 		return nil, nil
 	}
-	return json.Marshal(c)
+	cp := *c
+	if err := encryptStorageEngineCredentials(&cp); err != nil {
+		return nil, err
+	}
+	return json.Marshal(cp)
 }
 
 // Scan implements the sql.Scanner interface for StorageEngineConfig
@@ -633,7 +672,11 @@ func (c *StorageEngineConfig) Scan(value interface{}) error {
 	if !ok {
 		return nil
 	}
-	return json.Unmarshal(b, c)
+	if err := json.Unmarshal(b, c); err != nil {
+		return err
+	}
+	decryptStorageEngineCredentials(c)
+	return nil
 }
 
 // TenantSandboxConfig is one named sandbox backend a workspace maintains.

@@ -58,3 +58,28 @@ func TestStorageBackendRejectsTraversingPathPrefix(t *testing.T) {
 	}
 	require.Error(t, backend.Validate())
 }
+
+func TestStorageBackendValidateRejectsUnknownSource(t *testing.T) {
+	backend := &StorageBackend{
+		TenantID: 1, Name: "spoofed", Provider: "local",
+		Source: "process",
+	}
+	err := backend.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "source")
+}
+
+func TestStorageBackendValidateAllowsKnownSources(t *testing.T) {
+	for _, source := range []string{StorageBackendSourceUser, StorageBackendSourceEnv} {
+		backend := &StorageBackend{
+			TenantID: 1, Name: "ok", Provider: "local", Source: source,
+		}
+		require.NoError(t, backend.Validate(), "source %q should be valid", source)
+	}
+}
+
+func TestStorageBackendValidateDefaultsSourceToUser(t *testing.T) {
+	backend := &StorageBackend{TenantID: 1, Name: "ok", Provider: "local"}
+	require.NoError(t, backend.Validate())
+	assert.Equal(t, StorageBackendSourceUser, backend.Source)
+}

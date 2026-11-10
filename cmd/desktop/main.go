@@ -34,6 +34,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/runtime"
 	"github.com/Tencent/WeKnora/internal/stream"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/utils"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -214,6 +215,11 @@ func main() {
 	configureDesktopStorage(execPath)
 	configureDesktopFileStorage(execPath)
 	logger.ConfigureFromEnv()
+	// Same fail-closed rule as the server: an unset key is fine, a key that is
+	// set but not decodable must stop startup instead of disabling encryption.
+	if _, err := utils.LoadAndValidateAESKey(); err != nil {
+		panic(fmt.Sprintf("invalid SYSTEM_AES_KEY: %v", err))
+	}
 
 	// Set Gin mode
 	if os.Getenv("GIN_MODE") == "release" {

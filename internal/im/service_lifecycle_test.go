@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
@@ -176,7 +175,7 @@ func createLifecycleChannel(t *testing.T, db *gorm.DB, id, agentID string) *IMCh
 		OutputMode:  "full",
 		Locale:      "en-US",
 		SessionMode: string(SessionModeUser),
-		Credentials: types.JSON(`{"token":"v1"}`),
+		Credentials: CredentialsJSON(`{"token":"v1"}`),
 	}
 	if err := db.Create(channel).Error; err != nil {
 		t.Fatalf("create channel: %v", err)
@@ -196,7 +195,7 @@ func TestEnsureChannelAdapterRefreshesStaleConfig(t *testing.T) {
 		t.Fatalf("start initial channel: %v", err)
 	}
 	if err := db.Model(&IMChannel{}).Where("id = ?", channel.ID).
-		Updates(map[string]any{"agent_id": "agent-new", "credentials": types.JSON(`{"token":"v2"}`)}).Error; err != nil {
+		Updates(map[string]any{"agent_id": "agent-new", "credentials": CredentialsJSON(`{"token":"v2"}`)}).Error; err != nil {
 		t.Fatalf("update durable channel: %v", err)
 	}
 
@@ -303,7 +302,7 @@ func TestChannelConfigEventReloadsOtherReplica(t *testing.T) {
 	}
 	updated := *channel
 	updated.AgentID = "agent-new"
-	updated.Credentials = types.JSON(`{"token":"v2"}`)
+	updated.Credentials = CredentialsJSON(`{"token":"v2"}`)
 	if err := svcOne.UpdateChannel(&updated); err != nil {
 		t.Fatalf("update channel: %v", err)
 	}
@@ -415,17 +414,17 @@ func TestSameChannelRuntimeConfigUsesSemanticCredentials(t *testing.T) {
 		OutputMode:  "full",
 		Locale:      "en-US",
 		SessionMode: string(SessionModeUser),
-		Credentials: types.JSON(`{"token":"secret","timeout":10}`),
+		Credentials: CredentialsJSON(`{"token":"secret","timeout":10}`),
 		UpdatedAt:   now,
 	}
 	fresh := *cached
-	fresh.Credentials = types.JSON(`{"timeout":10,"token":"secret"}`)
+	fresh.Credentials = CredentialsJSON(`{"timeout":10,"token":"secret"}`)
 	fresh.UpdatedAt = now.Truncate(time.Microsecond)
 
 	if !sameChannelRuntimeConfig(cached, &fresh) {
 		t.Fatal("semantic-equivalent credentials or timestamp precision triggered a rebuild")
 	}
-	fresh.Credentials = types.JSON(`{"timeout":10,"token":"changed"}`)
+	fresh.Credentials = CredentialsJSON(`{"timeout":10,"token":"changed"}`)
 	if sameChannelRuntimeConfig(cached, &fresh) {
 		t.Fatal("changed credentials did not trigger a rebuild")
 	}

@@ -1590,7 +1590,8 @@ export default {
       importFailed: '가져오기 실패',
       waiting: '대기 중...',
       importInProgress: '가져오기가 진행 중입니다. 완료될 때까지 기다려 주세요.',
-      noFailedRecords: '다운로드할 실패 기록이 없습니다'
+      noFailedRecords: '다운로드할 실패 기록이 없습니다',
+      failedEntriesExpired: '실패 항목 링크가 만료되었습니다. 다시 가져와 새 링크를 생성하세요.',
     }
   },
   agentEditor: {

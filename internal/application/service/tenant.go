@@ -65,6 +65,15 @@ func (s *tenantService) CreateTenant(ctx context.Context, tenant *types.Tenant) 
 		})
 		return nil, err
 	}
+	// Tenant configuration must never carry RAM role credentials, even for a
+	// superuser-created tenant. Role credentials are reserved for the
+	// process-wide environment backend (see NewFileServiceFromStorageConfig).
+	if tenant.StorageEngineConfig != nil && tenant.StorageEngineConfig.OSS != nil {
+		if err := tenant.StorageEngineConfig.OSS.ValidateForTenantWrite(); err != nil {
+			logger.ErrorWithFields(ctx, err, map[string]interface{}{"tenant_name": tenant.Name})
+			return nil, err
+		}
+	}
 
 	logger.Info(ctx, "Saving tenant information to database")
 	if err := s.repo.CreateTenant(ctx, tenant); err != nil {
@@ -166,6 +175,12 @@ func (s *tenantService) UpdateTenant(ctx context.Context, tenant *types.Tenant) 
 
 	logger.Infof(ctx, "Updating tenant, ID: %d, name: %s", tenant.ID, tenant.Name)
 
+	if tenant.StorageEngineConfig != nil && tenant.StorageEngineConfig.OSS != nil {
+		if err := tenant.StorageEngineConfig.OSS.ValidateForTenantWrite(); err != nil {
+			logger.ErrorWithFields(ctx, err, map[string]interface{}{"tenant_id": tenant.ID})
+			return nil, err
+		}
+	}
 	if err := s.validateStorageBucketUniqueness(ctx, tenant); err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"tenant_id": tenant.ID,

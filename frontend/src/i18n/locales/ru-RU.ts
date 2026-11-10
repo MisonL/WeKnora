@@ -1590,7 +1590,8 @@ export default {
       importFailed: 'Ошибка импорта',
       waiting: 'Ожидание...',
       importInProgress: 'Импорт выполняется, дождитесь завершения',
-      noFailedRecords: 'Нет записей с ошибками для скачивания'
+      noFailedRecords: 'Нет записей с ошибками для скачивания',
+      failedEntriesExpired: 'Срок действия ссылки на список ошибок истёк. Повторите импорт, чтобы создать новую ссылку.',
     }
   },
   agentEditor: {

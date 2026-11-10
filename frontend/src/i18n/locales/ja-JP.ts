@@ -8358,7 +8358,8 @@ export default {
       importFailed: 'インポート失敗',
       waiting: '待機中...',
       importInProgress: 'インポートを実行中です。完了までお待ちください',
-      noFailedRecords: 'ダウンロードできる失敗レコードはありません'
+      noFailedRecords: 'ダウンロードできる失敗レコードはありません',
+      failedEntriesExpired: '失敗明細のリンクの有効期限が切れました。再インポートして新しいリンクを生成してください。',
     }
   },
   mermaid: {

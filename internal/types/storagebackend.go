@@ -76,6 +76,23 @@ func (b *StorageBackend) Validate() error {
 	if b.Status != StorageBackendStatusActive && b.Status != StorageBackendStatusDisabled {
 		return errors.NewValidationError("status must be active or disabled")
 	}
+	// Only the two known origins are accepted. This keeps a request from
+	// claiming an unrecognized source that a downstream gate might treat
+	// loosely; role credentials are only ever allowed for "env".
+	if b.Source == "" {
+		b.Source = StorageBackendSourceUser
+	}
+	switch b.Source {
+	case StorageBackendSourceUser, StorageBackendSourceEnv:
+	default:
+		return errors.NewValidationError(fmt.Sprintf("unsupported storage backend source: %q", b.Source))
+	}
+	// Role credentials may only come from the environment snapshot. This is a
+	// whitelist (not an equality check against "user") so that any future or
+	// misspelled source cannot slip a role config through.
+	if NormalizeOSSAuthType(b.Config.AuthType) == OSSAuthTypeRAMRoleARN && b.Source != StorageBackendSourceEnv {
+		return errors.NewValidationError("oss ram_role_arn is only allowed on the environment storage backend")
+	}
 	return b.Config.ValidateForProvider(b.Provider)
 }
 
@@ -105,19 +122,33 @@ type StorageBackendConfig struct {
 	UseTempBucket   bool   `json:"use_temp_bucket,omitempty"`
 	TempBucketName  string `json:"temp_bucket_name,omitempty"`
 	TempRegion      string `json:"temp_region,omitempty"`
+	// OSS RAM role authentication (aliyun only). AuthType is empty or
+	// "access_key" for static credentials; "ram_role_arn" enables STS.
+	AuthType              string `json:"auth_type,omitempty"`
+	RoleARN               string `json:"role_arn,omitempty"`
+	RoleSessionName       string `json:"role_session_name,omitempty"`
+	RoleSessionExpiration int    `json:"role_session_expiration,omitempty"`
+	STSEndpoint           string `json:"sts_endpoint,omitempty"`
+	Policy                string `json:"policy,omitempty"`
+	ExternalID            string `json:"external_id,omitempty"`
+	PresignTTLSeconds     int    `json:"presign_ttl_seconds,omitempty"`
 }
 
 func (c StorageBackendConfig) Value() (driver.Value, error) {
 	if key := utils.GetAESKey(); key != nil {
 		if c.AccessKeyID != "" {
-			if encrypted, err := utils.EncryptAESGCM(c.AccessKeyID, key); err == nil {
-				c.AccessKeyID = encrypted
+			encrypted, err := utils.EncryptAESGCM(c.AccessKeyID, key)
+			if err != nil {
+				return nil, fmt.Errorf("encrypt storage backend access key: %w", err)
 			}
+			c.AccessKeyID = encrypted
 		}
 		if c.SecretAccessKey != "" {
-			if encrypted, err := utils.EncryptAESGCM(c.SecretAccessKey, key); err == nil {
-				c.SecretAccessKey = encrypted
+			encrypted, err := utils.EncryptAESGCM(c.SecretAccessKey, key)
+			if err != nil {
+				return nil, fmt.Errorf("encrypt storage backend secret key: %w", err)
 			}
+			c.SecretAccessKey = encrypted
 		}
 	}
 	return json.Marshal(c)
@@ -198,6 +229,31 @@ func (c StorageBackendConfig) ValidateForProvider(provider string) error {
 			}
 		}
 		return nil
+	case "oss":
+		for name, value := range map[string]string{"endpoint": c.Endpoint, "region": c.Region, "bucket_name": c.BucketName} {
+			if err := required(name, value); err != nil {
+				return err
+			}
+		}
+		switch NormalizeOSSAuthType(c.AuthType) {
+		case OSSAuthTypeRAMRoleARN:
+			// Caller credentials are still required to call STS AssumeRole.
+			for name, value := range map[string]string{"access_key_id": c.AccessKeyID, "secret_access_key": c.SecretAccessKey} {
+				if err := required(name, value); err != nil {
+					return err
+				}
+			}
+			return ValidateOSSRoleAuth(c.RoleARN, c.RoleSessionName, c.STSEndpoint, c.Policy, c.RoleSessionExpiration)
+		case OSSAuthTypeAccessKey:
+			for name, value := range map[string]string{"access_key_id": c.AccessKeyID, "secret_access_key": c.SecretAccessKey} {
+				if err := required(name, value); err != nil {
+					return err
+				}
+			}
+			return nil
+		default:
+			return errors.NewValidationError("unsupported oss auth_type: " + c.AuthType)
+		}
 	default:
 		for name, value := range map[string]string{"endpoint": c.Endpoint, "region": c.Region, "access_key_id": c.AccessKeyID, "secret_access_key": c.SecretAccessKey, "bucket_name": c.BucketName} {
 			if err := required(name, value); err != nil {
@@ -239,7 +295,10 @@ func (b StorageBackend) ToStorageEngineConfig() *StorageEngineConfig {
 	case "s3":
 		result.S3 = &S3EngineConfig{Endpoint: c.Endpoint, Region: c.Region, AccessKey: c.AccessKeyID, SecretKey: c.SecretAccessKey, BucketName: c.BucketName, PathPrefix: c.PathPrefix, UseSSL: c.UseSSL, ForcePathStyle: c.ForcePathStyle}
 	case "oss":
-		result.OSS = &OSSEngineConfig{Endpoint: c.Endpoint, Region: c.Region, AccessKey: c.AccessKeyID, SecretKey: c.SecretAccessKey, BucketName: c.BucketName, PathPrefix: c.PathPrefix, UseTempBucket: c.UseTempBucket, TempBucketName: c.TempBucketName, TempRegion: c.TempRegion}
+		// Auth fields are carried through so the resolver can build an STS
+		// client. Whether they are *allowed* is decided by the source gate in
+		// NewFileServiceFromStorageConfig, not here.
+		result.OSS = &OSSEngineConfig{Endpoint: c.Endpoint, Region: c.Region, AccessKey: c.AccessKeyID, SecretKey: c.SecretAccessKey, BucketName: c.BucketName, PathPrefix: c.PathPrefix, UseTempBucket: c.UseTempBucket, TempBucketName: c.TempBucketName, TempRegion: c.TempRegion, AuthType: c.AuthType, RoleARN: c.RoleARN, RoleSessionName: c.RoleSessionName, RoleSessionExpiration: c.RoleSessionExpiration, STSEndpoint: c.STSEndpoint, Policy: c.Policy, ExternalID: c.ExternalID, PresignTTLSeconds: c.PresignTTLSeconds}
 	case "ks3":
 		result.KS3 = &KS3EngineConfig{Endpoint: c.Endpoint, Region: c.Region, AccessKey: c.AccessKeyID, SecretKey: c.SecretAccessKey, BucketName: c.BucketName, PathPrefix: c.PathPrefix}
 	case "obs":
@@ -347,7 +406,25 @@ func StorageBackendFromEnvironment(tenantID uint64) *StorageBackend {
 	case "s3":
 		b.Config = StorageBackendConfig{Endpoint: os.Getenv("S3_ENDPOINT"), Region: os.Getenv("S3_REGION"), AccessKeyID: os.Getenv("S3_ACCESS_KEY"), SecretAccessKey: os.Getenv("S3_SECRET_KEY"), BucketName: os.Getenv("S3_BUCKET_NAME"), PathPrefix: os.Getenv("S3_PATH_PREFIX"), UseSSL: !strings.EqualFold(os.Getenv("S3_USE_SSL"), "false"), ForcePathStyle: strings.EqualFold(os.Getenv("S3_FORCE_PATH_STYLE"), "true")}
 	case "oss":
-		b.Config = StorageBackendConfig{Endpoint: os.Getenv("OSS_ENDPOINT"), Region: os.Getenv("OSS_REGION"), AccessKeyID: os.Getenv("OSS_ACCESS_KEY"), SecretAccessKey: os.Getenv("OSS_SECRET_KEY"), BucketName: os.Getenv("OSS_BUCKET_NAME"), PathPrefix: os.Getenv("OSS_PATH_PREFIX"), UseTempBucket: os.Getenv("OSS_TEMP_BUCKET_NAME") != "", TempBucketName: os.Getenv("OSS_TEMP_BUCKET_NAME"), TempRegion: os.Getenv("OSS_TEMP_REGION")}
+		b.Config = StorageBackendConfig{
+			Endpoint:              os.Getenv("OSS_ENDPOINT"),
+			Region:                os.Getenv("OSS_REGION"),
+			AccessKeyID:           os.Getenv("OSS_ACCESS_KEY"),
+			SecretAccessKey:       os.Getenv("OSS_SECRET_KEY"),
+			BucketName:            os.Getenv("OSS_BUCKET_NAME"),
+			PathPrefix:            os.Getenv("OSS_PATH_PREFIX"),
+			UseTempBucket:         os.Getenv("OSS_TEMP_BUCKET_NAME") != "",
+			TempBucketName:        os.Getenv("OSS_TEMP_BUCKET_NAME"),
+			TempRegion:            os.Getenv("OSS_TEMP_REGION"),
+			AuthType:              NormalizeOSSAuthType(os.Getenv("OSS_AUTH_TYPE")),
+			RoleARN:               os.Getenv("OSS_ROLE_ARN"),
+			RoleSessionName:       os.Getenv("OSS_ROLE_SESSION_NAME"),
+			RoleSessionExpiration: envInt("OSS_ROLE_SESSION_EXPIRATION"),
+			STSEndpoint:           os.Getenv("OSS_STS_ENDPOINT"),
+			Policy:                os.Getenv("OSS_POLICY"),
+			ExternalID:            OSSRoleExternalIDFromEnv(),
+			PresignTTLSeconds:     envInt("OSS_PRESIGN_TTL_SECONDS"),
+		}
 	case "obs":
 		b.Config = StorageBackendConfig{Endpoint: os.Getenv("OBS_ENDPOINT"), Region: os.Getenv("OBS_REGION"), AccessKeyID: os.Getenv("OBS_ACCESS_KEY"), SecretAccessKey: os.Getenv("OBS_SECRET_KEY"), BucketName: os.Getenv("OBS_BUCKET_NAME"), PathPrefix: os.Getenv("OBS_PATH_PREFIX"), UseSSL: !strings.EqualFold(os.Getenv("OBS_USE_SSL"), "false")}
 	default:

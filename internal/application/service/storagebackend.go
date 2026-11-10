@@ -53,6 +53,11 @@ func (s *StorageBackendService) Create(ctx context.Context, backend *types.Stora
 	if err := backend.Validate(); err != nil {
 		return err
 	}
+	// Role-backed backend that is not sourced from the environment is
+	// rejected before the connectivity check.
+	if err := rejectUserRoleBackend(backend); err != nil {
+		return err
+	}
 	if err := validateStorageBackendEndpoint(backend); err != nil {
 		return err
 	}
@@ -189,12 +194,22 @@ func (s *StorageBackendService) SetDefault(ctx context.Context, tenantID uint64,
 		if backend.Status != types.StorageBackendStatusActive {
 			return apperrors.NewBadRequestError("only an active storage backend can be the default")
 		}
+		// Making a row the default promotes it onto every unresolvable KB, so
+		// the credential-source gate has to run here as well, not only on write.
+		if err := rejectUserRoleBackend(&backend); err != nil {
+			return apperrors.NewBadRequestError("storage backend cannot be the default").WithDetails(err.Error())
+		}
 		return tx.Model(&types.Tenant{}).Where("id = ?", tenantID).Update("default_storage_backend_id", id).Error
 	})
 }
 
 func (s *StorageBackendService) Test(ctx context.Context, backend *types.StorageBackend) error {
 	if err := backend.Validate(); err != nil {
+		return err
+	}
+	// Role-backed backend that is not sourced from the environment is
+	// rejected before the connectivity check.
+	if err := rejectUserRoleBackend(backend); err != nil {
 		return err
 	}
 	if err := validateStorageBackendEndpoint(backend); err != nil {
@@ -216,7 +231,7 @@ func (s *StorageBackendService) Test(ctx context.Context, backend *types.Storage
 	c := backend.Config
 	switch backend.Provider {
 	case "local":
-		fileService, _, err := filesvc.NewFileServiceFromStorageConfig("local", backend.ToStorageEngineConfig(), "")
+		fileService, _, err := filesvc.NewFileServiceFromStorageConfig("local", backend.ToStorageEngineConfig(), "", backend.Source)
 		if err != nil {
 			return err
 		}
@@ -238,7 +253,20 @@ func (s *StorageBackendService) Test(ctx context.Context, backend *types.Storage
 	case "s3":
 		return filesvc.CheckS3ConnectivityWithOptions(ctx, c.Endpoint, c.AccessKeyID, c.SecretAccessKey, c.BucketName, c.Region, c.ForcePathStyle)
 	case "oss":
-		return filesvc.CheckOssConnectivity(ctx, c.Endpoint, c.Region, c.AccessKeyID, c.SecretAccessKey, c.BucketName)
+		return filesvc.CheckOssConnectivityWithConfig(ctx, filesvc.OSSAuthConfig{
+			Endpoint:    c.Endpoint,
+			Region:      c.Region,
+			AccessKey:   c.AccessKeyID,
+			SecretKey:   c.SecretAccessKey,
+			BucketName:  c.BucketName,
+			AuthType:    types.NormalizeOSSAuthType(c.AuthType),
+			RoleARN:     c.RoleARN,
+			SessionName: c.RoleSessionName,
+			STSEndpoint: c.STSEndpoint,
+			Policy:      c.Policy,
+			ExternalID:  c.ExternalID,
+			Expiration:  c.RoleSessionExpiration,
+		})
 	case "ks3":
 		return filesvc.CheckKS3Connectivity(ctx, c.Endpoint, c.Region, c.AccessKeyID, c.SecretAccessKey, c.BucketName)
 	case "obs":
@@ -300,6 +328,9 @@ func (s *StorageBackendService) ResolveBackend(ctx context.Context, tenant *type
 	if backendID == "" && provider != "" {
 		backend, err := s.repo.FindLegacyAlias(ctx, tenant.ID, provider)
 		if err != nil || backend != nil {
+			if err := rejectUserRoleBackend(backend); err != nil {
+				return nil, err
+			}
 			return backend, err
 		}
 	}
@@ -314,12 +345,31 @@ func (s *StorageBackendService) ResolveBackend(ctx context.Context, tenant *type
 		if backend == nil {
 			return nil, fmt.Errorf("storage backend not found")
 		}
+		// Check the credential source before the status so a disabled user
+		// role row is still rejected with the distinguishable sentinel.
+		if err := rejectUserRoleBackend(backend); err != nil {
+			return nil, err
+		}
 		if backend.Status != types.StorageBackendStatusActive {
 			return nil, fmt.Errorf("storage backend is not active")
 		}
 		return backend, nil
 	}
 	return nil, nil
+}
+
+// rejectUserRoleBackend refuses a role-backed backend unless it came from the
+// environment snapshot. Returning the sentinel lets every resolver keep the
+// rejection instead of silently falling back to another identity.
+func rejectUserRoleBackend(backend *types.StorageBackend) error {
+	if backend == nil {
+		return nil
+	}
+	if types.NormalizeOSSAuthType(backend.Config.AuthType) == types.OSSAuthTypeRAMRoleARN &&
+		backend.Source != types.StorageBackendSourceEnv {
+		return fmt.Errorf("%w: storage backend %s carries role credentials outside the environment", filesvc.ErrStorageRoleNotAllowed, backend.ID)
+	}
+	return nil
 }
 
 func (s *StorageBackendService) ResolveFileService(ctx context.Context, tenant *types.Tenant, backendID, provider, localBaseDir string) (interfaces.FileService, string, error) {
@@ -332,7 +382,7 @@ func (s *StorageBackendService) ResolveFileService(ctx context.Context, tenant *
 		return nil, "", err
 	}
 	if backend != nil {
-		inner, provider, err := filesvc.NewFileServiceFromStorageConfig(backend.Provider, backend.ToStorageEngineConfig(), localBaseDir)
+		inner, provider, err := filesvc.NewFileServiceFromStorageConfig(backend.Provider, backend.ToStorageEngineConfig(), localBaseDir, backend.Source)
 		if err != nil {
 			return nil, provider, err
 		}
@@ -340,11 +390,15 @@ func (s *StorageBackendService) ResolveFileService(ctx context.Context, tenant *
 		return filesvc.NewResourceCatalogFileService(scoped, s.resourceCatalog), provider, nil
 	}
 	sec := tenant.StorageEngineConfig
+	// Workspace config is untrusted; only a config that came from the
+	// environment snapshot may carry role credentials.
+	source := "tenant"
 	if strings.TrimSpace(provider) == "" && storageEngineDefaultProvider(sec) == "" {
 		if env := types.StorageBackendFromEnvironment(tenant.ID); env != nil {
 			provider = env.Provider
 			if sec == nil {
 				sec = env.ToStorageEngineConfig()
+				source = types.StorageBackendSourceEnv
 			}
 		}
 	}
@@ -352,6 +406,7 @@ func (s *StorageBackendService) ResolveFileService(ctx context.Context, tenant *
 		provider,
 		sec,
 		localBaseDir,
+		source,
 	)
 	if err != nil {
 		return nil, resolvedProvider, err
