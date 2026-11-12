@@ -8,22 +8,23 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-// Failure modes: the variable is ignored (pool stays unlimited and the server
-// refuses connections past max_connections); a bad value crashes startup or
-// silently sets an unintended cap such as 0 or a negative number; an unset
-// variable changes the existing unlimited default.
+// Behavior: the pool is always capped. DB_MAX_OPEN_CONNS overrides the
+// default; unset, zero and negative values all fall back to the default cap
+// so a burst of parallel requests can never exhaust the server's
+// max_connections (default cap waits instead of failing).
 func TestApplyDBMaxOpenConns(t *testing.T) {
+	const wantDefault = 20
 	cases := []struct {
 		name string
 		env  string
 		want int
 	}{
-		{name: "unset keeps the unlimited default", env: "", want: 0},
+		{name: "unset falls back to the default cap", env: "", want: wantDefault},
 		{name: "positive value caps the pool", env: "40", want: 40},
 		{name: "surrounding spaces are tolerated", env: " 25 ", want: 25},
-		{name: "zero means unlimited", env: "0", want: 0},
-		{name: "negative value is ignored", env: "-5", want: 0},
-		{name: "non-numeric value is ignored", env: "forty", want: 0},
+		{name: "zero falls back to the default cap", env: "0", want: wantDefault},
+		{name: "negative value falls back to the default cap", env: "-5", want: wantDefault},
+		{name: "non-numeric value falls back to the default cap", env: "forty", want: wantDefault},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
