@@ -42,15 +42,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
+      # uv resolves and downloads the pinned interpreter itself, so
+      # actions/setup-python is not needed here. It was also the reason this
+      # job broke: setup-python has no 3.10.18 build for ubuntu-26.04, while
+      # `uv sync --python 3.10.18` fetches a standalone build on any runner.
       - name: Install uv
         uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
           cache-dependency-glob: docreader/uv.lock
+
+      - name: Install the pinned interpreter
+        run: uv python install ${{ env.PYTHON_VERSION }}
 
       - name: Install Python dependencies
         run: uv sync --project docreader --locked --no-dev --python ${{ env.PYTHON_VERSION }}
