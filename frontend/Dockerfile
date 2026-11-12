@@ -27,7 +27,7 @@ FROM --platform=$BUILDPLATFORM node:24-bookworm-slim@sha256:ba849c60be29959425b8
 
 WORKDIR /frontend
 
-ARG NPM_REGISTRY=
+ARG NPM_REGISTRY=https://registry.npmmirror.com
 ARG NODE_MAX_OLD_SPACE_SIZE=4096
 
 ENV VITE_IS_DOCKER=true

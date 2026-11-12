@@ -131,9 +131,9 @@ build_app_image() {
     docker build \
         --platform $PLATFORM \
         --build-arg GOPRIVATE_ARG=${GOPRIVATE:-""} \
-        --build-arg GOPROXY_ARG=${GOPROXY:-"https://goproxy.cn,direct"} \
+        --build-arg GOPROXY_ARG=${GOPROXY:-"https://mirrors.aliyun.com/goproxy/,direct"} \
         --build-arg GOSUMDB_ARG=${GOSUMDB:-"off"} \
-        --build-arg APK_MIRROR_ARG="${APK_MIRROR_ARG:-}" \
+        --build-arg APK_MIRROR_ARG="${APK_MIRROR_ARG:-mirrors.aliyun.com}" \
         --build-arg VERSION_ARG="$VERSION" \
         --build-arg COMMIT_ID_ARG="$COMMIT_ID" \
         --build-arg BUILD_TIME_ARG="$BUILD_TIME" \
@@ -164,7 +164,7 @@ build_docreader_image() {
         --platform $PLATFORM \
         --build-arg PLATFORM=$PLATFORM \
         --build-arg TARGETARCH=$TARGETARCH \
-        --build-arg APT_MIRROR="${APT_MIRROR:-}" \
+        --build-arg APT_MIRROR="${APT_MIRROR:-http://mirrors.aliyun.com}" \
         --build-arg PLAYWRIGHT_DOWNLOAD_HOST="${PLAYWRIGHT_DOWNLOAD_HOST:-}" \
         --build-arg PLAYWRIGHT_WEBKIT_DOWNLOAD_HOST="${PLAYWRIGHT_WEBKIT_DOWNLOAD_HOST:-}" \
         --build-arg VERSION_ARG="$VERSION" \
@@ -194,7 +194,7 @@ build_frontend_image() {
     docker build \
         --platform $PLATFORM \
         --build-arg VITE_FRONTEND_COMMIT="$COMMIT_ID" \
-        ${NPM_REGISTRY:+--build-arg NPM_REGISTRY="$NPM_REGISTRY"} \
+        --build-arg NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmmirror.com}" \
         ${NODE_MAX_OLD_SPACE_SIZE:+--build-arg NODE_MAX_OLD_SPACE_SIZE="$NODE_MAX_OLD_SPACE_SIZE"} \
         -f frontend/Dockerfile \
         -t wechatopenai/weknora-ui:latest \
