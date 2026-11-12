@@ -172,6 +172,11 @@ func MergeParserEngineConfigForUpdate(incoming, existing *ParserEngineConfig) *P
 	out.MinerUAPIKey = PreserveIfRedacted(out.MinerUAPIKey, prev.MinerUAPIKey)
 	out.MinerUServerAPIKey = PreserveIfRedacted(out.MinerUServerAPIKey, prev.MinerUServerAPIKey)
 	out.PaddleOCRVLCloudToken = PreserveIfRedacted(out.PaddleOCRVLCloudToken, prev.PaddleOCRVLCloudToken)
+	// Keep the ciphertext of credentials the load path could not decrypt, so
+	// this settings save restores them instead of blanking the column.
+	if existing != nil {
+		out.undecryptable = existing.undecryptable
+	}
 	// Chat attachment parser rules are configured per agent; preserve any legacy
 	// tenant-level rules when the settings UI omits this field on engine updates.
 	if incoming.ChatParserEngineRules == nil && existing != nil {
@@ -264,6 +269,11 @@ func MergeStorageEngineConfigForUpdate(incoming, existing *StorageEngineConfig) 
 		obs.AccessKey = PreserveIfRedacted(obs.AccessKey, prev.AccessKey)
 		obs.SecretKey = PreserveIfRedacted(obs.SecretKey, prev.SecretKey)
 		out.OBS = &obs
+	}
+	// Keep the ciphertext of credentials the load path could not decrypt, so
+	// this settings save restores them instead of blanking the column.
+	if existing != nil {
+		out.undecryptable = existing.undecryptable
 	}
 	return &out
 }
@@ -406,6 +416,12 @@ func MergeSandboxConfigForUpdate(incoming, existing *TenantSandboxConfig) *Tenan
 		if out.UserSandboxEmptyRetentionDays == 0 {
 			out.UserSandboxEmptyRetentionDays = existing.UserSandboxEmptyRetentionDays
 		}
+	}
+
+	// Keep the ciphertext of credentials the load path could not decrypt, so
+	// this settings save restores them instead of blanking the column.
+	if existing != nil {
+		out.undecryptable = existing.undecryptable
 	}
 
 	return &out

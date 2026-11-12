@@ -85,7 +85,7 @@ func TestIMChannelBeforeCreate_SessionModeDefault(t *testing.T) {
 				AgentID:     "agent-1",
 				Platform:    "slack",
 				SessionMode: tt.inputMode,
-				Credentials: []byte("{}"),
+				Credentials: NewCredentialsJSON([]byte("{}")),
 			}
 			err := ch.BeforeCreate(&gorm.DB{})
 			if err != nil {
@@ -104,7 +104,7 @@ func TestIMChannelBeforeCreate_InvalidSessionMode(t *testing.T) {
 		AgentID:     "agent-1",
 		Platform:    "slack",
 		SessionMode: "invalid",
-		Credentials: []byte("{}"),
+		Credentials: NewCredentialsJSON([]byte("{}")),
 	}
 	err := ch.BeforeCreate(&gorm.DB{})
 	if err == nil {
@@ -129,7 +129,7 @@ func TestIMChannelBeforeSave_SessionModeValidation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ch := &IMChannel{
 				SessionMode: tt.sessionMode,
-				Credentials: []byte("{}"),
+				Credentials: NewCredentialsJSON([]byte("{}")),
 			}
 			err := ch.BeforeSave(&gorm.DB{})
 			if tt.wantErr {
@@ -163,8 +163,8 @@ func TestSessionModeConstants(t *testing.T) {
 func TestComputeBotIdentity_FeishuAndLarkAreDistinct(t *testing.T) {
 	const creds = `{"app_id":"cli_a1b2c3","app_secret":"s"}`
 
-	feishu := &IMChannel{Platform: "feishu", Credentials: []byte(creds)}
-	lark := &IMChannel{Platform: "lark", Credentials: []byte(creds)}
+	feishu := &IMChannel{Platform: "feishu", Credentials: NewCredentialsJSON([]byte(creds))}
+	lark := &IMChannel{Platform: "lark", Credentials: NewCredentialsJSON([]byte(creds))}
 
 	feishuID := feishu.computeBotIdentity()
 	larkID := lark.computeBotIdentity()
@@ -181,7 +181,7 @@ func TestComputeBotIdentity_FeishuAndLarkAreDistinct(t *testing.T) {
 }
 
 func TestComputeBotIdentity_LarkWithoutAppID(t *testing.T) {
-	ch := &IMChannel{Platform: "lark", Credentials: []byte(`{"app_secret":"s"}`)}
+	ch := &IMChannel{Platform: "lark", Credentials: NewCredentialsJSON([]byte(`{"app_secret":"s"}`))}
 	if got := ch.computeBotIdentity(); got != "" {
 		t.Errorf("identity = %q, want empty when app_id is missing", got)
 	}
@@ -191,10 +191,10 @@ func TestIMChannelComputeBotIdentity_YunzhijiaUsesYZJToken(t *testing.T) {
 	makeChannel := func(sendMsgURL string) *IMChannel {
 		return &IMChannel{
 			Platform: "yunzhijia",
-			Credentials: []byte(fmt.Sprintf(
+			Credentials: NewCredentialsJSON([]byte(fmt.Sprintf(
 				`{"send_msg_url":%q}`,
 				sendMsgURL,
-			)),
+			))),
 		}
 	}
 
