@@ -179,3 +179,86 @@ func TestReadFailureIsReportedAsSuch(t *testing.T) {
 	require.ErrorAs(t, err, &transportErr)
 	assert.Equal(t, "read response", transportErr.Op)
 }
+
+// 429 and the 5xx family mean "the backend was unavailable", so sending the
+// request again is exactly what the vendor asked for. Before this, every
+// non-2xx was final and a rate-limited embedding call failed outright.
+func TestPostJSONWithRetryRetriesRateLimitAndServerErrors(t *testing.T) {
+	for _, status := range []int{
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Setenv("SSRF_WHITELIST", "127.0.0.1")
+			attempts := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				attempts++
+				if attempts < 3 {
+					w.WriteHeader(status)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			}))
+			defer server.Close()
+
+			var out map[string]any
+			err := Endpoint{}.PostJSONWithRetry(
+				context.Background(), server.URL, map[string]any{}, &out, fastPolicy(), "test",
+			)
+			require.NoError(t, err)
+			assert.Equal(t, true, out["ok"])
+			assert.Equal(t, 3, attempts, "a retryable status must be retried until it succeeds")
+		})
+	}
+}
+
+// A 4xx that is not a rate limit is the vendor rejecting the request body:
+// repeating it cannot change the answer, so it stays final.
+func TestPostJSONWithRetryKeepsOther4xxFinal(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Setenv("SSRF_WHITELIST", "127.0.0.1")
+			attempts := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				attempts++
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+
+			err := Endpoint{}.PostJSONWithRetry(
+				context.Background(), server.URL, map[string]any{}, nil, fastPolicy(), "test",
+			)
+			require.Error(t, err)
+			assert.Equal(t, 1, attempts)
+		})
+	}
+}
+
+// Retry-After is the vendor telling us when to come back. Honouring it beats
+// guessing with our own backoff.
+func TestRetryPolicyHonoursRetryAfter(t *testing.T) {
+	p := RetryPolicy{MaxRetries: 3, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}
+	hint := &HTTPError{StatusCode: http.StatusTooManyRequests, Header: http.Header{"Retry-After": []string{"2"}}}
+
+	wait := p.retryWait(1, hint)
+	assert.GreaterOrEqual(t, wait, time.Second, "the vendor hint must not be shortened by our backoff")
+	assert.LessOrEqual(t, wait, maxRetryAfterHint, "an absurd hint must be capped")
+}
+
+// Jitter keeps a batch of workers from retrying in lockstep; it must stay
+// within the top half of the intended window.
+func TestRetryWaitStaysWithinItsWindow(t *testing.T) {
+	p := RetryPolicy{MaxRetries: 3, BaseDelay: time.Second, MaxDelay: 10 * time.Second}
+	for attempt := 1; attempt <= 3; attempt++ {
+		base := p.delay(attempt)
+		for i := 0; i < 50; i++ {
+			got := p.retryWait(attempt, nil)
+			assert.GreaterOrEqual(t, got, base/2)
+			assert.LessOrEqual(t, got, base)
+		}
+	}
+}

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/api"
@@ -39,6 +41,15 @@ func (c *Client) GetModelID() string { return c.cfg.Endpoint.ModelID }
 func (c *Client) Settings() Config { return c.cfg }
 
 func (c *Client) url() string { return c.cfg.Endpoint.Resolve(defaultPath) }
+
+const (
+	// streamStartRetries is how many times a transient failure of the stream
+	// handshake is retried with exponential backoff.
+	streamStartRetries = 2
+	// streamStartRetryBaseDelay is the wait before the first retry; it doubles
+	// per attempt (500ms, 1s).
+	streamStartRetryBaseDelay = 500 * time.Millisecond
+)
 
 func (c *Client) send(
 	ctx context.Context, messages []api.Message, opts *api.Options, stream bool,
@@ -97,23 +108,83 @@ func (c *Client) Chat(ctx context.Context, messages []api.Message, opts *api.Opt
 	return result, nil
 }
 
+// isTransientOpenError reports whether a failure of the stream handshake is
+// worth retrying. Only transport failures and the retryable statuses count:
+// a 4xx reply is the same rejection on every attempt.
+func isTransientOpenError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var httpErr *api.HTTPError
+	if errors.As(err, &httpErr) {
+		code := httpErr.StatusCode
+		return code == http.StatusRequestTimeout || code == http.StatusTooManyRequests ||
+			code >= http.StatusInternalServerError
+	}
+	var transportErr *api.TransportError
+	if errors.As(err, &transportErr) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	return false
+}
+
 // ChatStream performs a streaming completion.
+//
+// A failure before the stream opens (connect, TLS, non-2xx, a request the
+// transport never got an answer to) is retried when transient, with the last
+// error returned; see isTransientOpenError. Failures after the stream opened
+// surface as error chunks on the returned channel and are the consumer's to
+// retry.
 func (c *Client) ChatStream(
 	ctx context.Context, messages []api.Message, opts *api.Options,
 ) (<-chan types.StreamResponse, error) {
 	ctx, cancel := api.WithLLMTimeout(ctx, api.DefaultStreamTimeout)
-
-	resp, data, err := c.send(ctx, messages, opts, true)
-	if err != nil {
+	var resp *http.Response
+	var data []byte
+	var err error
+	// The caller may retry the handshake itself (the chat pipeline does). In
+	// that case skip the transport-level budget: stacking both would issue up
+	// to 9 handshakes for one user request under a sustained outage.
+	maxStartRetries := streamStartRetries
+	if api.TransportRetryDisabled(ctx) {
+		maxStartRetries = 0
+	}
+	// Once the model rejects images, keep them out of every later attempt:
+	// re-sending them only repeats a request we already know it refuses.
+	var strippedMessages []api.Message
+	for attempt := 0; attempt <= maxStartRetries; attempt++ {
+		if attempt > 0 {
+			delay := streamStartRetryBaseDelay << uint(attempt-1)
+			logger.Infof(ctx, "[LLM Stream] retrying %s (%d/%d) in %v: %v",
+				c.cfg.Endpoint.Model, attempt, maxStartRetries, delay,
+				api.TruncateForDebug(err.Error(), 300))
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				cancel()
+				return nil, ctx.Err()
+			}
+		}
+		resp, data, err = c.send(ctx, messages, opts, true)
+		if err == nil {
+			break
+		}
 		if api.IsMultimodalNotSupportedError(err) {
 			logger.Warnf(ctx, "[LLM Stream] Model %s does not support multimodal, retrying without images",
 				c.cfg.Endpoint.Model)
-			resp, data, err = c.send(ctx, api.StripImagesFromMessages(messages), opts, true)
+			if strippedMessages == nil {
+				strippedMessages = api.StripImagesFromMessages(messages)
+			}
+			resp, data, err = c.send(ctx, strippedMessages, opts, true)
 		}
-		if err != nil {
-			cancel()
-			return nil, fmt.Errorf("create chat completion stream: %w", err)
+		if err == nil || !isTransientOpenError(err) {
+			break
 		}
+	}
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("create chat completion stream: %w", err)
 	}
 
 	ch := make(chan types.StreamResponse)
@@ -465,9 +536,16 @@ func (c *Client) processStream(
 		}
 		event, err := reader.ReadEvent()
 		if err != nil {
-			if err == io.EOF {
+			switch {
+			case err == io.EOF:
 				finish(assembler.EndAtEOF)
-			} else {
+			case errors.Is(err, context.Canceled) && assembler.Finished():
+				// The answer already carried its finish_reason; the caller
+				// cancelled only because it has everything it needs. Closing as
+				// a normal end keeps the usage record and hands the consumer no
+				// spurious error chunk.
+				finish(assembler.EndAtEOF)
+			default:
 				assembler.Fail(ch, err)
 			}
 			return
