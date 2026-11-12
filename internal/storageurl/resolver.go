@@ -2,6 +2,7 @@ package storageurl
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 
@@ -205,9 +206,14 @@ func BuildFileServiceForProvider(
 		sec = tenant.StorageEngineConfig
 	}
 
-	svc, _, err := filesvc.NewFileServiceFromStorageConfig(provider, sec, baseDir)
+	svc, _, err := filesvc.NewFileServiceFromStorageConfig(provider, sec, baseDir, "tenant")
 	if err == nil {
 		return svc
+	}
+	if errors.Is(err, filesvc.ErrStorageRoleNotAllowed) {
+		// Fail all operations instead of substituting the default service: a
+		// rejected role config must not be served under another identity.
+		return filesvc.NewRejectedFileService(err)
 	}
 	if provider == "local" {
 		externalURL := strings.TrimSpace(os.Getenv("APP_EXTERNAL_URL"))

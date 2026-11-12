@@ -95,7 +95,15 @@ require (
 	gorm.io/gorm v1.31.1
 )
 
-require github.com/metakeule/fmtdate v1.1.2 // indirect
+require (
+	github.com/alibabacloud-go/debug v1.0.1 // indirect
+	gopkg.in/ini.v1 v1.67.0 // indirect
+)
+
+require (
+	github.com/aliyun/credentials-go v1.4.14
+	github.com/metakeule/fmtdate v1.1.2 // indirect
+)
 
 require (
 	cloud.google.com/go/auth v0.20.0 // indirect

@@ -16,7 +16,6 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
-	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
 	"github.com/google/uuid"
 )
 
@@ -28,24 +27,24 @@ type ossFileService struct {
 	pathPrefix     string
 	bucketName     string
 	tempBucketName string
+	presignTTL     time.Duration
+	// roleScoped is true when credentials come from STS AssumeRole. In that
+	// mode the bucket must already exist and be readable; creation is not
+	// attempted because the role is scoped to this bucket only.
+	roleScoped bool
 }
 
 const ossScheme = "oss://"
 
-// newOSSClient creates an OSS client using the official Aliyun SDK v2.
+// newOSSClient creates an OSS client using long-lived static credentials.
 func newOSSClient(endpoint, region, accessKey, secretKey string) (*oss.Client, error) {
-	if err := utils.ValidateURLForSSRF(endpoint); err != nil {
-		return nil, fmt.Errorf("unsafe OSS endpoint: %w", err)
-	}
-	creds := credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")
-
-	cfg := oss.LoadDefaultConfig().
-		WithCredentialsProvider(creds).
-		WithRegion(region).
-		WithEndpoint(endpoint).
-		WithHttpClient(objectStorageHTTPClient())
-
-	return oss.NewClient(cfg), nil
+	return newOSSClientWithConfig(OSSAuthConfig{
+		Endpoint:  endpoint,
+		Region:    region,
+		AccessKey: accessKey,
+		SecretKey: secretKey,
+		AuthType:  ossAuthTypeAccessKey,
+	})
 }
 
 // ossEnsureBucket checks if the bucket exists and creates it if missing.
@@ -83,30 +82,58 @@ func NewOssFileService(endpoint, region, accessKey, secretKey, bucketName, pathP
 
 // NewOssFileServiceWithTempBucket creates an Aliyun OSS file service with optional temp bucket.
 func NewOssFileServiceWithTempBucket(endpoint, region, accessKey, secretKey, bucketName, pathPrefix, tempBucketName, tempRegion string) (interfaces.FileService, error) {
-	client, err := newOSSClient(endpoint, region, accessKey, secretKey)
+	return NewOssFileServiceWithAuthConfig(OSSAuthConfig{
+		Endpoint:     endpoint,
+		Region:       region,
+		AccessKey:    accessKey,
+		SecretKey:    secretKey,
+		BucketName:   bucketName,
+		PathPrefix:   pathPrefix,
+		TempBucket:   tempBucketName,
+		TempRegion:   tempRegion,
+		AuthType:     ossAuthTypeAccessKey,
+		EnsureBucket: true,
+	})
+}
+
+// NewOssFileServiceWithAuthConfig builds an OSS-backed FileService from the
+// full auth configuration, including ram_role_arn. Base credentials are the
+// caller AK/SK; in role mode the SDK receives temporary credentials.
+func NewOssFileServiceWithAuthConfig(cfg OSSAuthConfig) (interfaces.FileService, error) {
+	if cfg.AuthType == "" {
+		cfg.AuthType = ossAuthTypeAccessKey
+	}
+	if strings.TrimSpace(cfg.BucketName) == "" {
+		return nil, errors.New("OSS bucket name is required")
+	}
+	client, err := newOSSClientWithConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := ossEnsureBucket(client, bucketName); err != nil {
+	if err := probeOSSAtStartup(client, cfg, cfg.BucketName); err != nil {
 		return nil, err
 	}
 
 	var tempClient *oss.Client
-	if tempBucketName != "" {
+	if cfg.TempBucket != "" {
+		tempRegion := cfg.TempRegion
 		if tempRegion == "" {
-			tempRegion = region
+			tempRegion = cfg.Region
 		}
-		tempClient, err = newOSSClient(endpoint, tempRegion, accessKey, secretKey)
+		tempCfg := cfg
+		tempCfg.Region = tempRegion
+		tempClient, err = newOSSClientWithConfig(tempCfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize OSS temp client: %w", err)
 		}
-		if err := ossEnsureBucket(tempClient, tempBucketName); err != nil {
+		if err := probeOSSAtStartup(tempClient, cfg, cfg.TempBucket); err != nil {
 			return nil, err
 		}
 	}
 
 	// Normalize pathPrefix: ensure it ends with '/' if not empty
+	pathPrefix := cfg.PathPrefix
 	if pathPrefix != "" && !strings.HasSuffix(pathPrefix, "/") {
 		pathPrefix += "/"
 	}
@@ -115,26 +142,54 @@ func NewOssFileServiceWithTempBucket(endpoint, region, accessKey, secretKey, buc
 		client:         client,
 		tempClient:     tempClient,
 		pathPrefix:     pathPrefix,
-		bucketName:     bucketName,
-		tempBucketName: tempBucketName,
+		bucketName:     cfg.BucketName,
+		tempBucketName: cfg.TempBucket,
+		presignTTL:     presignTTL(cfg),
+		roleScoped:     cfg.AuthType == ossAuthTypeRAMRoleARN,
 	}, nil
 }
 
 // CheckOssConnectivity tests OSS connectivity using the provided credentials.
 func CheckOssConnectivity(ctx context.Context, endpoint, region, accessKey, secretKey, bucketName string) error {
-	client, err := newOSSClient(endpoint, region, accessKey, secretKey)
+	return CheckOssConnectivityWithConfig(ctx, OSSAuthConfig{
+		Endpoint:   endpoint,
+		Region:     region,
+		AccessKey:  accessKey,
+		SecretKey:  secretKey,
+		BucketName: bucketName,
+		AuthType:   ossAuthTypeAccessKey,
+	})
+}
+
+// CheckOssConnectivityWithConfig probes the bucket with the configured auth
+// mode. Role mode uses ListObjectsV2 because GetBucketAcl is not granted on
+// the production bucket and would otherwise produce a false positive.
+func CheckOssConnectivityWithConfig(ctx context.Context, cfg OSSAuthConfig) error {
+	if strings.TrimSpace(cfg.BucketName) == "" {
+		return errors.New("OSS bucket name is required")
+	}
+	client, err := newOSSClientWithConfig(cfg)
 	if err != nil {
 		return err
 	}
 
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	exists, err := client.IsBucketExist(checkCtx, bucketName)
+	if cfg.AuthType == ossAuthTypeRAMRoleARN {
+		if _, err := client.ListObjectsV2(checkCtx, &oss.ListObjectsV2Request{
+			Bucket:  oss.Ptr(cfg.BucketName),
+			MaxKeys: 1,
+		}); err != nil {
+			return fmt.Errorf("failed to access OSS bucket %q: %w", cfg.BucketName, err)
+		}
+		return nil
+	}
+	exists, err := client.IsBucketExist(checkCtx, cfg.BucketName)
 	if err != nil {
 		return fmt.Errorf("failed to check OSS bucket: %w", err)
 	}
 	if !exists {
-		return fmt.Errorf("bucket %q does not exist or is not accessible", bucketName)
+		return fmt.Errorf("bucket %q does not exist or is not accessible", cfg.BucketName)
 	}
 	return nil
 }
@@ -161,6 +216,18 @@ func (s *ossFileService) CheckConnectivity(ctx context.Context) error {
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
+	if s.roleScoped {
+		// GetBucketAcl is not granted for role credentials; use ListObjectsV2
+		// so a missing or inaccessible bucket surfaces as an error.
+		if _, err := s.client.ListObjectsV2(checkCtx, &oss.ListObjectsV2Request{
+			Bucket:  oss.Ptr(s.bucketName),
+			MaxKeys: 1,
+		}); err != nil {
+			return fmt.Errorf("failed to access OSS bucket %q: %w", s.bucketName, err)
+		}
+		return nil
+	}
+
 	exists, err := s.client.IsBucketExist(checkCtx, s.bucketName)
 	if err != nil {
 		return fmt.Errorf("failed to check OSS bucket: %w", err)
@@ -175,6 +242,9 @@ func (s *ossFileService) CheckConnectivity(ctx context.Context) error {
 func (s *ossFileService) SaveFile(ctx context.Context,
 	file *multipart.FileHeader, tenantID uint64, knowledgeID string,
 ) (string, error) {
+	if file == nil {
+		return "", errors.New("file header is nil")
+	}
 	ext := filepath.Ext(file.Filename)
 	objectName := fmt.Sprintf("%s%d/%s/%s%s", s.pathPrefix, tenantID, knowledgeID, uuid.New().String(), ext)
 
@@ -373,11 +443,16 @@ func (s *ossFileService) GetFileURL(ctx context.Context, filePath string) (strin
 		client = s.client
 	}
 
-	// Generate presigned URL (valid for 24 hours)
+	// Generate presigned URL. Lifetime is configurable because STS tokens cap
+	// the effective validity (Aliyun takes the smaller of the two).
+	ttl := s.presignTTL
+	if ttl <= 0 {
+		ttl = staticPresignTTL
+	}
 	result, err := client.Presign(ctx, &oss.GetObjectRequest{
 		Bucket: oss.Ptr(bucketName),
 		Key:    oss.Ptr(objectName),
-	}, oss.PresignExpires(24*time.Hour))
+	}, oss.PresignExpires(ttl))
 	if err != nil {
 		return "", fmt.Errorf("failed to generate OSS presigned URL: %w", err)
 	}
