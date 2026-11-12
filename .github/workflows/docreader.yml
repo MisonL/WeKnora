@@ -37,7 +37,10 @@ env:
 jobs:
   verify:
     name: Python tests and Go client tests
-    runs-on: ubuntu-latest
+    # Playwright 1.55 (pinned by docreader/uv.lock) has no WebKit build for
+    # ubuntu-26.04, so `playwright install --with-deps webkit` fails there.
+    # Pin the image instead of chasing runner upgrades until the lock moves.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
