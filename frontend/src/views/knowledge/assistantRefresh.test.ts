@@ -52,6 +52,11 @@ test('refreshes the FAQ entries and tags once per burst for its own KB only', as
       listFAQEntries, listKnowledgeTags,
       getKnowledgeBaseById: async () => ({ data: { id: 'kb', type: 'faq' } }),
     },
+    // The failed-entry dropdown downloads through the authenticated /files proxy
+    // instead of opening the stored path directly, so the component imports
+    // these two helpers. They are unused by this test's assertions.
+    '@/utils/protectedFileAccess': { buildProtectedFileRequest: () => null },
+    '@/utils/protectedResource': { responseFileName: () => 'faq_failed_entries.csv' },
     xlsx: {}, papaparse: {},
   }, { kbId: 'kb' })
   await flush()

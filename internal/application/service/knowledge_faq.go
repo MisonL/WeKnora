@@ -337,6 +337,9 @@ func (s *knowledgeService) UpdateFAQEntry(ctx context.Context,
 	if chunk.ChunkType != types.ChunkTypeFAQ {
 		return nil, werrors.NewBadRequestError("仅支持更新 FAQ 条目")
 	}
+	// 运营字段快照必须在任何改动之前取：后续 chunk 会被就地更新，
+	// 只有和旧值比较才能判断索引元数据是否需要同步。
+	oldOperational := faqOperationalStateOf(chunk)
 	meta, err := sanitizeFAQEntryPayload(payload)
 	if err != nil {
 		return nil, err
@@ -419,7 +422,7 @@ func (s *knowledgeService) UpdateFAQEntry(ctx context.Context,
 	if questionIndexMode == types.FAQQuestionIndexModeSeparate && len(oldSimilarQuestions) > 0 {
 		// 分别索引模式下的增量更新
 		if err := s.incrementalIndexFAQEntry(ctx, kb, faqKnowledge, chunk, embeddingModel,
-			oldStandardQuestion, oldSimilarQuestions, oldAnswers, meta); err != nil {
+			oldStandardQuestion, oldSimilarQuestions, oldAnswers, oldOperational, meta); err != nil {
 			return nil, err
 		}
 	} else {
@@ -489,6 +492,8 @@ func (s *knowledgeService) AddSimilarQuestions(ctx context.Context,
 	if chunk.ChunkType != types.ChunkTypeFAQ {
 		return nil, werrors.NewBadRequestError("仅支持更新 FAQ 条目")
 	}
+	// 本路径不修改运营字段，快照仍要在改动前取，避免日后就地更新时漏掉比较。
+	oldOperational := faqOperationalStateOf(chunk)
 
 	// Get existing metadata
 	meta, err := chunk.FAQMetadata()
@@ -578,7 +583,7 @@ func (s *knowledgeService) AddSimilarQuestions(ctx context.Context,
 	if questionIndexMode == types.FAQQuestionIndexModeSeparate {
 		// Only index the new similar questions
 		if err := s.incrementalIndexFAQEntry(ctx, kb, faqKnowledge, chunk, embeddingModel,
-			meta.StandardQuestion, oldSimilarQuestions, meta.Answers, meta); err != nil {
+			meta.StandardQuestion, oldSimilarQuestions, meta.Answers, oldOperational, meta); err != nil {
 			return nil, err
 		}
 	} else {
@@ -1960,7 +1965,7 @@ func (s *knowledgeService) buildFAQIndexInfoList(
 	})
 
 	// 每个相似问创建一个索引项
-	for i, similarQ := range meta.SimilarQuestions {
+	for _, similarQ := range meta.SimilarQuestions {
 		similarContent := similarQ
 		if indexMode == types.FAQIndexModeQuestionAnswer && len(meta.Answers) > 0 {
 			var builder strings.Builder
@@ -1971,7 +1976,11 @@ func (s *knowledgeService) buildFAQIndexInfoList(
 			}
 			similarContent = builder.String()
 		}
-		sourceID := fmt.Sprintf("%s-%d", chunk.ID, i)
+		// 用问题内容哈希而不是循环下标：下标会随相似问增删而重排，
+		// 增量删除按 hashQuestion 构造 source_id 时匹配不到旧记录，导致被
+		// 移除的相似问向量永久残留。三处（首次索引 / 增量删除 / 增量新增）
+		// 必须使用同一套标识。
+		sourceID := fmt.Sprintf("%s-%s", chunk.ID, hashQuestion(similarQ))
 		indexInfoList = append(indexInfoList, &types.IndexInfo{
 			Content:         similarContent,
 			SourceID:        sourceID,

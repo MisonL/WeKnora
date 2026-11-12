@@ -67,16 +67,25 @@ func (r *chunkRepository) CreateChunks(ctx context.Context, chunks []*types.Chun
 		}
 	}
 
-	// GORM substitutes default:true for a zero bool even with Select("*").
-	// A non-nil pointer makes both true and false explicit on insert, while
-	// embedding the original chunk keeps generated seq_ids and timestamps on it.
+	// GORM substitutes default:true / default:1 for zero bool/int values even
+	// with Select("*"). A non-nil pointer makes both true and false explicit on
+	// insert, while embedding the original chunk keeps generated seq_ids and
+	// timestamps on it. Flags stays nil (so the DB default of "recommended"
+	// applies) unless the chunk is FAQ-typed or carries explicit flags: FAQ is
+	// the only consumer of the recommended flag, and it must be able to
+	// persist an explicit is_recommended=false (Flags == 0).
 	type chunkInsert struct {
 		*types.Chunk
 		IsEnabled *bool
+		Flags     *types.ChunkFlags
 	}
 	rows := make([]chunkInsert, len(chunks))
 	for i, chunk := range chunks {
-		rows[i] = chunkInsert{Chunk: chunk, IsEnabled: &chunk.IsEnabled}
+		var flags *types.ChunkFlags
+		if chunk.ChunkType == types.ChunkTypeFAQ || chunk.Flags != 0 {
+			flags = &chunk.Flags
+		}
+		rows[i] = chunkInsert{Chunk: chunk, IsEnabled: &chunk.IsEnabled, Flags: flags}
 	}
 
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -846,8 +855,11 @@ func (r *chunkRepository) DeleteUnindexedChunks(
 	return chunks, nil
 }
 
-// ListAllFAQChunksByKnowledgeID lists all FAQ chunks for a knowledge ID (only essential fields for efficiency)
-// Uses batch query to handle large datasets
+// ListAllFAQChunksByKnowledgeID lists all FAQ chunks for a knowledge ID.
+// Projection covers every column the replace-mode diff reads (hash, tag,
+// enabled/flags, metadata, seq_id) plus what index cleanup needs to rebuild
+// per-chunk index info, while keeping the large Content column out of the
+// scan. Uses batch query to handle large datasets.
 func (r *chunkRepository) ListAllFAQChunksByKnowledgeID(
 	ctx context.Context,
 	tenantID uint64,
@@ -860,7 +872,7 @@ func (r *chunkRepository) ListAllFAQChunksByKnowledgeID(
 	for {
 		var batchChunks []*types.Chunk
 		if err := r.db.WithContext(ctx).
-			Select("id, content_hash").
+			Select("id, seq_id, knowledge_id, knowledge_base_id, tag_id, content_hash, is_enabled, flags, chunk_type, metadata").
 			Where("tenant_id = ? AND knowledge_id = ? AND chunk_type = ?", tenantID, knowledgeID, types.ChunkTypeFAQ).
 			Offset(offset).
 			Limit(batchSize).
