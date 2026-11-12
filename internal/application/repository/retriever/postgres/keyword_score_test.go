@@ -195,3 +195,30 @@ func TestVectorRetrieveDoesNotRequireKeywordScoreFunction(t *testing.T) {
 		})
 	}
 }
+
+// The generated-question exclusion must stay a flat filter built only from
+// constant comparisons plus a starts_with prefix test. A column-to-column
+// comparison here makes ParadeDB reject the whole top-K BM25 query with
+// "Unsupported query shape" (SQLSTATE XX000), and a correlated anti-join would
+// block the top-K pushdown. Both regressions were observed in production.
+func TestGeneratedQuestionExclusionAvoidsColumnComparison(t *testing.T) {
+	repo, mock := newKeywordTestRepository(t)
+	mock.ExpectQuery(regexp.QuoteMeta(keywordScoreFunctionSQL)).
+		WillReturnRows(sqlmock.NewRows([]string{"score_function"}).AddRow("paradedb.score"))
+
+	query := `SELECT paradedb\.score\(id\) as score,.*FROM "embeddings" WHERE .*` +
+		`content \|\|\| \$2.*` +
+		`NOT \(knowledge_base_id IN \(\$4\) AND source_type = 0 AND chunk_id <> '' AND starts_with\(source_id, chunk_id \|\| '-'\)\)`
+
+	mock.ExpectQuery(query).
+		WithArgs("kb-off", "关键词测试", true, "kb-off", 5).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "chunk_id", "score"}).AddRow(1, "chunk-test", 1.5))
+
+	_, err := repo.KeywordsRetrieve(context.Background(), types.RetrieveParams{
+		Query:                         "关键词测试",
+		TopK:                          5,
+		KnowledgeBaseIDs:              []string{"kb-off"},
+		ExcludeGeneratedQuestionKBIDs: []string{"kb-off"},
+	})
+	require.NoError(t, err)
+}

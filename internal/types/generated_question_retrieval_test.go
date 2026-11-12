@@ -1,6 +1,9 @@
 package types
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestIsGeneratedQuestionSource(t *testing.T) {
 	const chunkID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
@@ -65,5 +68,23 @@ func TestQuestionGenerationDisabledLeavesFAQAlone(t *testing.T) {
 	}
 	if QuestionGenerationDisabled(on) || !QuestionGenerationActive(on) {
 		t.Fatal("an enabled document knowledge base should keep generated questions")
+	}
+}
+
+func TestGeneratedQuestionRowPredicateParadeDBAvoidsColumnComparison(t *testing.T) {
+	sql := GeneratedQuestionRowPredicateParadeDB("")
+	if !strings.Contains(sql, "starts_with(source_id, chunk_id || '-')") {
+		t.Fatalf("predicate = %q, want a starts_with prefix test", sql)
+	}
+	// A column-to-column comparison anywhere in this filter makes ParadeDB
+	// reject the whole top-K BM25 query with "Unsupported query shape".
+	for _, forbidden := range []string{"source_id <>", "substr("} {
+		if strings.Contains(sql, forbidden) {
+			t.Fatalf("predicate still contains %q: %s", forbidden, sql)
+		}
+	}
+	if qualified := GeneratedQuestionRowPredicateParadeDB("embeddings"); !strings.Contains(
+		qualified, "starts_with(embeddings.source_id, embeddings.chunk_id || '-')") {
+		t.Fatalf("qualified predicate = %q", qualified)
 	}
 }
