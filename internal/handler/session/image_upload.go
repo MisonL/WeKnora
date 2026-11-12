@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -159,7 +160,12 @@ func (h *Handler) resolveImageFileService(ctx context.Context, storageProvider s
 		return h.fileService
 	}
 
-	svc, resolvedProvider, err := filesvc.NewFileServiceFromStorageConfig(storageProvider, tenant.StorageEngineConfig, "")
+	svc, resolvedProvider, err := filesvc.NewFileServiceFromStorageConfig(storageProvider, tenant.StorageEngineConfig, "", "tenant")
+	if errors.Is(err, filesvc.ErrStorageRoleNotAllowed) {
+		// Rejected role config: never substitute the process-global service.
+		logger.Warnf(ctx, "[image-storage] reject role credentials in tenant storage config: provider=%s", storageProvider)
+		return filesvc.NewRejectedFileService(err)
+	}
 	if err != nil {
 		logger.Warnf(ctx, "[image-storage] failed to create %s file service: %v, fallback to default", storageProvider, err)
 		return h.fileService

@@ -158,6 +158,29 @@ type ModelParameters struct {
 	// flags and the flat protocol compat object. Everything omitted is
 	// inherited from the vendor catalog (see internal/models/catalog).
 	Spec *ModelSpecOverride `yaml:"spec,omitempty" json:"spec,omitempty"`
+
+	// Stored ciphertext for credentials whose load-path decryption failed.
+	// Value writes these back verbatim while the corresponding exported field
+	// is empty, so a row whose SYSTEM_AES_KEY was rotated does not lose its
+	// ciphertext to the next full-row update (e.g. a display-name PATCH).
+	// Non-empty exported fields — a re-entered credential — always win.
+	apiKeyStored    string
+	appSecretStored string
+}
+
+// PreserveUndecryptableSecretsFrom carries preserved ciphertext from a row
+// loaded through Scan onto a parameters value assembled for an update, so the
+// write path can restore it instead of blanking the column.
+func (c *ModelParameters) PreserveUndecryptableSecretsFrom(loaded ModelParameters) {
+	if c == nil {
+		return
+	}
+	if c.APIKey == "" {
+		c.apiKeyStored = loaded.apiKeyStored
+	}
+	if c.AppSecret == "" {
+		c.appSecretStored = loaded.appSecretStored
+	}
 }
 
 // ModelSpecOverride is the per-row slice of a catalog model entry that an
@@ -261,6 +284,12 @@ type Model struct {
 // Value implements the driver.Valuer interface, used to convert ModelParameters to database value.
 // Encrypts APIKey and AppSecret before persisting to database (value receiver = no memory pollution).
 func (c ModelParameters) Value() (driver.Value, error) {
+	if c.APIKey == "" {
+		c.APIKey = c.apiKeyStored
+	}
+	if c.AppSecret == "" {
+		c.AppSecret = c.appSecretStored
+	}
 	if key := utils.GetAESKey(); key != nil {
 		if c.APIKey != "" {
 			if encrypted, err := utils.EncryptAESGCM(c.APIKey, key); err == nil {
@@ -294,14 +323,18 @@ func (c *ModelParameters) Scan(value interface{}) error {
 	// the user can't even see which model needs re-credentialing.
 	if plain, ok := utils.DecryptStoredSecretLenient(c.APIKey); ok {
 		c.APIKey = plain
+		c.apiKeyStored = ""
 	} else {
-		log.Printf("[crypto] model parameters api_key: decrypt failed (SYSTEM_AES_KEY missing/rotated?), treating as unconfigured")
+		log.Printf("[crypto] model parameters api_key: decrypt failed (SYSTEM_AES_KEY missing/rotated?), keeping ciphertext for write-back")
+		c.apiKeyStored = c.APIKey
 		c.APIKey = ""
 	}
 	if plain, ok := utils.DecryptStoredSecretLenient(c.AppSecret); ok {
 		c.AppSecret = plain
+		c.appSecretStored = ""
 	} else {
-		log.Printf("[crypto] model parameters app_secret: decrypt failed (SYSTEM_AES_KEY missing/rotated?), treating as unconfigured")
+		log.Printf("[crypto] model parameters app_secret: decrypt failed (SYSTEM_AES_KEY missing/rotated?), keeping ciphertext for write-back")
+		c.appSecretStored = c.AppSecret
 		c.AppSecret = ""
 	}
 	return nil

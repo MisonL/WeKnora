@@ -38,9 +38,7 @@ func (f *fakeEmbedChannelService) ListByTenant(
 }
 
 func (f *fakeEmbedChannelService) Update(
-	ctx context.Context, tenantID uint64, id string, req *types.EmbedChannel,
-	enabled *bool, showSuggested *bool, allowWebSearch *bool, allowFileUpload *bool,
-	defaultLocale *string, webhookURL *string, webhookSecret *string,
+	ctx context.Context, tenantID uint64, id string, update *types.EmbedChannelUpdate,
 ) (*types.EmbedChannel, error) {
 	return nil, nil
 }
@@ -312,6 +310,54 @@ func TestEmbedAuthSessionTokenPath(t *testing.T) {
 	}
 	if body["success"] != true {
 		t.Fatalf("expected success response, got %v", body)
+	}
+}
+
+// The publish token is public, so a deactivated workspace must not serve
+// embed traffic through still-valid channels: same check as MCPEndpointAuth.
+func TestEmbedAuthRejectsInactiveTenant(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, tc := range []struct {
+		name   string
+		status string
+		want   int
+	}{
+		{name: "inactive rejected", status: "inactive", want: http.StatusForbidden},
+		{name: "disabled rejected", status: "disabled", want: http.StatusForbidden},
+		{name: "case-insensitive", status: "InActive", want: http.StatusForbidden},
+		{name: "active allowed", status: "active", want: http.StatusOK},
+		{name: "empty status allowed", status: "", want: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &fakeEmbedChannelService{
+				channels: map[string]*types.EmbedChannel{
+					"ch-status": {
+						ID:                 "ch-status",
+						TenantID:           7,
+						Enabled:            true,
+						PublishToken:       "em_publish_ok",
+						AllowedOrigins:     []byte(`["https://app.example.com"]`),
+						RateLimitPerMinute: 0,
+					},
+				},
+			}
+			tenantSvc := &fakeTenantService{tenant: &types.Tenant{ID: 7, Status: tc.status}}
+
+			r := gin.New()
+			r.GET("/api/v1/embed/:channel_id/config", EmbedAuth(svc, tenantSvc, nil), func(c *gin.Context) {
+				c.JSON(http.StatusOK, gin.H{"success": true})
+			})
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/embed/ch-status/config", nil)
+			req.Header.Set("Authorization", "Embed em_publish_ok")
+			req.Header.Set("Origin", "https://app.example.com")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != tc.want {
+				t.Fatalf("status %q: got %d, want %d, body = %s", tc.status, w.Code, tc.want, w.Body.String())
+			}
+		})
 	}
 }
 

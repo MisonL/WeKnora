@@ -829,24 +829,37 @@ type UpdateKnowledgeBaseRequest struct {
 	// accepts a top-level vlm_config.
 	VLMConfig             *types.VLMConfig `json:"vlm_config"`
 	questionModelProvided bool
+	// chunkingConfigProvided records whether the config object carried an
+	// explicit chunking_config section. KnowledgeBaseConfig stores
+	// ChunkingConfig by value, so without this marker an omitted section is
+	// indistinguishable from a zero-value one and a partial PUT would wipe
+	// the stored chunking settings.
+	chunkingConfigProvided bool
 }
 
-// UnmarshalJSON retains whether an older client supplied the question-model binding.
+// UnmarshalJSON retains whether an older client supplied the question-model binding
+// and whether the config object carried chunking_config at all.
+//
+// Presence is recorded before the typed bind so a request that fails later
+// validation still carries the same "was it provided" answer as one that
+// succeeded. gin aborts on the returned error, so this only ever affects
+// diagnostics, never a write.
 func (r *UpdateKnowledgeBaseRequest) UnmarshalJSON(data []byte) error {
-	type plain UpdateKnowledgeBaseRequest
-	if err := json.Unmarshal(data, (*plain)(r)); err != nil {
-		return err
-	}
 	var payload struct {
 		Config struct {
-			Questions map[string]json.RawMessage `json:"question_generation_config"`
+			Questions      map[string]json.RawMessage `json:"question_generation_config"`
+			ChunkingConfig json.RawMessage            `json:"chunking_config"`
 		} `json:"config"`
 	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return err
+	// Best-effort: a malformed body yields no markers, which is the same as
+	// "not provided" and cannot reach a write because the bind below fails.
+	if err := json.Unmarshal(data, &payload); err == nil {
+		_, r.questionModelProvided = payload.Config.Questions["model_id"]
+		r.chunkingConfigProvided = len(payload.Config.ChunkingConfig) > 0 &&
+			string(payload.Config.ChunkingConfig) != "null"
 	}
-	_, r.questionModelProvided = payload.Config.Questions["model_id"]
-	return nil
+	type plain UpdateKnowledgeBaseRequest
+	return json.Unmarshal(data, (*plain)(r))
 }
 
 // UpdateKnowledgeBase godoc
@@ -891,6 +904,11 @@ func (h *KnowledgeBaseHandler) UpdateKnowledgeBase(c *gin.Context) {
 	if !req.questionModelProvided && req.Config != nil && req.Config.QuestionGenerationConfig != nil &&
 		currentKB.QuestionGenerationConfig != nil {
 		req.Config.QuestionGenerationConfig.ModelID = currentKB.QuestionGenerationConfig.ModelID
+	}
+	if req.Config != nil && !req.chunkingConfigProvided {
+		// The request carried a config object without chunking_config: keep
+		// the stored chunking settings instead of replacing them with zeros.
+		req.Config.ChunkingConfig = currentKB.ChunkingConfig
 	}
 	if err := validateKnowledgeBaseSettingsUpdate(c, currentKB, req.Config, req.VLMConfig); err != nil {
 		_ = c.Error(err)

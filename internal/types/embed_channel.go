@@ -101,6 +101,30 @@ func (ch *EmbedChannel) AllowedOriginsList() []string {
 	return origins
 }
 
+// EmbedChannelUpdate carries the mutable embed-channel fields for an update.
+// A nil pointer means "keep the stored value"; a present pointer replaces it
+// (an empty string clears the field). AllowedOrigins nil means keep; a present
+// empty slice is stored as an empty allowlist.
+type EmbedChannelUpdate struct {
+	Name                   *string
+	AgentID                *string
+	AllowedOrigins         JSON
+	WelcomeMessage         *string
+	PrimaryColor           *string
+	PageTitle              *string
+	HeaderTitleMode        *string
+	WidgetPosition         *string
+	RateLimitPerMinute     *int
+	RateLimitPerDay        *int
+	Enabled                *bool
+	ShowSuggestedQuestions *bool
+	AllowWebSearch         *bool
+	AllowFileUpload        *bool
+	DefaultLocale          *string
+	WebhookURL             *string
+	WebhookSecret          *string
+}
+
 // EmbedChannelPublicConfig is returned to anonymous embed clients (no secrets).
 type EmbedChannelPublicConfig struct {
 	ChannelID              string   `json:"channel_id"`

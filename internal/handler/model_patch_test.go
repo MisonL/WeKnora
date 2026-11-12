@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -70,4 +71,43 @@ func TestPatchModelNeedsAField(t *testing.T) {
 	rec := patchModel(t, stub, `{}`)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Nil(t, stub.updated)
+}
+
+// A row whose API key could not be decrypted is loaded with an empty APIKey
+// plus the original ciphertext retained by Scan. A display-only PATCH must
+// hand that ciphertext back to the repository, so Select("*") cannot blank
+// the column.
+func TestPatchModelPreservesUndecryptableKeyCiphertext(t *testing.T) {
+	t.Setenv("SYSTEM_AES_KEY", "0123456789abcdef0123456789abcdef")
+	stored, err := (&types.ModelParameters{APIKey: "sk-rotated", AppSecret: "sec-rotated"}).Value()
+	require.NoError(t, err)
+
+	t.Setenv("SYSTEM_AES_KEY", "fedcba9876543210fedcba9876543210")
+	var loaded types.ModelParameters
+	require.NoError(t, loaded.Scan(stored.([]byte)))
+	require.Empty(t, loaded.APIKey)
+
+	stub := &stubPatchModelService{model: &types.Model{
+		ID: "m1", Name: "gpt-4o", DisplayName: "old",
+		Type: types.ModelTypeKnowledgeQA, Source: types.ModelSourceRemote,
+		Parameters: loaded,
+	}}
+	rec := patchModel(t, stub, `{"display_name":"renamed"}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.NotNil(t, stub.updated)
+
+	// The value handed to the repository still carries the ciphertext, so the
+	// subsequent full-row update restores it instead of writing an empty key.
+	rewritten, err := stub.updated.Parameters.Value()
+	require.NoError(t, err)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(rewritten.([]byte), &doc))
+	require.Equal(t, "enc:v1:",
+		func() string {
+			key, _ := doc["api_key"].(string)
+			if len(key) >= len("enc:v1:") {
+				return key[:len("enc:v1:")]
+			}
+			return key
+		}())
 }

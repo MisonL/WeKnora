@@ -491,6 +491,11 @@ func (s *sessionService) UpdateSession(ctx context.Context, session *types.Sessi
 		return err
 	}
 	if existing != nil {
+		if !session.DescriptionProvided {
+			// The update request did not carry a description: keep the stored
+			// one so a title-only rename cannot wipe it.
+			session.Description = existing.Description
+		}
 		session.Description = types.SanitizeClientSessionDescription(
 			session.Description, existing.Description)
 	}

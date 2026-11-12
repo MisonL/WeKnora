@@ -60,23 +60,33 @@ func NewEmbedChannelHandler(
 }
 
 type embedChannelRequest struct {
-	Name                   string   `json:"name"`
-	Enabled                *bool    `json:"enabled"`
-	AllowedOrigins         []string `json:"allowed_origins"`
-	WelcomeMessage         string   `json:"welcome_message"`
-	RateLimitPerMinute     int      `json:"rate_limit_per_minute"`
-	RateLimitPerDay        int      `json:"rate_limit_per_day"`
-	PrimaryColor           string   `json:"primary_color"`
-	PageTitle              string   `json:"page_title"`
-	HeaderTitleMode        string   `json:"header_title_mode"`
-	ShowSuggestedQuestions *bool    `json:"show_suggested_questions"`
-	WidgetPosition         string   `json:"widget_position"`
-	AllowWebSearch         *bool    `json:"allow_web_search"`
-	AllowFileUpload        *bool    `json:"allow_file_upload"`
-	DefaultLocale          *string  `json:"default_locale"`
-	WebhookURL             *string  `json:"webhook_url"`
-	WebhookSecret          *string  `json:"webhook_secret"`
-	AgentID                *string  `json:"agent_id"`
+	Name           string   `json:"name"`
+	Enabled        *bool    `json:"enabled"`
+	AllowedOrigins []string `json:"allowed_origins"`
+	// Styling fields are pointers so an omitted field keeps the stored value
+	// instead of being decoded as an empty string that would clear it.
+	WelcomeMessage         *string `json:"welcome_message"`
+	RateLimitPerMinute     int     `json:"rate_limit_per_minute"`
+	RateLimitPerDay        int     `json:"rate_limit_per_day"`
+	PrimaryColor           *string `json:"primary_color"`
+	PageTitle              *string `json:"page_title"`
+	HeaderTitleMode        *string `json:"header_title_mode"`
+	ShowSuggestedQuestions *bool   `json:"show_suggested_questions"`
+	WidgetPosition         *string `json:"widget_position"`
+	AllowWebSearch         *bool   `json:"allow_web_search"`
+	AllowFileUpload        *bool   `json:"allow_file_upload"`
+	DefaultLocale          *string `json:"default_locale"`
+	WebhookURL             *string `json:"webhook_url"`
+	WebhookSecret          *string `json:"webhook_secret"`
+	AgentID                *string `json:"agent_id"`
+}
+
+// derefString returns the pointed-to value, or the empty string for nil.
+func derefString(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
 }
 
 // isProductionMode reports whether the server runs in a hardened (release) mode.
@@ -149,14 +159,14 @@ func (h *EmbedChannelHandler) CreateEmbedChannel(c *gin.Context) {
 		Name:                   req.Name,
 		Enabled:                enabled,
 		AllowedOrigins:         originsJSON,
-		WelcomeMessage:         req.WelcomeMessage,
+		WelcomeMessage:         derefString(req.WelcomeMessage),
 		RateLimitPerMinute:     req.RateLimitPerMinute,
 		RateLimitPerDay:        req.RateLimitPerDay,
-		PrimaryColor:           req.PrimaryColor,
-		PageTitle:              req.PageTitle,
-		HeaderTitleMode:        req.HeaderTitleMode,
+		PrimaryColor:           derefString(req.PrimaryColor),
+		PageTitle:              derefString(req.PageTitle),
+		HeaderTitleMode:        types.NormalizeEmbedHeaderTitleMode(derefString(req.HeaderTitleMode)),
 		ShowSuggestedQuestions: showSuggested,
-		WidgetPosition:         req.WidgetPosition,
+		WidgetPosition:         types.NormalizeEmbedWidgetPosition(derefString(req.WidgetPosition)),
 		AllowWebSearch:         allowWebSearch,
 		AllowFileUpload:        allowFileUpload,
 		DefaultLocale:          types.NormalizeEmbedDefaultLocale(stringOrEmpty(req.DefaultLocale)),
@@ -230,21 +240,28 @@ func (h *EmbedChannelHandler) UpdateEmbedChannel(c *gin.Context) {
 	if req.AllowedOrigins != nil {
 		originsJSON, _ = json.Marshal(req.AllowedOrigins)
 	}
-	update := &types.EmbedChannel{
-		Name:               req.Name,
-		AllowedOrigins:     originsJSON,
-		WelcomeMessage:     req.WelcomeMessage,
-		RateLimitPerMinute: req.RateLimitPerMinute,
-		RateLimitPerDay:    req.RateLimitPerDay,
-		PrimaryColor:       req.PrimaryColor,
-		PageTitle:          req.PageTitle,
-		HeaderTitleMode:    req.HeaderTitleMode,
-		WidgetPosition:     req.WidgetPosition,
+	// Only the fields the request carried are applied; a toggle that just
+	// flips `enabled` must not clear the channel's styling configuration.
+	update := &types.EmbedChannelUpdate{
+		Name:                   &req.Name,
+		AllowedOrigins:         types.JSON(originsJSON),
+		WelcomeMessage:         req.WelcomeMessage,
+		RateLimitPerMinute:     &req.RateLimitPerMinute,
+		RateLimitPerDay:        &req.RateLimitPerDay,
+		PrimaryColor:           req.PrimaryColor,
+		PageTitle:              req.PageTitle,
+		HeaderTitleMode:        req.HeaderTitleMode,
+		WidgetPosition:         req.WidgetPosition,
+		Enabled:                req.Enabled,
+		ShowSuggestedQuestions: req.ShowSuggestedQuestions,
+		AllowWebSearch:         req.AllowWebSearch,
+		AllowFileUpload:        req.AllowFileUpload,
+		DefaultLocale:          req.DefaultLocale,
+		WebhookURL:             req.WebhookURL,
+		WebhookSecret:          req.WebhookSecret,
+		AgentID:                req.AgentID,
 	}
-	if req.AgentID != nil {
-		update.AgentID = strings.TrimSpace(*req.AgentID)
-	}
-	ch, err := h.embedSvc.Update(c.Request.Context(), tenantID, channelID, update, req.Enabled, req.ShowSuggestedQuestions, req.AllowWebSearch, req.AllowFileUpload, req.DefaultLocale, req.WebhookURL, req.WebhookSecret)
+	ch, err := h.embedSvc.Update(c.Request.Context(), tenantID, channelID, update)
 	if err != nil {
 		writeEmbedMgmtError(c, err)
 		return

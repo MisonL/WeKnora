@@ -16,6 +16,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -404,10 +405,26 @@ func (h *Handler) UpdateSession(c *gin.Context) {
 
 	// Parse request body to session object
 	var session types.Session
-	if err := c.ShouldBindJSON(&session); err != nil {
+	if err := c.ShouldBindBodyWith(&session, binding.JSON); err != nil {
 		logger.Error(ctx, "Failed to parse session data", err)
 		c.Error(errors.NewBadRequestError(err.Error()))
 		return
+	}
+
+	// types.Session cannot express field presence, so decode the raw JSON a
+	// second time to learn whether the client sent a description at all.
+	// Without this, a title-only rename would wipe the stored description.
+	var provided struct {
+		Description *string `json:"description"`
+	}
+	if err := c.ShouldBindBodyWith(&provided, binding.JSON); err != nil {
+		logger.Error(ctx, "Failed to parse session data", err)
+		c.Error(errors.NewBadRequestError(err.Error()))
+		return
+	}
+	if provided.Description != nil {
+		session.Description = *provided.Description
+		session.DescriptionProvided = true
 	}
 
 	session.ID = id

@@ -830,6 +830,10 @@ func (h *ModelHandler) UpdateModel(c *gin.Context) {
 	newParams := req.Parameters
 	newParams.APIKey = storedAPIKey
 	newParams.AppSecret = storedAppSecret
+	// When the stored credential could not be decrypted, its ciphertext is
+	// carried through so the write path restores it instead of blanking the
+	// column. Re-entering a credential goes through /credentials.
+	newParams.PreserveUndecryptableSecretsFrom(model.Parameters)
 	// Preserve backend-managed fields not sent by the frontend either.
 	newParams.ParameterSize = model.Parameters.ParameterSize
 	if newParams.InterfaceType == "" {

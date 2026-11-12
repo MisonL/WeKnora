@@ -93,11 +93,18 @@ type WebSearchProviderParameters struct {
 	ProxyURL string `yaml:"proxy_url" json:"proxy_url,omitempty"`
 	// Provider-specific extra configuration for future extensibility
 	ExtraConfig map[string]string `yaml:"extra_config" json:"extra_config,omitempty"`
+
+	// Ciphertext kept when the load-path decryption failed, so Value can write
+	// it back instead of blanking a recoverable secret.
+	apiKeyStored string
 }
 
 // Value implements the driver.Valuer interface.
 // Encrypts APIKey before persisting to database.
 func (p WebSearchProviderParameters) Value() (driver.Value, error) {
+	if p.APIKey == "" {
+		p.APIKey = p.apiKeyStored
+	}
 	if key := utils.GetAESKey(); key != nil && p.APIKey != "" {
 		if encrypted, err := utils.EncryptAESGCM(p.APIKey, key); err == nil {
 			p.APIKey = encrypted
@@ -121,11 +128,25 @@ func (p *WebSearchProviderParameters) Scan(value interface{}) error {
 	}
 	if plain, ok := utils.DecryptStoredSecretLenient(p.APIKey); ok {
 		p.APIKey = plain
+		p.apiKeyStored = ""
 	} else {
-		log.Printf("[crypto] web search provider api_key: decrypt failed (SYSTEM_AES_KEY missing/rotated?), treating as unconfigured")
+		log.Printf("[crypto] web search provider api_key: decrypt failed (SYSTEM_AES_KEY missing/rotated?), keeping ciphertext for write-back")
+		p.apiKeyStored = p.APIKey
 		p.APIKey = ""
 	}
 	return nil
+}
+
+// PreserveUndecryptableSecretsFrom carries the ciphertext of a credential
+// whose load-path decryption failed onto a parameters value assembled for an
+// update, so the write path restores it instead of blanking the column.
+func (p *WebSearchProviderParameters) PreserveUndecryptableSecretsFrom(loaded WebSearchProviderParameters) {
+	if p == nil {
+		return
+	}
+	if p.APIKey == "" {
+		p.apiKeyStored = loaded.apiKeyStored
+	}
 }
 
 // WebSearchProviderTypeInfo describes the metadata of a provider type.

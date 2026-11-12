@@ -176,7 +176,11 @@ func (r *tenantRepository) AdjustStorageUsed(ctx context.Context, tenantID uint6
 			tenant.StorageUsed = 0
 		}
 
-		return tx.Save(&tenant).Error
+		// Update the single column instead of Save(&tenant): a full-row write
+		// would re-encode every jsonb config from the just-scanned snapshot,
+		// overwriting credentials whose lenient decryption had failed.
+		return tx.Model(&types.Tenant{}).Where("id = ?", tenantID).
+			UpdateColumn("storage_used", tenant.StorageUsed).Error
 	})
 }
 

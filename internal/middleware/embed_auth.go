@@ -152,6 +152,14 @@ func EmbedAuth(
 			c.Abort()
 			return
 		}
+		// The publish token is public, so a deactivated workspace must not
+		// keep serving embed traffic through still-valid channels. Same
+		// check as MCPEndpointAuth.
+		if strings.EqualFold(tenant.Status, "inactive") || strings.EqualFold(tenant.Status, "disabled") {
+			c.JSON(http.StatusForbidden, gin.H{"error": "workspace inactive"})
+			c.Abort()
+			return
+		}
 
 		user := &types.User{
 			ID:       fmt.Sprintf("embed-%s", channelID),

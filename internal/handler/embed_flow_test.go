@@ -35,7 +35,7 @@ func (f *flowEmbedSvc) ListByTenant(context.Context, uint64) ([]*types.EmbedChan
 	return nil, nil
 }
 
-func (f *flowEmbedSvc) Update(context.Context, uint64, string, *types.EmbedChannel, *bool, *bool, *bool, *bool, *string, *string, *string) (*types.EmbedChannel, error) {
+func (f *flowEmbedSvc) Update(context.Context, uint64, string, *types.EmbedChannelUpdate) (*types.EmbedChannel, error) {
 	return nil, nil
 }
 

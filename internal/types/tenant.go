@@ -196,6 +196,10 @@ type CredentialsConfig struct {
 type WeKnoraCloudCredentials struct {
 	AppID     string `json:"app_id"`
 	AppSecret string `json:"app_secret"`
+
+	// Ciphertext kept when the load-path decryption failed, so Value can write
+	// it back instead of blanking a recoverable secret.
+	appSecretStored string
 }
 
 type APIPrincipalMode string
@@ -218,6 +222,10 @@ type APIPrincipalConfig struct {
 	// back to the tenant-level principal.
 	RequireDirectHeader bool   `json:"require_direct_header,omitempty"`
 	HMACSecret          string `json:"hmac_secret,omitempty"`
+
+	// Ciphertext kept when the load-path decryption failed, so Value can write
+	// it back instead of blanking a recoverable secret.
+	hmacSecretStored string
 }
 
 func (c *APIPrincipalConfig) Value() (driver.Value, error) {
@@ -225,6 +233,9 @@ func (c *APIPrincipalConfig) Value() (driver.Value, error) {
 		return nil, nil
 	}
 	cp := *c
+	if cp.HMACSecret == "" {
+		cp.HMACSecret = cp.hmacSecretStored
+	}
 	if cp.HMACSecret != "" {
 		if key := utils.GetAESKey(); key != nil {
 			if encrypted, err := utils.EncryptAESGCM(cp.HMACSecret, key); err == nil {
@@ -248,11 +259,25 @@ func (c *APIPrincipalConfig) Scan(value interface{}) error {
 	}
 	if plain, ok := utils.DecryptStoredSecretLenient(c.HMACSecret); ok {
 		c.HMACSecret = plain
+		c.hmacSecretStored = ""
 	} else {
-		log.Printf("[crypto] tenant api_principal_config.hmac_secret: decrypt failed (SYSTEM_AES_KEY missing/rotated?), treating as unconfigured")
+		log.Printf("[crypto] tenant api_principal_config.hmac_secret: decrypt failed (SYSTEM_AES_KEY missing/rotated?), keeping ciphertext for write-back")
+		c.hmacSecretStored = c.HMACSecret
 		c.HMACSecret = ""
 	}
 	return nil
+}
+
+// PreserveUndecryptableSecretsFrom carries the ciphertext of a secret whose
+// load-path decryption failed onto a config value assembled for an update, so
+// the write path restores it instead of blanking the column.
+func (c *APIPrincipalConfig) PreserveUndecryptableSecretsFrom(loaded *APIPrincipalConfig) {
+	if c == nil || loaded == nil {
+		return
+	}
+	if c.HMACSecret == "" {
+		c.hmacSecretStored = loaded.hmacSecretStored
+	}
 }
 
 // GetWeKnoraCloud returns the WeKnoraCloud credentials, or nil if not configured.
@@ -272,6 +297,11 @@ func (c *CredentialsConfig) Value() (driver.Value, error) {
 		return nil, nil
 	}
 	cp := *c
+	if cp.WeKnoraCloud != nil && cp.WeKnoraCloud.AppSecret == "" && cp.WeKnoraCloud.appSecretStored != "" {
+		cloud := *cp.WeKnoraCloud
+		cloud.AppSecret = cloud.appSecretStored
+		cp.WeKnoraCloud = &cloud
+	}
 	if cp.WeKnoraCloud != nil && cp.WeKnoraCloud.AppSecret != "" {
 		if key := utils.GetAESKey(); key != nil {
 			if encrypted, err := utils.EncryptAESGCM(cp.WeKnoraCloud.AppSecret, key); err == nil {
@@ -297,8 +327,10 @@ func (c *CredentialsConfig) Scan(value interface{}) error {
 	if c.WeKnoraCloud != nil {
 		if plain, ok := utils.DecryptStoredSecretLenient(c.WeKnoraCloud.AppSecret); ok {
 			c.WeKnoraCloud.AppSecret = plain
+			c.WeKnoraCloud.appSecretStored = ""
 		} else {
-			log.Printf("[crypto] tenant credentials we_knora_cloud.app_secret: decrypt failed (SYSTEM_AES_KEY missing/rotated?), treating as unconfigured")
+			log.Printf("[crypto] tenant credentials we_knora_cloud.app_secret: decrypt failed (SYSTEM_AES_KEY missing/rotated?), keeping ciphertext for write-back")
+			c.WeKnoraCloud.appSecretStored = c.WeKnoraCloud.AppSecret
 			c.WeKnoraCloud.AppSecret = ""
 		}
 	}
@@ -353,6 +385,10 @@ type ParserEngineConfig struct {
 	PaddleOCRVLCloudModel               string `json:"paddleocr_vl_cloud_model,omitempty"` // e.g. PaddleOCR-VL-1.6
 	PaddleOCRVLCloudUseSealRecognition  *bool  `json:"paddleocr_vl_cloud_use_seal_recognition,omitempty"`
 	PaddleOCRVLCloudUseChartRecognition *bool  `json:"paddleocr_vl_cloud_use_chart_recognition,omitempty"`
+
+	// Ciphertext of credentials whose load-path decryption failed; kept for
+	// write-back so a settings save cannot blank an unrecoverable credential.
+	undecryptable preservedCiphertext
 }
 
 const (
@@ -500,7 +536,12 @@ func (c *ParserEngineConfig) Value() (driver.Value, error) {
 	if c == nil {
 		return nil, nil
 	}
-	return json.Marshal(c)
+	cp := *c
+	restoreParserEngineCredentials(&cp)
+	if err := encryptParserEngineCredentials(&cp); err != nil {
+		return nil, err
+	}
+	return json.Marshal(cp)
 }
 
 // Scan implements the sql.Scanner interface for ParserEngineConfig
@@ -512,7 +553,11 @@ func (c *ParserEngineConfig) Scan(value interface{}) error {
 	if !ok {
 		return nil
 	}
-	return json.Unmarshal(b, c)
+	if err := json.Unmarshal(b, c); err != nil {
+		return err
+	}
+	decryptParserEngineCredentials(c)
+	return nil
 }
 
 // StorageEngineConfig holds tenant-level storage engine parameters for Local, MinIO, COS, TOS, S3, OSS, KS3, and OBS.
@@ -527,6 +572,10 @@ type StorageEngineConfig struct {
 	OSS             *OSSEngineConfig   `json:"oss,omitempty"`
 	KS3             *KS3EngineConfig   `json:"ks3,omitempty"`
 	OBS             *OBSEngineConfig   `json:"obs,omitempty"`
+
+	// Ciphertext of credentials whose load-path decryption failed; kept for
+	// write-back so a settings save cannot blank an unrecoverable credential.
+	undecryptable preservedCiphertext
 }
 
 // LocalEngineConfig is for local file system storage (single-machine deployment only).
@@ -593,6 +642,33 @@ type OSSEngineConfig struct {
 	UseTempBucket  bool   `json:"use_temp_bucket"`
 	TempBucketName string `json:"temp_bucket_name"`
 	TempRegion     string `json:"temp_region"`
+	// RAM role authentication. Only the environment-sourced backend may carry
+	// these fields; workspace-level config is rejected at write time and at
+	// service construction.
+	AuthType              string `json:"auth_type,omitempty"`
+	RoleARN               string `json:"role_arn,omitempty"`
+	RoleSessionName       string `json:"role_session_name,omitempty"`
+	RoleSessionExpiration int    `json:"role_session_expiration,omitempty"`
+	STSEndpoint           string `json:"sts_endpoint,omitempty"`
+	Policy                string `json:"policy,omitempty"`
+	ExternalID            string `json:"external_id,omitempty"`
+	PresignTTLSeconds     int    `json:"presign_ttl_seconds,omitempty"`
+}
+
+// ValidateForTenantWrite rejects OSS auth modes that must never be persisted
+// through workspace-level configuration: role credentials are allowed only on
+// the environment backend, because that path is not user-editable.
+func (c *OSSEngineConfig) ValidateForTenantWrite() error {
+	if c == nil {
+		return nil
+	}
+	if NormalizeOSSAuthType(c.AuthType) != OSSAuthTypeAccessKey {
+		return fmt.Errorf("oss auth_type %q cannot be configured per workspace", c.AuthType)
+	}
+	if c.RoleARN != "" || c.RoleSessionName != "" || c.STSEndpoint != "" || c.Policy != "" || c.ExternalID != "" || c.RoleSessionExpiration != 0 {
+		return fmt.Errorf("oss role fields cannot be configured per workspace")
+	}
+	return nil
 }
 
 // KS3EngineConfig is for Kingsoft Cloud KS3 object storage.
@@ -621,7 +697,16 @@ func (c *StorageEngineConfig) Value() (driver.Value, error) {
 	if c == nil {
 		return nil, nil
 	}
-	return json.Marshal(c)
+	cp := *c
+	// Encrypt first: it replaces every nested provider struct with a private
+	// copy, so restoring the preserved ciphertext afterwards cannot mutate
+	// the live config. Encrypting an empty field leaves it empty, which is
+	// exactly the state restore fills in.
+	if err := encryptStorageEngineCredentials(&cp); err != nil {
+		return nil, err
+	}
+	restoreStorageEngineCredentials(&cp)
+	return json.Marshal(cp)
 }
 
 // Scan implements the sql.Scanner interface for StorageEngineConfig
@@ -633,7 +718,11 @@ func (c *StorageEngineConfig) Scan(value interface{}) error {
 	if !ok {
 		return nil
 	}
-	return json.Unmarshal(b, c)
+	if err := json.Unmarshal(b, c); err != nil {
+		return err
+	}
+	decryptStorageEngineCredentials(c)
+	return nil
 }
 
 // TenantSandboxConfig is one named sandbox backend a workspace maintains.
@@ -719,6 +808,10 @@ type TenantSandboxConfig struct {
 	Cube   *CubeSandboxConfig   `json:"cube,omitempty"`
 	E2B    *E2BSandboxConfig    `json:"e2b,omitempty"`
 	Docker *DockerSandboxConfig `json:"docker,omitempty"`
+
+	// Ciphertext of credentials whose load-path decryption failed; kept for
+	// write-back so a settings save cannot blank an unrecoverable credential.
+	undecryptable preservedCiphertext
 }
 
 // CubeSandboxConfig addresses one CubeSandbox deployment. APIURL, ProxyURL,
@@ -926,11 +1019,13 @@ func (c *TenantSandboxConfig) Value() (driver.Value, error) {
 
 	if c.Cube != nil {
 		cube := *c.Cube
+		c.undecryptable.restore("cube.api_key", &cube.APIKey)
 		cube.APIKey = encrypt(cube.APIKey)
 		cp.Cube = &cube
 	}
 	if c.E2B != nil {
 		e2b := *c.E2B
+		c.undecryptable.restore("e2b.api_key", &e2b.APIKey)
 		e2b.APIKey = encrypt(e2b.APIKey)
 		cp.E2B = &e2b
 	}
@@ -938,6 +1033,7 @@ func (c *TenantSandboxConfig) Value() (driver.Value, error) {
 	if len(c.EnvVars) > 0 {
 		envVars := make(map[string]string, len(c.EnvVars))
 		for name, value := range c.EnvVars {
+			c.undecryptable.restore("env:"+name, &value)
 			envVars[name] = encrypt(value)
 		}
 		cp.EnvVars = envVars
@@ -945,10 +1041,40 @@ func (c *TenantSandboxConfig) Value() (driver.Value, error) {
 	// Injected headers are the sandbox-side way to call an API without the
 	// credential ever entering the sandbox, so their values are secrets.
 	if c.Network != nil {
-		cp.Network = c.Network.CloneWithSecrets(encrypt)
+		network := c.Network.CloneWithSecrets(func(value string) string { return value })
+		walkSandboxNetworkSecrets(network, func(key string, value *string) {
+			c.undecryptable.restore(key, value)
+			*value = encrypt(*value)
+		})
+		cp.Network = network
 	}
 
 	return json.Marshal(&cp)
+}
+
+// walkSandboxNetworkSecrets visits every credential-bearing header value with
+// the stable key used by preservedCiphertext. Keys are normalized the same way
+// MergeSandboxConfigForUpdate matches rules, so a whitespace or header-case
+// change still finds the preserved ciphertext.
+func walkSandboxNetworkSecrets(p *SandboxNetworkPolicy, visit func(key string, value *string)) {
+	if p == nil || visit == nil {
+		return
+	}
+	for i := range p.CubeRules {
+		rule := &p.CubeRules[i]
+		for j := range rule.Inject {
+			inject := &rule.Inject[j]
+			visit("net:cube:"+networkSecretKey(rule.Name, inject.Header), &inject.Secret)
+		}
+	}
+	for i := range p.E2BHostRules {
+		rule := &p.E2BHostRules[i]
+		for name := range rule.Headers {
+			value := rule.Headers[name]
+			visit("net:e2b:"+networkSecretKey(rule.Host, name), &value)
+			rule.Headers[name] = value
+		}
+	}
 }
 
 // Scan implements the sql.Scanner interface. Secrets that cannot be decrypted
@@ -967,7 +1093,8 @@ func (c *TenantSandboxConfig) Scan(value interface{}) error {
 		return err
 	}
 
-	decrypt := func(stored, label string) string {
+	c.undecryptable = newPreservedCiphertext()
+	decryptKeyed := func(key, label, stored string) string {
 		if stored == "" {
 			return ""
 		}
@@ -975,26 +1102,23 @@ func (c *TenantSandboxConfig) Scan(value interface{}) error {
 			return plain
 		}
 		log.Printf("[crypto] tenant_sandbox_config.%s: decrypt failed "+
-			"(SYSTEM_AES_KEY missing/rotated?), treating as unconfigured", label)
+			"(SYSTEM_AES_KEY missing/rotated?), keeping ciphertext for write-back", label)
+		c.undecryptable.remember(key, stored)
 		return ""
 	}
 
 	if c.Cube != nil {
-		c.Cube.APIKey = decrypt(c.Cube.APIKey, "cube.api_key")
+		c.Cube.APIKey = decryptKeyed("cube.api_key", "cube.api_key", c.Cube.APIKey)
 	}
 	if c.E2B != nil {
-		c.E2B.APIKey = decrypt(c.E2B.APIKey, "e2b.api_key")
+		c.E2B.APIKey = decryptKeyed("e2b.api_key", "e2b.api_key", c.E2B.APIKey)
 	}
 	for name, stored := range c.EnvVars {
-		c.EnvVars[name] = decrypt(stored, "env_vars."+name)
+		c.EnvVars[name] = decryptKeyed("env:"+name, "env_vars."+name, stored)
 	}
-	if c.Network != nil {
-		// CloneWithSecrets has no rule/header context, so rotated-key failures
-		// share one label rather than identifying the individual credential.
-		c.Network = c.Network.CloneWithSecrets(func(stored string) string {
-			return decrypt(stored, "network.injected_header")
-		})
-	}
+	walkSandboxNetworkSecrets(c.Network, func(key string, value *string) {
+		*value = decryptKeyed(key, "network.injected_header", *value)
+	})
 
 	return nil
 }

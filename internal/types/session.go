@@ -112,6 +112,12 @@ type Session struct {
 	// PinnedAt records when the session was pinned; nil when not pinned.
 	PinnedAt *time.Time `json:"pinned_at,omitempty"`
 
+	// DescriptionProvided marks an update request that carried a description
+	// explicitly. Never set by the JSON decoder and never persisted; the
+	// handler marks it so an omitted description keeps the stored value while
+	// an explicit empty string still clears it.
+	DescriptionProvided bool `json:"-" gorm:"-" yaml:"-"`
+
 	// LastRequestState records the input-bar state used the last time this
 	// session sent a question (agent, model, KB scope, web search, MCPs).
 	// Persisted on every successful POST to /knowledge-chat or /agent-chat so

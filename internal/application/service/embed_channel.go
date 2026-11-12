@@ -117,67 +117,82 @@ func (s *embedChannelService) ListByTenant(
 }
 
 func (s *embedChannelService) Update(
-	ctx context.Context, tenantID uint64, id string, req *types.EmbedChannel,
-	enabled *bool, showSuggested *bool, allowWebSearch *bool, allowFileUpload *bool,
-	defaultLocale *string, webhookURL *string, webhookSecret *string,
+	ctx context.Context, tenantID uint64, id string, update *types.EmbedChannelUpdate,
 ) (*types.EmbedChannel, error) {
+	if update == nil {
+		return nil, errors.New("embed channel update is required")
+	}
 	ch, err := s.getOwned(ctx, tenantID, id)
 	if err != nil {
 		return nil, err
 	}
-	if req.Name != "" {
-		ch.Name = strings.TrimSpace(req.Name)
+	if update.Name != nil {
+		if trimmed := strings.TrimSpace(*update.Name); trimmed != "" {
+			ch.Name = trimmed
+		}
 	}
-	ch.WelcomeMessage = req.WelcomeMessage
-	ch.PrimaryColor = strings.TrimSpace(req.PrimaryColor)
-	ch.PageTitle = strings.TrimSpace(req.PageTitle)
-	ch.HeaderTitleMode = types.NormalizeEmbedHeaderTitleMode(req.HeaderTitleMode)
-	if showSuggested != nil {
-		ch.ShowSuggestedQuestions = *showSuggested
+	// Each field is applied only when the caller sent it, so a request that
+	// only flips `enabled` cannot wipe the channel's styling configuration.
+	if update.WelcomeMessage != nil {
+		ch.WelcomeMessage = *update.WelcomeMessage
 	}
-	if allowWebSearch != nil {
-		ch.AllowWebSearch = *allowWebSearch
+	if update.PrimaryColor != nil {
+		ch.PrimaryColor = strings.TrimSpace(*update.PrimaryColor)
 	}
-	if allowFileUpload != nil {
-		ch.AllowFileUpload = *allowFileUpload
+	if update.PageTitle != nil {
+		ch.PageTitle = strings.TrimSpace(*update.PageTitle)
 	}
-	if defaultLocale != nil {
-		ch.DefaultLocale = types.NormalizeEmbedDefaultLocale(*defaultLocale)
+	if update.HeaderTitleMode != nil {
+		ch.HeaderTitleMode = types.NormalizeEmbedHeaderTitleMode(*update.HeaderTitleMode)
 	}
-	if webhookURL != nil {
-		trimmed := strings.TrimSpace(*webhookURL)
+	if update.ShowSuggestedQuestions != nil {
+		ch.ShowSuggestedQuestions = *update.ShowSuggestedQuestions
+	}
+	if update.AllowWebSearch != nil {
+		ch.AllowWebSearch = *update.AllowWebSearch
+	}
+	if update.AllowFileUpload != nil {
+		ch.AllowFileUpload = *update.AllowFileUpload
+	}
+	if update.DefaultLocale != nil {
+		ch.DefaultLocale = types.NormalizeEmbedDefaultLocale(*update.DefaultLocale)
+	}
+	if update.WebhookURL != nil {
+		trimmed := strings.TrimSpace(*update.WebhookURL)
 		if err := ValidateEmbedWebhookURL(trimmed); err != nil {
 			return nil, err
 		}
 		ch.WebhookURL = trimmed
 	}
-	if webhookSecret != nil {
-		ch.WebhookSecret = strings.TrimSpace(*webhookSecret)
+	if update.WebhookSecret != nil {
+		ch.WebhookSecret = strings.TrimSpace(*update.WebhookSecret)
 	}
-	if req.WidgetPosition != "" {
-		ch.WidgetPosition = types.NormalizeEmbedWidgetPosition(req.WidgetPosition)
+	if update.WidgetPosition != nil {
+		ch.WidgetPosition = types.NormalizeEmbedWidgetPosition(*update.WidgetPosition)
 	}
-	if enabled != nil {
-		ch.Enabled = *enabled
+	if update.Enabled != nil {
+		ch.Enabled = *update.Enabled
 	}
-	if req.RateLimitPerMinute > 0 {
-		ch.RateLimitPerMinute = req.RateLimitPerMinute
+	if update.RateLimitPerMinute != nil && *update.RateLimitPerMinute > 0 {
+		ch.RateLimitPerMinute = *update.RateLimitPerMinute
 	}
-	if req.RateLimitPerDay > 0 {
-		ch.RateLimitPerDay = req.RateLimitPerDay
+	if update.RateLimitPerDay != nil && *update.RateLimitPerDay > 0 {
+		ch.RateLimitPerDay = *update.RateLimitPerDay
 	}
-	if req.AllowedOrigins != nil {
-		if len(req.AllowedOrigins) == 0 {
+	if update.AllowedOrigins != nil {
+		if len(update.AllowedOrigins) == 0 {
 			ch.AllowedOrigins = []byte("[]")
 		} else {
-			ch.AllowedOrigins = req.AllowedOrigins
+			ch.AllowedOrigins = update.AllowedOrigins
 		}
 	}
-	if trimmed := strings.TrimSpace(req.AgentID); trimmed != "" && trimmed != ch.AgentID {
-		if _, err := s.ensureAgentOwned(ctx, tenantID, trimmed); err != nil {
-			return nil, err
+	if update.AgentID != nil {
+		if trimmed := strings.TrimSpace(*update.AgentID); trimmed != "" && trimmed != ch.AgentID {
+			if _, err := s.ensureAgentOwned(ctx, tenantID, trimmed); err != nil {
+				return nil, err
+			}
+			ch.AgentID = trimmed
 		}
-		ch.AgentID = trimmed
 	}
 	if err := s.repo.Update(ctx, ch); err != nil {
 		return nil, err

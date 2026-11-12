@@ -71,10 +71,14 @@ func (r *webSearchProviderRepository) List(ctx context.Context, tenantID uint64)
 
 // Update updates a web search provider
 func (r *webSearchProviderRepository) Update(ctx context.Context, provider *types.WebSearchProviderEntity) error {
+	// Only the editable columns are selected: a full Select("*") would rewrite
+	// the identity and timestamp columns from whatever the caller passed, so a
+	// stale entity could clobber them. Provider type, ID and tenant are
+	// immutable after creation.
 	update := func(db *gorm.DB) error {
 		result := db.Model(&types.WebSearchProviderEntity{}).Where(
 			"id = ? AND tenant_id = ?", provider.ID, provider.TenantID,
-		).Select("*").Updates(provider)
+		).Select("name", "description", "parameters", "is_default", "updated_at").Updates(provider)
 		if result.Error != nil {
 			return result.Error
 		}

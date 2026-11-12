@@ -44,10 +44,25 @@ type CreateProviderRequest struct {
 
 // UpdateProviderRequest defines the request body for updating a provider
 type UpdateProviderRequest struct {
-	Name        string                            `json:"name"`
-	Description string                            `json:"description"`
-	Parameters  types.WebSearchProviderParameters `json:"parameters"`
-	IsDefault   bool                              `json:"is_default"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// Parameters is nil when the request omitted the whole parameters object;
+	// a present object updates only the fields it carries (pointer fields).
+	Parameters *UpdateProviderParameters `json:"parameters"`
+	// IsDefault is nil when omitted; omitted keeps the stored default flag.
+	IsDefault *bool `json:"is_default"`
+}
+
+// UpdateProviderParameters carries the mutable search-provider settings.
+// A nil field means "keep the stored value"; a present field replaces it
+// (an empty string clears it). APIKey is never written from this endpoint —
+// it flows through the /credentials subresource only.
+type UpdateProviderParameters struct {
+	APIKey      *string            `json:"api_key,omitempty"`
+	EngineID    *string            `json:"engine_id,omitempty"`
+	BaseURL     *string            `json:"base_url,omitempty"`
+	ProxyURL    *string            `json:"proxy_url,omitempty"`
+	ExtraConfig *map[string]string `json:"extra_config,omitempty"`
 }
 
 // --- helpers ---
@@ -227,17 +242,39 @@ func (h *WebSearchProviderHandler) UpdateProvider(c *gin.Context) {
 	// behind the /credentials subresource. Force-preserve the stored key
 	// regardless of what the body says; log a warning if a stale caller
 	// passes one so we can spot them.
-	if req.Parameters.APIKey != "" && req.Parameters.APIKey != existing.Parameters.APIKey {
+	if req.Parameters != nil && req.Parameters.APIKey != nil &&
+		*req.Parameters.APIKey != "" && *req.Parameters.APIKey != existing.Parameters.APIKey {
 		logger.Warnf(ctx,
 			"deprecated: api_key in PUT /web-search-providers/%s body is ignored; use PUT /credentials instead",
 			secutils.SanitizeForLog(id))
 	}
-	mergedParams := req.Parameters
+	// Start from the stored parameters and overlay only the fields the request
+	// carried, so a partial PUT (e.g. only proxy_url) cannot drop ProxyURL,
+	// BaseURL, EngineID or ExtraConfig back to zero values.
+	mergedParams := existing.Parameters
 	mergedParams.APIKey = existing.Parameters.APIKey
-	// Preserve ExtraConfig when the request omits it (nil); otherwise a
-	// partial PUT would silently drop tenant-configured extras.
-	if mergedParams.ExtraConfig == nil {
-		mergedParams.ExtraConfig = existing.Parameters.ExtraConfig
+	// Carry the ciphertext of a credential whose decryption failed, so this
+	// save restores it instead of blanking a recoverable secret.
+	mergedParams.PreserveUndecryptableSecretsFrom(existing.Parameters)
+	if p := req.Parameters; p != nil {
+		if p.EngineID != nil {
+			mergedParams.EngineID = *p.EngineID
+		}
+		if p.BaseURL != nil {
+			mergedParams.BaseURL = *p.BaseURL
+		}
+		if p.ProxyURL != nil {
+			mergedParams.ProxyURL = *p.ProxyURL
+		}
+		if p.ExtraConfig != nil {
+			mergedParams.ExtraConfig = *p.ExtraConfig
+		}
+	}
+	// An omitted is_default keeps the stored flag; sending false explicitly
+	// clears the default instead of being lost as a zero value.
+	isDefault := existing.IsDefault
+	if req.IsDefault != nil {
+		isDefault = *req.IsDefault
 	}
 
 	// Preserve existing values for top-level metadata fields when the
@@ -261,7 +298,7 @@ func (h *WebSearchProviderHandler) UpdateProvider(c *gin.Context) {
 		Provider:    existing.Provider, // Provider type is immutable after creation
 		Description: secutils.SanitizeForLog(mergedDescription),
 		Parameters:  mergedParams,
-		IsDefault:   req.IsDefault,
+		IsDefault:   isDefault,
 	}
 
 	if err := h.service.UpdateProvider(ctx, provider); err != nil {

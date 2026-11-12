@@ -127,10 +127,11 @@ func TestUpdateSessionRejectsPlantedMaintenanceDescription(t *testing.T) {
 	require.NoError(t, db.Create(aliceSession).Error)
 
 	err := svc.UpdateSession(testSessionScopeContext(1, "alice"), &types.Session{
-		ID:          aliceSession.ID,
-		TenantID:    1,
-		Title:       "still mine",
-		Description: types.SkillMaintenanceSessionMarker + "install",
+		ID:                  aliceSession.ID,
+		TenantID:            1,
+		Title:               "still mine",
+		Description:         types.SkillMaintenanceSessionMarker + "install",
+		DescriptionProvided: true,
 	})
 	require.NoError(t, err)
 

@@ -959,6 +959,11 @@ func (h *TenantHandler) UpdateAPIPrincipalConfig(c *gin.Context) {
 		RequireDirectHeader:   req.RequireDirectHeader,
 		HMACSecret:            hmacSecret,
 	}
+	// A stored secret that failed to decrypt stays in the column; restoring
+	// the original key is the only way to read it again.
+	if tenant.APIPrincipalConfig != nil {
+		cfg.PreserveUndecryptableSecretsFrom(tenant.APIPrincipalConfig)
+	}
 	if cfg.Mode == types.APIPrincipalModeSignedToken && strings.TrimSpace(cfg.HMACSecret) == "" {
 		c.Error(errors.NewValidationError("hmac_secret is required for signed_token mode"))
 		return
@@ -1562,7 +1567,15 @@ func (h *TenantHandler) updateTenantStorageEngineConfigInternal(c *gin.Context) 
 		c.Error(errors.NewBadRequestError("Workspace is empty"))
 		return
 	}
+	if err := cfg.OSS.ValidateForTenantWrite(); err != nil {
+		c.Error(errors.NewValidationError("oss config rejected").WithDetails(err.Error()))
+		return
+	}
 	merged := types.MergeStorageEngineConfigForUpdate(&cfg, tenant.StorageEngineConfig)
+	if err := merged.OSS.ValidateForTenantWrite(); err != nil {
+		c.Error(errors.NewValidationError("oss config rejected").WithDetails(err.Error()))
+		return
+	}
 	tenant.StorageEngineConfig = merged
 	updatedTenant, err := h.service.UpdateTenant(ctx, tenant)
 	if err != nil {

@@ -177,3 +177,35 @@ func TestWebSearchProviderRepositoryStopsWhenDefaultScopeCannotBeLocked(t *testi
 		Where("tenant_id = ?", provider.TenantID).Count(&count).Error)
 	require.Zero(t, count)
 }
+
+// Update must write only the editable columns: a stale entity that leaves
+// immutable fields at their zero values must not rewrite provider type,
+// identity or creation time.
+func TestWebSearchProviderRepositoryUpdateWritesOnlyEditableColumns(t *testing.T) {
+	db, repo := newWebSearchProviderTestRepository(t)
+	ctx := context.Background()
+
+	row := newDuckDuckGoProvider("original", false)
+	row.Description = "desc"
+	row.Parameters = types.WebSearchProviderParameters{ProxyURL: "http://old"}
+	require.NoError(t, repo.Create(ctx, row))
+	require.False(t, row.CreatedAt.IsZero())
+
+	stale := &types.WebSearchProviderEntity{
+		ID:         row.ID,
+		TenantID:   row.TenantID,
+		Name:       "renamed",
+		Provider:   types.WebSearchProviderTypeGoogle, // immutable, must be ignored
+		Parameters: types.WebSearchProviderParameters{ProxyURL: "http://new"},
+		IsDefault:  false,
+	}
+	require.NoError(t, repo.Update(ctx, stale))
+
+	var stored types.WebSearchProviderEntity
+	require.NoError(t, db.First(&stored, "id = ?", row.ID).Error)
+	require.Equal(t, "renamed", stored.Name)
+	require.Equal(t, "http://new", stored.Parameters.ProxyURL)
+	require.Equal(t, types.WebSearchProviderTypeDuckDuckGo, stored.Provider,
+		"provider type is immutable after creation")
+	require.Equal(t, row.CreatedAt.UTC(), stored.CreatedAt.UTC())
+}
