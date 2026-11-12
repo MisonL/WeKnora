@@ -180,3 +180,31 @@ func TestSubtreeChildID_MatchesPrefix(t *testing.T) {
 	assert.False(t, strings.HasPrefix(sibling, prefix),
 		"sibling node whose id shares a leading substring must not match the prefix")
 }
+
+// A user explicitly clearing credentials must actually clear them, even when
+// the stored ciphertext could not be decrypted with the current
+// SYSTEM_AES_KEY. Without DropUndecryptableCredentials, ToJSON restores the
+// old ciphertext and the delete silently becomes a no-op.
+func TestDataSourceConfig_DropUndecryptableCredentialsPreventsRestore(t *testing.T) {
+	withAESKey(t, testAESKey32)
+	const ciphertext = "enc:v1:old-rotated-key-blob"
+
+	cfg := &DataSourceConfig{
+		Type:        ConnectorTypeRSS,
+		Credentials: map[string]interface{}{"auth_headers": ""},
+		undecryptable: preservedCiphertext{
+			"auth_headers": ciphertext,
+		},
+	}
+
+	// Baseline: without the drop, the ciphertext is restored.
+	blob, err := cfg.ToJSON()
+	assert.NoError(t, err)
+	assert.Contains(t, string(blob), "old-rotated-key-blob")
+
+	// After an explicit delete, the ciphertext must be gone.
+	cfg.DropUndecryptableCredentials()
+	blob, err = cfg.ToJSON()
+	assert.NoError(t, err)
+	assert.NotContains(t, string(blob), "old-rotated-key-blob")
+}

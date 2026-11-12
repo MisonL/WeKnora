@@ -265,6 +265,9 @@ func (s *mcpServiceService) UpdateMCPService(
 			existing.AuthConfig.APIKey = ""
 			existing.AuthConfig.Token = ""
 			existing.AuthConfig.CustomHeaders = nil
+			// This path owns the explicit removal: drop the write-back
+			// ciphertext so the cleared values actually reach the column.
+			existing.AuthConfig.ClearPreservedSecrets()
 		}
 	}
 

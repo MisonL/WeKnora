@@ -4,12 +4,14 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/Tencent/WeKnora/internal/datasource"
 	"github.com/Tencent/WeKnora/internal/handler/dto"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 )
 
 // DataSourceHandler handles HTTP requests for data source management
@@ -211,7 +213,21 @@ func (h *DataSourceHandler) UpdateDataSource(c *gin.Context) {
 	id := c.Param("id")
 
 	var req types.DataSource
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+		return
+	}
+	// types.DataSource cannot express field presence, so decode the raw JSON a
+	// second time to learn which fields the client actually sent.
+	var provided struct {
+		Name             *string     `json:"name"`
+		SyncSchedule     *string     `json:"sync_schedule"`
+		SyncMode         *string     `json:"sync_mode"`
+		ConflictStrategy *string     `json:"conflict_strategy"`
+		SyncDeletions    *bool       `json:"sync_deletions"`
+		Config           *types.JSON `json:"config"`
+	}
+	if err := c.ShouldBindBodyWith(&provided, binding.JSON); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
 	}
@@ -222,16 +238,40 @@ func (h *DataSourceHandler) UpdateDataSource(c *gin.Context) {
 		return
 	}
 
-	req.ID = id
-	req.TenantID = existing.TenantID
-	req.KnowledgeBaseID = existing.KnowledgeBaseID
-	ds, err := h.service.UpdateDataSource(ctx, &req)
+	// Read-modify-write: start from the stored row and overlay only the fields
+	// the request carried, so a rename cannot wipe sync_schedule/sync_deletions
+	// back to zero values. Concurrent PUTs interleave at whole-field granularity
+	// (last writer wins per field); sync-settings PATCH remains the atomic
+	// per-field alternative.
+	ds := *existing
+	if provided.Name != nil && strings.TrimSpace(*provided.Name) != "" {
+		ds.Name = *provided.Name
+	}
+	if provided.SyncSchedule != nil {
+		ds.SyncSchedule = *provided.SyncSchedule
+	}
+	if provided.SyncMode != nil && *provided.SyncMode != "" {
+		ds.SyncMode = *provided.SyncMode
+	}
+	if provided.ConflictStrategy != nil && *provided.ConflictStrategy != "" {
+		ds.ConflictStrategy = *provided.ConflictStrategy
+	}
+	if provided.SyncDeletions != nil {
+		ds.SyncDeletions = *provided.SyncDeletions
+	}
+	if provided.Config != nil {
+		ds.Config = *provided.Config
+	}
+	ds.ID = id
+	ds.TenantID = existing.TenantID
+	ds.KnowledgeBaseID = existing.KnowledgeBaseID
+	updated, err := h.service.UpdateDataSource(ctx, &ds)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, dto.NewDataSourceResponse(ds))
+	c.JSON(http.StatusOK, dto.NewDataSourceResponse(updated))
 }
 
 // DeleteDataSource godoc

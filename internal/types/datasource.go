@@ -233,6 +233,36 @@ type DataSourceConfig struct {
 
 	// Connector-specific configuration
 	Settings map[string]interface{} `json:"settings"`
+
+	// Ciphertext of credentials whose load-path decryption failed, keyed by
+	// credential name. ToJSON writes it back while the entry is still empty,
+	// so re-encoding the config for an unrelated update cannot destroy a
+	// credential the original SYSTEM_AES_KEY may still recover.
+	undecryptable preservedCiphertext
+}
+
+// DropUndecryptableCredentials discards the preserved ciphertext. Call it on
+// paths where the user explicitly deletes credentials: ToJSON would otherwise
+// restore the old ciphertext and the delete would silently be a no-op.
+func (d *DataSourceConfig) DropUndecryptableCredentials() {
+	if d == nil {
+		return
+	}
+	d.undecryptable = nil
+}
+
+// PreserveUndecryptableCredentialsFrom carries the preserved ciphertext of a
+// previously loaded config onto a value assembled for an update.
+func (d *DataSourceConfig) PreserveUndecryptableCredentialsFrom(loaded *DataSourceConfig) {
+	if d == nil || loaded == nil || loaded.undecryptable == nil {
+		return
+	}
+	if d.undecryptable == nil {
+		d.undecryptable = newPreservedCiphertext()
+	}
+	for name, ciphertext := range loaded.undecryptable {
+		d.undecryptable[name] = ciphertext
+	}
 }
 
 // HasCredentials reports whether the credentials map carries any value at
@@ -536,6 +566,22 @@ func (d *DataSourceConfig) ToJSON() (JSON, error) {
 		return nil, nil
 	}
 	out := *d
+	if len(out.Credentials) > 0 {
+		// Restore entries the load path could not decrypt before re-encoding.
+		// Only entries still present in the map are restored, so removing a
+		// credential stays an explicit, effective action.
+		creds := make(map[string]interface{}, len(out.Credentials))
+		for k, v := range out.Credentials {
+			if str, ok := v.(string); ok && str == "" {
+				if ciphertext := out.undecryptable[k]; ciphertext != "" {
+					creds[k] = ciphertext
+					continue
+				}
+			}
+			creds[k] = v
+		}
+		out.Credentials = creds
+	}
 	if key := utils.GetAESKey(); key != nil && len(out.Credentials) > 0 {
 		encCreds := make(map[string]interface{}, len(out.Credentials))
 		for k, v := range out.Credentials {
@@ -607,6 +653,10 @@ func (d *DataSource) ParseConfig() (*DataSourceConfig, error) {
 			config.Credentials[k] = plain
 			continue
 		}
+		if config.undecryptable == nil {
+			config.undecryptable = newPreservedCiphertext()
+		}
+		config.undecryptable.remember(k, s)
 		// Same rationale as the other Scan paths: don't fail the load —
 		// blank the field so the row stays visible. ParseConfig callers
 		// then see an empty credential string; HasCredentials() returns

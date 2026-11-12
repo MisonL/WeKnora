@@ -212,6 +212,9 @@ func (s *DataSourceService) updateDataSource(
 			merged := *incomingCfg
 			if existingCfg != nil {
 				merged.Credentials = existingCfg.Credentials
+				// Keep the ciphertext of credentials that failed to decrypt,
+				// so this update restores them instead of blanking the map.
+				merged.PreserveUndecryptableCredentialsFrom(existingCfg)
 			} else {
 				merged.Credentials = nil
 			}
@@ -333,13 +336,24 @@ func (s *DataSourceService) ClearDataSourceCredentials(ctx context.Context, id s
 		return nil
 	}
 	parsed.StripNonSecretCredentials(existing.Type)
+	// 显式清空必须连保留密文一起丢弃：ToJSON 会为“值为空但留有密文”的条目
+	// 还原旧密文（防止无关更新毁掉密钥轮换后仍可恢复的凭据），若不先清掉，
+	// 这里会写回旧密文，接口返回成功但凭据实际没有删除。
+	parsed.DropUndecryptableCredentials()
 	if !parsed.HasConfiguredCredentials(existing.Type) {
 		blob, err := parsed.ToJSON()
 		if err != nil {
 			return err
 		}
 		existing.Config = blob
-		return s.dsRepo.Update(ctx, existing)
+		if err := s.dsRepo.Update(ctx, existing); err != nil {
+			return err
+		}
+		logger.Infof(ctx, "DataSource credentials cleared by user: id=%s", secutils.SanitizeForLog(id))
+		recordKBActivity(ctx, s.audit, existing.TenantID, existing.KnowledgeBaseID, types.AuditActionDataSourceUpdated,
+			"data_source", existing.ID, types.AuditOutcomeSuccess,
+			map[string]any{"name": existing.Name, "type": existing.Type, "changed_fields": []string{"credentials"}})
+		return nil
 	}
 	parsed.Credentials = nil
 	blob, err := parsed.ToJSON()

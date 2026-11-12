@@ -118,6 +118,41 @@ type MCPAuthConfig struct {
 	// Secret: encrypted at rest like APIKey and Token, never returned, and
 	// changed only through the credentials subresource after creation.
 	ClientSecret string `json:"client_secret,omitempty"`
+
+	// Ciphertext kept when the load-path decryption failed, so Value can write
+	// it back instead of blanking a recoverable secret.
+	apiKeyStored       string
+	tokenStored        string
+	clientSecretStored string
+}
+
+// PreserveUndecryptableSecretsFrom carries preserved ciphertext from a row
+// loaded through Scan onto an auth config assembled for an update.
+func (c *MCPAuthConfig) PreserveUndecryptableSecretsFrom(loaded *MCPAuthConfig) {
+	if c == nil || loaded == nil {
+		return
+	}
+	if c.APIKey == "" {
+		c.apiKeyStored = loaded.apiKeyStored
+	}
+	if c.Token == "" {
+		c.tokenStored = loaded.tokenStored
+	}
+	if c.ClientSecret == "" {
+		c.clientSecretStored = loaded.clientSecretStored
+	}
+}
+
+// ClearPreservedSecrets drops the write-back ciphertext so an explicit
+// credential removal actually clears the column. Call it only from a path
+// that is deliberately erasing a secret.
+func (c *MCPAuthConfig) ClearPreservedSecrets() {
+	if c == nil {
+		return
+	}
+	c.apiKeyStored = ""
+	c.tokenStored = ""
+	c.clientSecretStored = ""
 }
 
 // IsOAuth reports whether this service uses the OAuth strategy.
@@ -276,6 +311,15 @@ func (c *MCPAuthConfig) Value() (driver.Value, error) {
 		return nil, nil
 	}
 	out := *c
+	if out.APIKey == "" {
+		out.APIKey = out.apiKeyStored
+	}
+	if out.Token == "" {
+		out.Token = out.tokenStored
+	}
+	if out.ClientSecret == "" {
+		out.ClientSecret = out.clientSecretStored
+	}
 	if key := utils.GetAESKey(); key != nil {
 		if out.APIKey != "" {
 			if encrypted, err := utils.EncryptAESGCM(out.APIKey, key); err == nil {
@@ -315,21 +359,27 @@ func (c *MCPAuthConfig) Scan(value interface{}) error {
 	}
 	if plain, ok := utils.DecryptStoredSecretLenient(c.APIKey); ok {
 		c.APIKey = plain
+		c.apiKeyStored = ""
 	} else {
-		log.Printf("[crypto] mcp auth_config api_key: decrypt failed (SYSTEM_AES_KEY missing/rotated?), treating as unconfigured")
+		log.Printf("[crypto] mcp auth_config api_key: decrypt failed (SYSTEM_AES_KEY missing/rotated?), keeping ciphertext for write-back")
+		c.apiKeyStored = c.APIKey
 		c.APIKey = ""
 	}
 	if plain, ok := utils.DecryptStoredSecretLenient(c.Token); ok {
 		c.Token = plain
+		c.tokenStored = ""
 	} else {
-		log.Printf("[crypto] mcp auth_config token: decrypt failed (SYSTEM_AES_KEY missing/rotated?), treating as unconfigured")
+		log.Printf("[crypto] mcp auth_config token: decrypt failed (SYSTEM_AES_KEY missing/rotated?), keeping ciphertext for write-back")
+		c.tokenStored = c.Token
 		c.Token = ""
 	}
 	if plain, ok := utils.DecryptStoredSecretLenient(c.ClientSecret); ok {
 		c.ClientSecret = plain
+		c.clientSecretStored = ""
 	} else {
 		log.Printf("[crypto] mcp auth_config client_secret: decrypt failed " +
-			"(SYSTEM_AES_KEY missing/rotated?), treating as unconfigured")
+			"(SYSTEM_AES_KEY missing/rotated?), keeping ciphertext for write-back")
+		c.clientSecretStored = c.ClientSecret
 		c.ClientSecret = ""
 	}
 	return nil
