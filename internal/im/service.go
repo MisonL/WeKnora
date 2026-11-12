@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/storageurl"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
@@ -65,7 +67,30 @@ const (
 	// agentCompleteWaitTimeout bounds how long IM waits for EventAgentComplete after
 	// the final answer stream finishes, preventing indefinite hangs.
 	agentCompleteWaitTimeout = 10 * time.Second
+	// defaultIMQATimeout bounds one IM QA turn end to end. Agent rounds keep
+	// their own per-stream stall budget; this deadline is the overall ceiling
+	// that /stop also releases by cancelling the same context.
+	defaultIMQATimeout = 10 * time.Minute
+	// imQATimeoutEnv overrides defaultIMQATimeout with a Go duration ("15m")
+	// or a plain number of seconds. Invalid values fall back to the default.
+	imQATimeoutEnv = "WEKNORA_IM_QA_TIMEOUT"
 )
+
+// imQATimeout returns the overall deadline for one IM QA turn, from
+// WEKNORA_IM_QA_TIMEOUT or the default.
+func imQATimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(imQATimeoutEnv))
+	if raw == "" {
+		return defaultIMQATimeout
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d
+	}
+	if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return defaultIMQATimeout
+}
 
 // imCitationTagRe matches inline citation tags produced by the agent pipeline.
 // These tags are rendered as interactive UI in the web frontend but are meaningless
@@ -178,6 +203,13 @@ func imQAFailureReply(err error) string {
 	return imErrorFallback
 }
 
+// ErrorFallbackText exposes the fixed user-facing fallback message for callers
+// outside this package (e.g. the HTTP handler's panic barrier) that must reply
+// without leaking any error internals.
+func ErrorFallbackText() string {
+	return imErrorFallback
+}
+
 // cleanIMContent applies all IM-specific content transformations:
 //  1. Collapse <image> XML blocks back to plain markdown
 //  2. Strip <kb/> and <web/> citation tags
@@ -261,7 +293,29 @@ const (
 
 	defaultRateLimitWindow      = 60 * time.Second
 	defaultRateLimitMaxRequests = 10
+	// commandRateLimitMax is the per-user sliding-window cap for
+	// resource-consuming slash-commands (e.g. /search). Deliberately looser
+	// than the normal message limit but still bounded so commands cannot
+	// bypass resource protection. Not configurable: a tighter default keeps
+	// the protection meaningful.
+	commandRateLimitMax = 20
+	// searchCommandRateLimitMax is the tighter cap for /search, which hits the
+	// embedding pipeline and a 2-slot global semaphore on every call. The
+	// generic command bucket is too loose for it.
+	searchCommandRateLimitMax = 5
 )
+
+// isControlCommand reports whether a slash-command is a lightweight control
+// operation that must never be blocked by rate limiting — otherwise the user
+// could not stop, clear or inspect the bot under heavy messaging.
+func isControlCommand(name string) bool {
+	switch strings.ToLower(name) {
+	case "stop", "help", "clear":
+		return true
+	default:
+		return false
+	}
+}
 
 // ErrChannelDisabled reports that a channel row exists but is disabled, so
 // callers can tell it apart from a missing channel or a transient failure.
@@ -1011,6 +1065,7 @@ func (s *Service) LoadAndStartChannels() error {
 	s.startChannelConfigSubscriber()
 
 	ctx := context.Background()
+	s.encryptLegacyChannelCredentials(ctx)
 	var channels []IMChannel
 	if err := s.db.Where("enabled = ? AND deleted_at IS NULL", true).Find(&channels).Error; err != nil {
 		return fmt.Errorf("load im channels: %w", err)
@@ -1037,6 +1092,52 @@ func (s *Service) LoadAndStartChannels() error {
 
 	logger.Infof(ctx, "[IM] Loaded %d enabled channels", len(channels))
 	return nil
+}
+
+// encryptLegacyChannelCredentials rewrites channels whose credentials were
+// stored before CredentialsJSON encrypted them.
+//
+// Scan keeps such rows usable, but only a write re-encrypts them: a channel
+// that is never edited again would stay in plaintext forever. jsonb_typeof is
+// 'object' exactly for the legacy shape, because the encrypted wrapper is a
+// JSON string scalar.
+func (s *Service) encryptLegacyChannelCredentials(ctx context.Context) {
+	if utils.GetAESKey() == nil || s.db.Dialector.Name() != "postgres" {
+		// SQLite (desktop) has no jsonb_typeof and normally runs without a key.
+		return
+	}
+
+	var ids []string
+	if err := s.db.WithContext(ctx).
+		Raw(`SELECT id FROM im_channels WHERE deleted_at IS NULL AND jsonb_typeof(credentials) = 'object'`).
+		Scan(&ids).Error; err != nil {
+		logger.Warnf(ctx, "[IM] Legacy credential scan failed, leaving rows as-is: %v", err)
+		return
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	encrypted := 0
+	for _, id := range ids {
+		var ch IMChannel
+		if err := s.db.WithContext(ctx).Where("id = ?", id).First(&ch).Error; err != nil {
+			logger.Warnf(ctx, "[IM] Legacy credential re-encrypt skipped for %s: %v", id, err)
+			continue
+		}
+		// UpdateColumn skips BeforeSave: the hook recomputes bot_identity from
+		// the model's credentials, and this model carries none.
+		if err := s.db.WithContext(ctx).Model(&IMChannel{}).Where("id = ?", id).
+			UpdateColumn("credentials", ch.Credentials).Error; err != nil {
+			logger.Warnf(ctx, "[IM] Legacy credential re-encrypt failed for %s: %v", id, err)
+			continue
+		}
+		encrypted++
+		logger.Infof(ctx, "[IM] Encrypted stored credentials for channel %s", id)
+	}
+	if encrypted > 0 {
+		logger.Infof(ctx, "[IM] Encrypted credentials of %d legacy channel(s)", encrypted)
+	}
 }
 
 // startChannelConfigSubscriber listens for durable channel mutations made by
@@ -1641,12 +1742,12 @@ func sameChannelRuntimeConfig(cached, fresh *IMChannel) bool {
 		equalChannelCredentials(cached.Credentials, fresh.Credentials)
 }
 
-func equalChannelCredentials(left, right types.JSON) bool {
+func equalChannelCredentials(left, right CredentialsJSON) bool {
 	var leftValue, rightValue any
-	if err := json.Unmarshal(left, &leftValue); err != nil {
-		return string(left) == string(right)
+	if err := json.Unmarshal(left.Bytes(), &leftValue); err != nil {
+		return string(left.Bytes()) == string(right.Bytes())
 	}
-	if err := json.Unmarshal(right, &rightValue); err != nil {
+	if err := json.Unmarshal(right.Bytes(), &rightValue); err != nil {
 		return false
 	}
 	return reflect.DeepEqual(leftValue, rightValue)
@@ -1739,10 +1840,31 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 	}
 
 	// Rate limit: enforce per-user sliding window to prevent abuse.
-	// Slash-commands (/stop, /clear, etc.) bypass rate limiting so the user
+	// Control commands (/stop, /help, /clear) bypass rate limiting so the user
 	// always retains control over the bot even under heavy messaging.
-	isCommand := s.cmdRegistry.IsRegistered(msg.Content)
-	if !isCommand {
+	// Resource-consuming commands (e.g. /search) bypass the message quota but
+	// still get a looser, bounded per-user limit so they cannot be used to
+	// sidestep queue/embedding protection.
+	if cmd, _, isCmd := s.cmdRegistry.Parse(msg.Content); isCmd {
+		if !isControlCommand(cmd.Name()) {
+			// 资源型指令用比普通消息更紧的独立配额：/search 每次会打 embedding，
+			// 与消息配额解耦后不能反而更宽松。
+			max := commandRateLimitMax
+			if cmd.Name() == "search" {
+				max = searchCommandRateLimitMax
+			}
+			rateLimitKey := makeUserKey(channelID, msg.UserID, msg.ChatID, threadID) + ":cmd"
+			if !s.rateLimiter.Allow(ctx, rateLimitKey, max) {
+				logger.Warnf(ctx, "[IM] Command rate limited: channel=%s user=%s chat=%s cmd=/%s",
+					channelID, msg.UserID, msg.ChatID, cmd.Name())
+				_ = adapter.SendReply(ctx, msg, &ReplyMessage{
+					Content: "指令发送过于频繁，请稍后再试。",
+					IsFinal: true,
+				})
+				return nil
+			}
+		}
+	} else {
 		rateLimitKey := makeUserKey(channelID, msg.UserID, msg.ChatID, threadID)
 		if !s.rateLimiter.Allow(ctx, rateLimitKey, s.rateLimitMax) {
 			logger.Warnf(ctx, "[IM] Rate limited: channel=%s user=%s chat=%s", channelID, msg.UserID, msg.ChatID)
@@ -1983,9 +2105,12 @@ func (s *Service) executeQARequest(req *qaRequest) {
 		return
 	}
 	if req.channel.KnowledgeBaseID != "" && downloaded != nil {
-		go s.processDownloadedFileToKnowledgeBase(
-			context.WithoutCancel(ctx), req.channel, downloaded,
-		)
+		go func() {
+			defer agenttools.RecoverGoroutine(context.WithoutCancel(ctx), "im-file-ingest", nil)
+			s.processDownloadedFileToKnowledgeBase(
+				context.WithoutCancel(ctx), req.channel, downloaded,
+			)
+		}()
 	}
 
 	// Determine output mode from channel config.
@@ -2518,10 +2643,11 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 		return s.fallbackNonStream(ctx, msg, session, customAgent, kbIDs, attachments, imageURLs, adapter, userKey, tenant)
 	}
 
-	// Prepare the QA pipeline
-	// No total deadline: each agent round has its own LLMCallTimeout (default 120s).
-	// A hard pipeline deadline would kill multi-round agent reasoning prematurely.
-	qaCtx, qaCancel := context.WithCancel(ctx)
+	// Prepare the QA pipeline.
+	// The deadline is the turn's overall ceiling; the stream layer still
+	// detects a model that goes silent well before it (WEKNORA_LLM_STREAM_STALL_TIMEOUT).
+	// qaCancel stays the release /stop uses, so cancelling still ends the turn immediately.
+	qaCtx, qaCancel := context.WithTimeout(ctx, imQATimeout())
 	defer qaCancel()
 
 	useAgent := customAgent != nil && customAgent.IsAgentMode()
@@ -2814,10 +2940,25 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 
 	// Start StreamManager stop watcher — mirrors web's handleAgentEventsForSSE
 	// stop detection. Cancels qaCtx if a stop event is written by any instance.
-	go s.watchStreamManagerStop(qaCtx, session.ID, assistantMsg.ID, qaCancel)
+	go func() {
+		defer agenttools.RecoverGoroutine(qaCtx, "im-stop-watcher", nil)
+		s.watchStreamManagerStop(qaCtx, session.ID, assistantMsg.ID, qaCancel)
+	}()
 
 	// Run QA async
 	go func() {
+		// Panic barrier: recover here so a panicking QA pipeline cannot take
+		// down the process. onPanic records a QA error (which maps to the fixed
+		// user-facing fallback text) and unblocks the flush/wait loop — for the
+		// KnowledgeQA path there is no deferred close below, so without this
+		// the caller would wait forever.
+		defer agenttools.RecoverGoroutine(ctx, "im-qa-stream", func() {
+			bufMu.Lock()
+			qaErr = fmt.Errorf("QA pipeline panicked")
+			bufMu.Unlock()
+			closeDone()
+			closeComplete()
+		})
 		// AgentQA returns after all synchronous events, including errors emitted
 		// after EventAgentComplete. KnowledgeQA starts an asynchronous stream,
 		// so its return must not end the reply.
@@ -2980,9 +3121,12 @@ func (s *Service) fallbackNonStream(ctx context.Context, msg *IncomingMessage, s
 
 // runQA executes the WeKnora QA pipeline and returns the full answer text.
 func (s *Service) runQA(ctx context.Context, session *types.Session, query string, customAgent *types.CustomAgent, kbIDs []string, attachments types.MessageAttachments, imageURLs []string, userKey string, quote *QuotedMessage) (string, error) {
-	// Cancellable context (no hard deadline): each agent round has its own
-	// LLMCallTimeout. The context can still be cancelled by /stop.
-	ctx, cancel := context.WithCancel(ctx)
+	// Overall ceiling for one QA turn, matching the streaming path. Without it
+	// the non-streaming and full-output paths had no deadline at all: only an
+	// explicit /stop could end them, so a stalled upstream could pin a worker
+	// indefinitely. Each agent round still keeps its own LLMCallTimeout; this
+	// is the outer bound that /stop also releases.
+	ctx, cancel := context.WithTimeout(ctx, imQATimeout())
 	defer cancel()
 
 	eventBus := event.NewEventBus()
@@ -3100,10 +3244,22 @@ func (s *Service) runQA(ctx context.Context, session *types.Session, query strin
 	defer s.clearInflightMapping(ctx, userKey)
 
 	// Start StreamManager stop watcher.
-	go s.watchStreamManagerStop(ctx, session.ID, assistantMsg.ID, cancel)
+	go func() {
+		defer agenttools.RecoverGoroutine(ctx, "im-stop-watcher", nil)
+		s.watchStreamManagerStop(ctx, session.ID, assistantMsg.ID, cancel)
+	}()
 
 	// Run QA async
 	go func() {
+		// Panic barrier: same contract as the streaming path — record a QA
+		// error (surfaces as the fixed fallback text) and unblock the caller.
+		defer agenttools.RecoverGoroutine(ctx, "im-qa-collect", func() {
+			answerMu.Lock()
+			qaErr = fmt.Errorf("QA pipeline panicked")
+			answerMu.Unlock()
+			closeDone()
+			closeComplete()
+		})
 		// Match the streaming path: a returned AgentQA cannot produce more
 		// events, while KnowledgeQA may still be consuming its answer stream.
 		if useAgent {
@@ -3233,6 +3389,12 @@ func (s *Service) ListChannelsByTenant(ctx context.Context, tenantID uint64) ([]
 	if err != nil {
 		return nil, err
 	}
+	// bot_identity can embed an authenticable secret on some platforms
+	// (legacy mattermost rows carry the raw outgoing token); this method feeds
+	// Viewer-facing list endpoints, so sanitize before returning.
+	for i := range rows {
+		rows[i].BotIdentity = SanitizeBotIdentityForDisplay(rows[i].Platform, rows[i].BotIdentity)
+	}
 	relocalizeBuiltinChannelAgentNames(ctx, rows)
 	return rows, nil
 }
@@ -3309,6 +3471,24 @@ func (s *Service) SetChannelKnowledgeBaseID(ctx context.Context, channel *IMChan
 	return nil
 }
 
+// saveChannel writes a channel row. When the loaded credentials could not be
+// decrypted (SYSTEM_AES_KEY rotated/missing), the credentials column is
+// omitted: writing the in-memory placeholder would permanently destroy
+// ciphertext the original key may still recover, and re-entering them has to
+// wait for that key. Value() also refuses to serialize an undecryptable
+// document, so a write that bypassed this helper fails loudly instead of
+// silently blanking the column.
+//
+// bot_identity is derived from the credentials, so it is omitted too: saving
+// it from the placeholder document would blank the unique identity that
+// duplicate-bot detection depends on.
+func (s *Service) saveChannel(channel *IMChannel) *gorm.DB {
+	if channel.Credentials.Undecryptable() {
+		return s.db.Omit("credentials", "bot_identity").Save(channel)
+	}
+	return s.db.Save(channel)
+}
+
 // UpdateChannel updates a channel and restarts it if needed.
 // Returns a duplicate_bot error if the bot identity is already used by another channel.
 func (s *Service) UpdateChannel(channel *IMChannel) error {
@@ -3318,7 +3498,7 @@ func (s *Service) UpdateChannel(channel *IMChannel) error {
 	if err := s.checkDuplicateBot(channel, channel.ID); err != nil {
 		return err
 	}
-	if err := s.db.Save(channel).Error; err != nil {
+	if err := s.saveChannel(channel).Save(channel).Error; err != nil {
 		return err
 	}
 	// Restart channel: stop old, start new if enabled
@@ -3376,7 +3556,7 @@ func (s *Service) ToggleChannel(channelID string, tenantID uint64) (*IMChannel, 
 		return nil, err
 	}
 	ch.Enabled = !ch.Enabled
-	if err := s.db.Save(&ch).Error; err != nil {
+	if err := s.saveChannel(&ch).Save(&ch).Error; err != nil {
 		return nil, err
 	}
 	if ch.Enabled {

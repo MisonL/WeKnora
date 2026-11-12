@@ -16,7 +16,7 @@ import (
 // "websocket" mode additionally runs a long-connection event stream.
 func NewFactory(region Region) im.AdapterFactory {
 	return func(factoryCtx context.Context, channel *im.IMChannel, msgHandler func(context.Context, *im.IncomingMessage) error) (im.Adapter, context.CancelFunc, error) {
-		creds, err := im.ParseCredentials(channel.Credentials)
+		creds, err := im.ParseCredentials(channel.Credentials.Bytes())
 		if err != nil {
 			return nil, nil, fmt.Errorf("parse %s credentials: %w", region.Platform, err)
 		}

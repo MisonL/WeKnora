@@ -2,8 +2,10 @@ package im
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -13,7 +15,17 @@ import (
 const (
 	searchMaxResults    = 5
 	searchContentMaxLen = 200 // runes shown per result
+	// searchTimeout bounds a single /search execution: it hits the embedding
+	// pipeline and must not run unbounded inside the synchronous command path.
+	searchTimeout = 30 * time.Second
+	// searchMaxConcurrency caps concurrent /search executions process-wide so
+	// a burst of commands cannot saturate the embedding backend the way the
+	// queued QA pipeline (worker pool) is protected.
+	searchMaxConcurrency = 2
 )
+
+// searchSlots is the process-wide concurrency gate for /search executions.
+var searchSlots = make(chan struct{}, searchMaxConcurrency)
 
 // SearchCommand implements /search <query>.
 //
@@ -43,6 +55,20 @@ func (c *SearchCommand) Execute(ctx context.Context, cmdCtx *CommandContext, arg
 	}
 
 	query := strings.Join(args, " ")
+
+	// Bound time and concurrency: /search runs synchronously in the message
+	// path (outside the QA queue), so without a gate one command could occupy
+	// unbounded embedding capacity.
+	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
+	defer cancel()
+	select {
+	case searchSlots <- struct{}{}:
+		defer func() { <-searchSlots }()
+	default:
+		return &CommandResult{
+			Content: "当前检索请求较多，请稍后再试。",
+		}, nil
+	}
 
 	// Resolve which KBs to search, mirroring the logic in the QA pipeline's
 	// resolveKnowledgeBasesFromAgent so that /search covers the same scope.
@@ -86,6 +112,15 @@ func (c *SearchCommand) Execute(ctx context.Context, cmdCtx *CommandContext, arg
 
 	retrieval, err := c.sessionService.SearchKnowledge(ctx, kbIDs, nil, nil, query, nil)
 	if err != nil {
+		if ctx.Err() != nil {
+			// 区分两种取消：/stop 是用户主动中止，报“超时”会让人以为系统出错。
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return &CommandResult{
+					Content: fmt.Sprintf("检索超过 %s 未返回，请稍后再试。", searchTimeout),
+				}, nil
+			}
+			return &CommandResult{Content: "已取消检索。"}, nil
+		}
 		return nil, fmt.Errorf("search knowledge: %w", err)
 	}
 	results := retrieval.Results

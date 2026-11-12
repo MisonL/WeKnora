@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/im"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -61,15 +62,15 @@ func (h *IMHandler) CreateIMChannel(c *gin.Context) {
 	}
 
 	var req struct {
-		Platform        string     `json:"platform" binding:"required"`
-		Name            string     `json:"name"`
-		Mode            string     `json:"mode"`
-		OutputMode      string     `json:"output_mode"`
-		Locale          string     `json:"locale"`
-		SessionMode     string     `json:"session_mode"`
-		KnowledgeBaseID string     `json:"knowledge_base_id"`
-		Credentials     types.JSON `json:"credentials"`
-		Enabled         *bool      `json:"enabled"`
+		Platform        string             `json:"platform" binding:"required"`
+		Name            string             `json:"name"`
+		Mode            string             `json:"mode"`
+		OutputMode      string             `json:"output_mode"`
+		Locale          string             `json:"locale"`
+		SessionMode     string             `json:"session_mode"`
+		KnowledgeBaseID string             `json:"knowledge_base_id"`
+		Credentials     im.CredentialsJSON `json:"credentials"`
+		Enabled         *bool              `json:"enabled"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -127,8 +128,8 @@ func (h *IMHandler) CreateIMChannel(c *gin.Context) {
 			channel.OutputMode = "stream"
 		}
 	}
-	if channel.Credentials == nil {
-		channel.Credentials = types.JSON("{}")
+	if channel.Credentials.IsZero() {
+		channel.Credentials = im.NewCredentialsJSON([]byte("{}"))
 	}
 
 	if err := h.imService.CreateChannel(channel); err != nil {
@@ -222,15 +223,15 @@ func (h *IMHandler) UpdateIMChannel(c *gin.Context) {
 	}
 
 	var req struct {
-		Name            *string    `json:"name"`
-		Mode            *string    `json:"mode"`
-		OutputMode      *string    `json:"output_mode"`
-		Locale          *string    `json:"locale"`
-		SessionMode     *string    `json:"session_mode"`
-		KnowledgeBaseID *string    `json:"knowledge_base_id"`
-		Credentials     types.JSON `json:"credentials"`
-		Enabled         *bool      `json:"enabled"`
-		AgentID         *string    `json:"agent_id"`
+		Name            *string            `json:"name"`
+		Mode            *string            `json:"mode"`
+		OutputMode      *string            `json:"output_mode"`
+		Locale          *string            `json:"locale"`
+		SessionMode     *string            `json:"session_mode"`
+		KnowledgeBaseID *string            `json:"knowledge_base_id"`
+		Credentials     im.CredentialsJSON `json:"credentials"`
+		Enabled         *bool              `json:"enabled"`
+		AgentID         *string            `json:"agent_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -264,7 +265,17 @@ func (h *IMHandler) UpdateIMChannel(c *gin.Context) {
 			return
 		}
 	}
-	if req.Credentials != nil {
+	if !req.Credentials.IsZero() {
+		if err := channel.CheckCredentialReplacement(true); err != nil {
+			// The stored ciphertext is unreadable with the current key and
+			// may still be recoverable; refuse to overwrite it. Restoring the
+			// original SYSTEM_AES_KEY unblocks both reading and re-entry.
+			logger.Errorf(c.Request.Context(), "[IM] Update channel refused: stored credentials are undecryptable (SYSTEM_AES_KEY rotated/missing)")
+			c.JSON(http.StatusConflict, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
 		channel.Credentials = req.Credentials
 	}
 	if req.Enabled != nil {
@@ -483,6 +494,17 @@ func (h *IMHandler) IMCallback(c *gin.Context) {
 
 	// Process message asynchronously
 	go func() {
+		// Panic barrier: HandleMessage resolves the adapter internally, so the
+		// fallback reply is sent through the running adapter here. A panicking
+		// message handler must not take down the whole process.
+		defer tools.RecoverGoroutine(asyncCtx, "im-handle-message", func() {
+			if adapter, _, ok := h.imService.GetChannelAdapter(channelID); ok {
+				_ = adapter.SendReply(asyncCtx, msg, &im.ReplyMessage{
+					Content: im.ErrorFallbackText(),
+					IsFinal: true,
+				})
+			}
+		})
 		if err := h.imService.HandleMessage(asyncCtx, msg, channelID); err != nil {
 			logger.Errorf(asyncCtx, "[IM] Handle message error for channel %s: %v", channelID, err)
 		}

@@ -12,7 +12,7 @@ import (
 // Supports two modes: "webhook" (HTTP callback) and "websocket" (long connection, default).
 func NewFactory() im.AdapterFactory {
 	return func(factoryCtx context.Context, channel *im.IMChannel, msgHandler func(context.Context, *im.IncomingMessage) error) (im.Adapter, context.CancelFunc, error) {
-		creds, err := im.ParseCredentials(channel.Credentials)
+		creds, err := im.ParseCredentials(channel.Credentials.Bytes())
 		if err != nil {
 			return nil, nil, fmt.Errorf("parse wecom credentials: %w", err)
 		}

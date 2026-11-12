@@ -3,6 +3,7 @@ package im
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -222,47 +223,93 @@ func (q *qaQueue) runWorker(id int) {
 		if req == nil {
 			return // queue closed
 		}
-
-		// Skip requests that have been cancelled or timed out while queued.
-		if req.ctx.Err() != nil {
-			q.totalTimeout.Add(1)
-			q.redisDecrUser(context.Background(), req.userKey)
-			continue
-		}
-
-		waitDuration := time.Since(req.enqueuedAt)
-		if waitDuration > queueTimeout {
-			q.totalTimeout.Add(1)
-			q.redisDecrUser(context.Background(), req.userKey)
-			logger.Warnf(req.ctx, "[IM] Queue timeout: user=%s waited=%s, discarding", req.msg.UserID, waitDuration)
-			_ = req.adapter.SendReply(req.ctx, req.msg, &ReplyMessage{
-				Content: "您的消息等待超时，请重新发送。",
-				IsFinal: true,
-			})
-			req.cancel()
-			continue
-		}
-
-		logger.Infof(req.ctx, "[IM] Dequeued: worker=%d user=%s waited=%s depth=%d",
-			id, req.msg.UserID, waitDuration, q.Metrics().Depth)
-
-		// Acquire global concurrency slot (blocks until a slot opens or request is cancelled).
-		if !q.acquireGlobalGate(req.ctx) {
-			// Context cancelled while waiting for a global slot — treat as timeout.
-			q.totalTimeout.Add(1)
-			q.redisDecrUser(context.Background(), req.userKey)
-			logger.Warnf(req.ctx, "[IM] Global gate wait cancelled: worker=%d user=%s", id, req.msg.UserID)
-			req.cancel()
-			continue
-		}
-
-		q.activeWorkers.Add(1)
-		q.handler(req)
-		q.activeWorkers.Add(-1)
-		q.totalProcessed.Add(1)
-		q.releaseGlobalGate()
-		q.redisDecrUser(context.Background(), req.userKey)
+		q.processRequest(id, req)
 	}
+}
+
+// processRequest runs a single dequeued request behind a panic barrier so a
+// panicking QA handler cannot take down the whole process (and every other
+// conversation in flight). Slot release (global gate + per-user counter) lives
+// in one deferred block that runs on both the normal and the panic path, so
+// neither counter can leak when a panic unwinds mid-request.
+func (q *qaQueue) processRequest(id int, req *qaRequest) {
+	var gateAcquired, working bool
+	defer func() {
+		r := recover()
+		if r != nil {
+			logger.Errorf(req.ctx, "[IM] QA worker panicked (worker=%d user=%s): %v\n%s",
+				id, req.msg.UserID, r, debug.Stack())
+		}
+		if working {
+			q.activeWorkers.Add(-1)
+		}
+		if gateAcquired {
+			q.releaseGlobalGate()
+		}
+		q.redisDecrUser(context.Background(), req.userKey)
+		if r != nil {
+			// Reply with the fixed fallback text; panic internals must never
+			// reach the user. safeSendReply keeps the barrier itself crash-proof.
+			q.safeSendReply(req, imErrorFallback)
+			req.cancel()
+		}
+	}()
+
+	// Skip requests that have been cancelled or timed out while queued.
+	if req.ctx.Err() != nil {
+		q.totalTimeout.Add(1)
+		return
+	}
+
+	waitDuration := time.Since(req.enqueuedAt)
+	if waitDuration > queueTimeout {
+		q.totalTimeout.Add(1)
+		logger.Warnf(req.ctx, "[IM] Queue timeout: user=%s waited=%s, discarding", req.msg.UserID, waitDuration)
+		_ = req.adapter.SendReply(req.ctx, req.msg, &ReplyMessage{
+			Content: "您的消息等待超时，请重新发送。",
+			IsFinal: true,
+		})
+		return
+	}
+
+	logger.Infof(req.ctx, "[IM] Dequeued: worker=%d user=%s waited=%s depth=%d",
+		id, req.msg.UserID, waitDuration, q.Metrics().Depth)
+
+	// Acquire global concurrency slot (blocks until a slot opens or request is cancelled).
+	slot, gateErr := q.acquireGlobalGate(req.ctx)
+	if gateErr != nil {
+		// Fail-closed: Redis is configured, so proceeding would silently exceed
+		// the global concurrency limit — same semantics as the dedup check in
+		// service.isDuplicate. The user can simply resend.
+		q.totalRejected.Add(1)
+		logger.Errorf(req.ctx, "[IM] Global gate unavailable (fail-closed, request dropped): %v", gateErr)
+		q.safeSendReply(req, imErrorFallback)
+		return
+	}
+	if !slot {
+		// Context cancelled while waiting for a global slot — treat as timeout.
+		q.totalTimeout.Add(1)
+		logger.Warnf(req.ctx, "[IM] Global gate wait cancelled: worker=%d user=%s", id, req.msg.UserID)
+		return
+	}
+	gateAcquired = true
+
+	q.activeWorkers.Add(1)
+	working = true
+	q.handler(req)
+	working = false
+	q.activeWorkers.Add(-1)
+	q.totalProcessed.Add(1)
+}
+
+// safeSendReply sends a fallback reply swallowing any panic so the panic
+// barrier itself can never crash the process.
+func (q *qaQueue) safeSendReply(req *qaRequest, content string) {
+	defer func() { _ = recover() }()
+	_ = req.adapter.SendReply(context.WithoutCancel(req.ctx), req.msg, &ReplyMessage{
+		Content: content,
+		IsFinal: true,
+	})
 }
 
 func (q *qaQueue) dequeue() *qaRequest {
@@ -313,11 +360,14 @@ return 0
 `)
 
 // acquireGlobalGate blocks until a global concurrency slot is available.
-// Returns true if the slot was acquired, false if ctx was cancelled while waiting.
-// When globalMaxWorkers is 0 or Redis is nil, it returns true immediately (no limit).
-func (q *qaQueue) acquireGlobalGate(ctx context.Context) bool {
+// Returns (true, nil) if the slot was acquired, (false, nil) if ctx was
+// cancelled while waiting, and (false, err) when Redis fails — fail-closed,
+// because with Redis configured a gate error means the global concurrency
+// limit can no longer be enforced (matching the dedup fail-closed semantics).
+// When globalMaxWorkers is 0 or Redis is nil, it returns (true, nil) immediately.
+func (q *qaQueue) acquireGlobalGate(ctx context.Context) (bool, error) {
 	if q.globalMaxWorkers <= 0 || q.redis == nil {
-		return true
+		return true, nil
 	}
 
 	for {
@@ -326,18 +376,17 @@ func (q *qaQueue) acquireGlobalGate(ctx context.Context) bool {
 			q.globalMaxWorkers, globalGateTTL.Milliseconds(),
 		).Int64()
 		if err != nil {
-			// Redis error — skip global check to avoid blocking the worker.
-			logger.Warnf(ctx, "[IM] Global gate Redis error (proceeding without limit): %v", err)
-			return true
+			// Redis error — refuse to proceed without the limit.
+			return false, err
 		}
 		if result == 1 {
-			return true
+			return true, nil
 		}
 
 		// Global limit reached — wait and retry.
 		select {
 		case <-ctx.Done():
-			return false
+			return false, nil
 		case <-time.After(globalGateRetryInterval):
 		}
 	}
@@ -363,8 +412,10 @@ func (q *qaQueue) redisCheckAndIncrUser(ctx context.Context, userKey string) err
 	key := RedisKeyQueueUser + userKey
 	count, err := q.redis.Incr(ctx, key).Result()
 	if err != nil {
-		// Redis error — skip global check, rely on local limit.
-		return nil
+		// Fail-closed: Redis is configured, so a failure here means the global
+		// per-user limit cannot be enforced. Consistent with the Redis dedup
+		// fail-closed semantics — the user can simply resend the message.
+		return fmt.Errorf("queue temporarily unavailable, please retry later: %w", err)
 	}
 	q.redis.Expire(ctx, key, redisQueueUserTTL)
 	if count > int64(q.maxPerUser) {
