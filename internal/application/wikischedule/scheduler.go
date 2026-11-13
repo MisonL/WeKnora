@@ -59,6 +59,20 @@ type KnowledgeBaseStore interface {
 	GetKnowledgeBaseByID(ctx context.Context, id string) (*types.KnowledgeBase, error)
 }
 
+// NewSchedulerFromRepository adapts the container's repository to the narrow
+// store and builds the scheduler. The container resolves a constructor from
+// its parameter types, so registering one that takes the narrow interface would
+// leave dig looking for a provider nobody registers; this wrapper keeps the
+// narrow interface for tests while the constructor names a type the container
+// actually provides.
+func NewSchedulerFromRepository(repo interfaces.KnowledgeBaseRepository, task interfaces.TaskEnqueuer) *Scheduler {
+	var store KnowledgeBaseStore
+	if repo != nil {
+		store = repo
+	}
+	return NewScheduler(store, task)
+}
+
 // Scheduler registers one cron entry per knowledge base that selected a daily
 // or weekly window.
 type Scheduler struct {

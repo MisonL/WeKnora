@@ -564,7 +564,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	logger.Debugf(ctx, "[Container] Data source sync framework registered")
 
 	// Wiki generation window (daily / weekly schedules)
-	must(container.Provide(wikischedule.NewScheduler))
+	must(container.Provide(wikischedule.NewSchedulerFromRepository))
 	must(container.Invoke(startWikiScheduler))
 	logger.Debugf(ctx, "[Container] Wiki schedule registered")
 	must(container.Invoke(startAuditLogRetention))
