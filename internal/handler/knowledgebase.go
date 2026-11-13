@@ -1819,6 +1819,11 @@ func validateKnowledgeBasePromptInstructions(kb *types.KnowledgeBase) error {
 	if err := types.ValidateKnowledgeBasePromptInstructions(kb); err != nil {
 		return apperrors.NewBadRequestError(err.Error())
 	}
+	if kb != nil {
+		if err := types.ValidateWikiSchedule(kb.WikiConfig); err != nil {
+			return apperrors.NewBadRequestError(err.Error())
+		}
+	}
 	return nil
 }
 

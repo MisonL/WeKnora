@@ -355,6 +355,9 @@ export function createKnowledgeBase(data: {
   faq_config?: { index_mode: string; question_index_mode?: string };
   wiki_config?: {
     auto_generate?: boolean;
+    schedule_mode?: 'on_change' | 'daily' | 'weekly' | 'manual';
+    schedule_time?: string;
+    schedule_weekdays?: number[];
     synthesis_model_id?: string;
     max_pages_per_ingest?: number;
     extraction_granularity?: 'focused' | 'standard' | 'exhaustive';
@@ -388,6 +391,9 @@ export function updateKnowledgeBase(id: string, data: {
     faq_config?: any;
     wiki_config?: {
       auto_generate?: boolean;
+      schedule_mode?: 'on_change' | 'daily' | 'weekly' | 'manual';
+      schedule_time?: string;
+      schedule_weekdays?: number[];
       synthesis_model_id?: string;
       max_pages_per_ingest?: number;
       extraction_granularity?: 'focused' | 'standard' | 'exhaustive';

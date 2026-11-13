@@ -87,6 +87,44 @@
               <t-switch id="wiki-auto-generate" v-model="formData.wikiConfig.autoGenerate" />
             </div>
 
+            <!-- Wiki 生成时机：改动即生成 / 每日 / 每周几 / 仅手动 -->
+            <div v-if="!isFAQ && formData.indexingStrategy.wikiEnabled && formData.wikiConfig.autoGenerate" class="form-item">
+              <label class="form-label">{{ $t('knowledgeEditor.wiki.scheduleModeLabel') }}</label>
+              <p class="form-tip">{{ $t('knowledgeEditor.wiki.scheduleModeTip') }}</p>
+              <t-radio-group :value="formData.wikiConfig.scheduleMode" @change="handleScheduleModeChange">
+                <t-radio-button value="on_change">{{ $t('knowledgeEditor.wiki.scheduleOnChange') }}</t-radio-button>
+                <t-radio-button value="daily">{{ $t('knowledgeEditor.wiki.scheduleDaily') }}</t-radio-button>
+                <t-radio-button value="weekly">{{ $t('knowledgeEditor.wiki.scheduleWeekly') }}</t-radio-button>
+                <t-radio-button value="manual">{{ $t('knowledgeEditor.wiki.scheduleManual') }}</t-radio-button>
+              </t-radio-group>
+              <div v-if="formData.wikiConfig.scheduleMode === 'daily' || formData.wikiConfig.scheduleMode === 'weekly'"
+                class="wiki-schedule-time">
+                <span class="wiki-schedule-time-label">{{ $t('knowledgeEditor.wiki.scheduleTimeLabel') }}</span>
+                <div class="wiki-schedule-runs">
+                  <div v-for="(run, index) in scheduleRuns" :key="index" class="wiki-schedule-run">
+                    <t-time-picker :value="run" format="HH:mm" :steps="[1, 5]"
+                      @change="(value: string) => updateScheduleRun(index, value)" />
+                    <t-button v-if="scheduleRuns.length > 1" theme="default" variant="text" size="small"
+                      @click="removeScheduleRun(index)">
+                      {{ $t('knowledgeEditor.wiki.scheduleRemoveRun') }}
+                    </t-button>
+                  </div>
+                  <t-button theme="primary" variant="text" size="small" :disabled="scheduleRuns.length >= 12"
+                    @click="addScheduleRun">
+                    + {{ $t('knowledgeEditor.wiki.scheduleAddRun') }}
+                  </t-button>
+                </div>
+              </div>
+              <div v-if="formData.wikiConfig.scheduleMode === 'weekly'" class="wiki-schedule-weekdays">
+                <span class="wiki-schedule-time-label">{{ $t('knowledgeEditor.wiki.scheduleWeekdaysLabel') }}</span>
+                <t-check-tag v-for="day in weekdayOptions" :key="day.value"
+                  :checked="formData.wikiConfig.scheduleWeekdays.includes(day.value)"
+                  @change="toggleScheduleWeekday(day.value)">
+                  {{ day.label }}
+                </t-check-tag>
+              </div>
+            </div>
+
             <!-- Wiki 提取粒度 (仅当 Wiki 启用时显示) -->
             <div v-if="!isFAQ && formData.indexingStrategy.wikiEnabled" class="form-item">
               <label class="form-label">{{ $t('knowledgeEditor.wiki.extractionGranularityLabel') }}</label>
@@ -1039,6 +1077,9 @@ const initFormData = (type: 'document' | 'faq' = 'document') => {
     },
     wikiConfig: {
       autoGenerate: true,
+      scheduleMode: 'on_change' as 'on_change' | 'daily' | 'weekly' | 'manual',
+      scheduleTime: '02:00',
+      scheduleWeekdays: [] as number[],
       synthesisModelId: '',
       maxPagesPerIngest: 0,
       extractionGranularity: 'standard' as 'focused' | 'standard' | 'exhaustive',
@@ -1210,6 +1251,17 @@ const loadKBData = async (
       },
       wikiConfig: {
         autoGenerate: kb.wiki_config?.auto_generate ?? true,
+        scheduleMode: (
+          kb.wiki_config?.schedule_mode === 'daily' ||
+          kb.wiki_config?.schedule_mode === 'weekly' ||
+          kb.wiki_config?.schedule_mode === 'manual'
+            ? kb.wiki_config.schedule_mode
+            : 'on_change'
+        ) as 'on_change' | 'daily' | 'weekly' | 'manual',
+        scheduleTime: kb.wiki_config?.schedule_time || '02:00',
+        scheduleWeekdays: Array.isArray(kb.wiki_config?.schedule_weekdays)
+          ? [...kb.wiki_config.schedule_weekdays]
+          : [],
         synthesisModelId: kb.wiki_config?.synthesis_model_id || '',
         maxPagesPerIngest: kb.wiki_config?.max_pages_per_ingest || 0,
         extractionGranularity: (
@@ -1295,6 +1347,71 @@ const handleGranularityChange = (value: string | number | boolean) => {
   formData.value.wikiConfig = {
     ...formData.value.wikiConfig,
     extractionGranularity: next,
+  }
+}
+
+// 生成时机：与后端 WikiScheduleMode 的四个取值保持一致。
+const handleScheduleModeChange = (value: string | number | boolean) => {
+  if (!formData.value) return
+  const mode =
+    value === 'daily' || value === 'weekly' || value === 'manual'
+      ? (value as 'daily' | 'weekly' | 'manual')
+      : 'on_change'
+  formData.value.wikiConfig = {
+    ...formData.value.wikiConfig,
+    scheduleMode: mode,
+  }
+}
+
+// scheduleTime 在表单里保持服务端的单值形态（"12:00" 或 "12:00,18:00"），
+// 编辑时展开成一个个运行时刻；保存时再拼回同一个字段。
+const scheduleRuns = computed<string[]>(() => {
+  const raw = formData.value?.wikiConfig?.scheduleTime || '02:00'
+  return raw.split(',').map((r: string) => r.trim()).filter(Boolean)
+})
+
+const setScheduleRuns = (runs: string[]) => {
+  if (!formData.value) return
+  formData.value.wikiConfig = {
+    ...formData.value.wikiConfig,
+    scheduleTime: runs.length ? runs.join(',') : '02:00',
+  }
+}
+
+const updateScheduleRun = (index: number, value: string) => {
+  if (!value) return
+  const runs = [...scheduleRuns.value]
+  runs[index] = value
+  setScheduleRuns(runs)
+}
+
+const addScheduleRun = () => {
+  setScheduleRuns([...scheduleRuns.value, '18:00'])
+}
+
+const removeScheduleRun = (index: number) => {
+  setScheduleRuns(scheduleRuns.value.filter((_, i) => i !== index))
+}
+
+const weekdayOptions = computed(() => [
+  { value: 1, label: t('knowledgeEditor.wiki.weekdayMon') },
+  { value: 2, label: t('knowledgeEditor.wiki.weekdayTue') },
+  { value: 3, label: t('knowledgeEditor.wiki.weekdayWed') },
+  { value: 4, label: t('knowledgeEditor.wiki.weekdayThu') },
+  { value: 5, label: t('knowledgeEditor.wiki.weekdayFri') },
+  { value: 6, label: t('knowledgeEditor.wiki.weekdaySat') },
+  { value: 0, label: t('knowledgeEditor.wiki.weekdaySun') },
+])
+
+const toggleScheduleWeekday = (day: number) => {
+  if (!formData.value) return
+  const current: number[] = formData.value.wikiConfig.scheduleWeekdays || []
+  const next = current.includes(day)
+    ? current.filter((d: number) => d !== day)
+    : [...current, day].sort((a: number, b: number) => a - b)
+  formData.value.wikiConfig = {
+    ...formData.value.wikiConfig,
+    scheduleWeekdays: next,
   }
 }
 
@@ -1677,6 +1794,9 @@ const buildSubmitData = () => {
   if (formData.value.type !== 'faq') {
     data.wiki_config = {
       auto_generate: formData.value.wikiConfig?.autoGenerate ?? true,
+      schedule_mode: formData.value.wikiConfig?.scheduleMode || 'on_change',
+      schedule_time: formData.value.wikiConfig?.scheduleTime || '02:00',
+      schedule_weekdays: formData.value.wikiConfig?.scheduleWeekdays || [],
       synthesis_model_id: formData.value.modelConfig?.wikiSynthesisModelId || '',
       max_pages_per_ingest: formData.value.wikiConfig?.maxPagesPerIngest || 0,
       extraction_granularity: formData.value.wikiConfig?.extractionGranularity || 'standard',
@@ -1783,6 +1903,9 @@ const doSubmit = async () => {
       if (formData.value.wikiConfig && formData.value.type !== 'faq') {
         updateConfig.wiki_config = {
           auto_generate: formData.value.wikiConfig.autoGenerate ?? true,
+          schedule_mode: formData.value.wikiConfig.scheduleMode || 'on_change',
+          schedule_time: formData.value.wikiConfig.scheduleTime || '02:00',
+          schedule_weekdays: formData.value.wikiConfig.scheduleWeekdays || [],
           synthesis_model_id: formData.value.modelConfig?.wikiSynthesisModelId || '',
           max_pages_per_ingest: formData.value.wikiConfig.maxPagesPerIngest || 0,
           extraction_granularity: formData.value.wikiConfig.extractionGranularity || 'standard',
@@ -2011,6 +2134,33 @@ watch(() => chatResources.allModels, (list) => {
 </script>
 
 <style scoped lang="less">
+.wiki-schedule-time,
+.wiki-schedule-weekdays {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.wiki-schedule-runs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wiki-schedule-run {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.wiki-schedule-time-label {
+  color: var(--td-text-color-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
 .wiki-instructions-input {
   position: relative;
 

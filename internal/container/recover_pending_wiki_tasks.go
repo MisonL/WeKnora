@@ -78,8 +78,18 @@ func recoverPendingWikiTasks(db *gorm.DB, task interfaces.TaskEnqueuer) {
 	}
 
 	recovered := 0
+	skippedScheduled := 0
 	for _, scope := range scopes {
 		if scope.ScopeID == "" {
+			continue
+		}
+		// A windowed knowledge base (schedule_mode daily / weekly) parks its
+		// ops on purpose; the wiki scheduler drains them inside the window.
+		// Recreating the trigger here would run it at whatever minute the app
+		// happened to restart, which is exactly what the window exists to
+		// avoid. Their ops survive the restart and the next tick picks them up.
+		if scope.TaskType == types.TypeWikiIngest && scheduledWikiKB(ctx, db, scope.ScopeID) {
+			skippedScheduled++
 			continue
 		}
 		// The batch plans its taxonomy in the trigger's language; take it
@@ -119,4 +129,32 @@ func recoverPendingWikiTasks(db *gorm.DB, task interfaces.TaskEnqueuer) {
 	if recovered > 0 {
 		logger.Infof(ctx, "[WikiRecovery] recreated %d trigger(s) from durable pending queues", recovered)
 	}
+	if skippedScheduled > 0 {
+		logger.Infof(ctx, "[WikiRecovery] skipped %d windowed knowledge base(s); the wiki scheduler drains them",
+			skippedScheduled)
+	}
+}
+
+// scheduledWikiKB reports whether the knowledge base holds its ops for a
+// wall-clock window. A lookup failure or an unparsable config answers false so
+// recovery falls back to recreating the trigger: running one batch early costs
+// a wasted drain, while never draining strands the ops until an upload.
+func scheduledWikiKB(ctx context.Context, db *gorm.DB, kbID string) bool {
+	var rows []string
+	if err := db.WithContext(ctx).
+		Model(&types.KnowledgeBase{}).
+		Where("id = ?", kbID).
+		Pluck("wiki_config", &rows).Error; err != nil {
+		logger.Warnf(ctx, "[WikiRecovery] wiki config probe for KB %s failed: %v", kbID, err)
+		return false
+	}
+	if len(rows) == 0 || rows[0] == "" {
+		return false
+	}
+	cfg := types.WikiConfig{}
+	if err := json.Unmarshal([]byte(rows[0]), &cfg); err != nil {
+		logger.Warnf(ctx, "[WikiRecovery] wiki config for KB %s is unreadable: %v", kbID, err)
+		return false
+	}
+	return cfg.IsAutoGenerateEnabled() && cfg.IsScheduled()
 }

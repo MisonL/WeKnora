@@ -393,6 +393,14 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		if err := s.releaseIngestForUnavailableWiki(ctx, kb.ID, "automatic generation disabled"); err != nil {
 			return err
 		}
+		// A windowed schedule (daily / weekly) still drains its queue on the
+		// scheduler's own trigger, so the ops must survive this pass: only the
+		// on-change triggers that raced the window boundary land here, and
+		// discarding would silently lose those documents until the next
+		// upload. Manual mode is the only one that drops them.
+		if kb.WikiConfig.IsScheduled() {
+			return nil
+		}
 		// Source deletion already reconciles page references synchronously.
 		// Its queued prose rewrites must not run later and overwrite manual pages.
 		discarder, ok := s.pendingRepo.(interfaces.TaskPendingOpsDiscarder)
@@ -444,6 +452,10 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	mapParallel := kb.WikiConfig.IngestMapParallelOrDefault(10)
 	reduceParallel := kb.WikiConfig.IngestReduceParallelOrDefault(10)
 	loggedBatchSize = batchSize
+	// A scheduled KB owns no finalizing slot when it parks an op, so this batch
+	// must not drain one when it consumes that op later: the document already
+	// reported completed and the decrement would hit the next attempt's counter.
+	absorbParkedSlots := !kb.WikiConfig.RunsOnChange()
 	loggedMapPar = mapParallel
 	loggedReducePar = reduceParallel
 
@@ -508,6 +520,34 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		// reclaimed automatically once eligible.
 		followUpScheduled = s.scheduleStaleClaimRecheck(ctx, payload)
 		return nil
+	}
+
+	// A knowledge base on schedule_mode daily/weekly generates only inside its
+	// window. Any other wake (a delete's retract, a trigger left over from
+	// before the schedule was set) must not pull the parked ingest ops along
+	// with it: hand them back to the queue and process only the retracts.
+	if kb.WikiConfig.IsScheduled() && !payload.Scheduled && payload.KnowledgeID == "" {
+		parked := make([]int64, 0, len(pendingOps))
+		kept := pendingOps[:0]
+		for _, op := range pendingOps {
+			if op.Op == WikiOpIngest && op.dbID != 0 {
+				parked = append(parked, op.dbID)
+				continue
+			}
+			kept = append(kept, op)
+		}
+		if len(parked) > 0 {
+			if err := s.pendingRepo.ReleaseByIDs(ctx, parked); err != nil {
+				return fmt.Errorf("wiki ingest: release parked ops: %w", err)
+			}
+			logger.Infof(ctx, "wiki ingest: %d op(s) for KB %s stay queued until the %s window",
+				len(parked), payload.KnowledgeBaseID, kb.WikiConfig.Schedule())
+		}
+		pendingOps = kept
+		if len(pendingOps) == 0 {
+			exitStatus = "waiting_for_window"
+			return nil
+		}
 	}
 
 	logger.Infof(ctx, "wiki ingest: batch processing %d ops for KB %s", len(pendingOps), payload.KnowledgeBaseID)
@@ -696,7 +736,7 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 				// "finalizing" until the housekeeping sweep marks it
 				// failed. The matching +1 was seeded by
 				// KnowledgePostProcess.SetFinalizing.
-				s.finalizeWikiSubtask(mapCtx, op.KnowledgeID, op.Attempt)
+				s.finalizeWikiSubtask(mapCtx, op.KnowledgeID, op.Attempt, absorbParkedSlots)
 			}
 			return nil
 		})
@@ -956,7 +996,7 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		// held — the retry (or the dead-letter drain in requeueFailedOps)
 		// releases it once the op reaches a real terminal state.
 		if _, unapplied := unappliedSlugKIDs[r.KnowledgeID]; !unapplied {
-			s.finalizeWikiSubtask(ctx, r.KnowledgeID, opAttempts[r.KnowledgeID])
+			s.finalizeWikiSubtask(ctx, r.KnowledgeID, opAttempts[r.KnowledgeID], absorbParkedSlots)
 		}
 		if r.WikiSpan == nil {
 			continue

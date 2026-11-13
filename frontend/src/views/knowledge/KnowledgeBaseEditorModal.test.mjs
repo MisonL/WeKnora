@@ -59,3 +59,29 @@ test('Wiki auto-generation setting defaults on, loads from the KB, and is submit
   assert.match(source, /knowledgeEditor\.wiki\.autoGenerateLabel/)
   assert.match(source, /knowledgeEditor\.wiki\.autoGenerateTip/)
 })
+
+test('Wiki generation schedule loads from the KB and is submitted on create and edit', () => {
+  // Default is the historical on-change behaviour, so an old KB keeps working.
+  assert.match(source, /scheduleMode: 'on_change' as 'on_change' \| 'daily' \| 'weekly' \| 'manual'/)
+  assert.match(source, /scheduleMode: \([\s\S]*?kb\.wiki_config\?\.schedule_mode[\s\S]*?\) as 'on_change' \| 'daily' \| 'weekly' \| 'manual'/)
+  // Both submit sites must send the schedule; a PATCH that omits it keeps the
+  // stored window, which would silently pin a daily KB after an unrelated edit.
+  const createPayload = source.match(/data\.wiki_config = \{([\s\S]*?)\n    \}/)?.[1]
+  assert.ok(createPayload, 'expected to find the create payload')
+  assert.match(createPayload, /schedule_mode: formData\.value\.wikiConfig\?\.scheduleMode \|\| 'on_change'/)
+  assert.match(createPayload, /schedule_time: formData\.value\.wikiConfig\?\.scheduleTime \|\| '02:00'/)
+  assert.match(createPayload, /schedule_weekdays: formData\.value\.wikiConfig\?\.scheduleWeekdays \|\| \[\]/)
+  const updatePayload = source.match(/updateConfig\.wiki_config = \{([\s\S]*?)\n      \}/)?.[1]
+  assert.ok(updatePayload, 'expected to find the update payload')
+  assert.match(updatePayload, /schedule_mode: formData\.value\.wikiConfig\.scheduleMode \|\| 'on_change'/)
+})
+
+test('Wiki schedule controls only show when Wiki generation is on', () => {
+  assert.match(source, /knowledgeEditor\.wiki\.scheduleModeLabel/)
+  assert.match(
+    source,
+    /wikiEnabled && formData\.wikiConfig\.autoGenerate" class="form-item">\s*\n\s*<label class="form-label">\{\{ \$t\('knowledgeEditor\.wiki\.scheduleModeLabel'\)/
+  )
+  assert.match(source, /scheduleMode === 'daily' \|\| formData\.wikiConfig\.scheduleMode === 'weekly'/)
+  assert.match(source, /scheduleMode === 'weekly'" class="wiki-schedule-weekdays"/)
+})

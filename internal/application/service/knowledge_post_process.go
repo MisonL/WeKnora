@@ -216,7 +216,11 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	willSpawnSummary := eff.SummaryEnabled && len(textChunks) > 0
 	willSpawnQuestion := len(textChunks) > 0 && kb.NeedsEmbeddingModel() &&
 		eff.QuestionGenerationConfig.Enabled
-	willSpawnWiki := kb.IsWikiAutoGenerateEnabled() && len(textChunks) > 0
+	// A document owes a wiki page whenever automatic generation is on, whether
+	// it runs on change or inside a daily/weekly window; only the timing and
+	// the slot accounting differ.
+	willSpawnWiki := kb.IsWikiAutoGenerateEnabled() &&
+		(kb.WikiConfig.RunsOnChange() || kb.WikiConfig.IsScheduled()) && len(textChunks) > 0
 	willSpawnAutoTag := kb.Type == types.KnowledgeBaseTypeDocument &&
 		kb.AutoTagConfig != nil && kb.AutoTagConfig.Enabled && len(textChunks) > 0
 	enqueuedAutoTag := false
@@ -257,7 +261,11 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		expectedSubtasks++
 	}
 	expectedSubtasks += questionBatchCount
-	if willSpawnWiki {
+	// A windowed KB parks its operation for the scheduler, so nothing drains a
+	// wiki slot now: counting it would hold the document in "finalizing" until
+	// the window opens.
+	wikiSlotCounted := willSpawnWiki && kb.WikiConfig.RunsOnChange()
+	if wikiSlotCounted {
 		expectedSubtasks++
 	}
 	expectedSubtasks += graphChunkCount
@@ -268,8 +276,25 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	enteredFinalizing := false
 	wikiSlotOwned := false
 
+	// Park the operation before the status transition: the queue row is the
+	// only record of "this document still owes a wiki page", so failing to
+	// persist it must keep the row processing for a retry. Duplicate rows on a
+	// retry collapse by dedup_key inside the consumer.
+	if willSpawnWiki && !wikiSlotCounted && knowledge.ParseStatus == types.ParseStatusProcessing {
+		pendingOp, buildErr := newWikiIngestPendingOp(
+			withAttempt(ctx, attempt), payload.TenantID, payload.KnowledgeBaseID, payload.KnowledgeID,
+		)
+		if buildErr != nil {
+			return buildErr
+		}
+		if _, err := enqueueWikiPendingOp(ctx, s.pendingRepo, pendingOp); err != nil {
+			s.tracker().FailSpanRetryable(ctx, postSpan, "WIKI_OP_PERSIST_FAILED", err.Error(), err)
+			return fmt.Errorf("park wiki ingest op for the next window: %w", err)
+		}
+	}
+
 	switch {
-	case knowledge.ParseStatus == types.ParseStatusFinalizing && kb.IndexingStrategy.WikiEnabled:
+	case knowledge.ParseStatus == types.ParseStatusFinalizing && kb.IndexingStrategy.WikiEnabled && kb.WikiConfig.RunsOnChange():
 		// A previous delivery may have persisted the Wiki op but failed to
 		// enqueue its KB-scoped trigger. Retry only the trigger: appending a
 		// second pending op would duplicate durable work and its finalizer.
@@ -317,7 +342,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		// cancel/delete cannot race us into completed.
 		var promoted bool
 		var err error
-		if willSpawnWiki {
+		if wikiSlotCounted {
 			seeder, ok := s.pendingRepo.(interfaces.TaskPendingOpsFinalizingSeeder)
 			if !ok {
 				return errors.New("wiki post-process requires atomic finalizing handoff")
@@ -331,7 +356,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 			promoted, err = seeder.SeedKnowledgeFinalizingWithPendingOp(
 				ctx, payload.KnowledgeID, expectedSubtasks, pendingOp,
 			)
-			wikiSlotOwned = promoted
+			wikiSlotOwned = promoted && wikiSlotCounted
 		} else {
 			promoted, err = s.knowledgeRepo.SetFinalizing(ctx, payload.KnowledgeID, expectedSubtasks)
 		}
@@ -438,18 +463,23 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	// 6. Schedule the Wiki trigger. The durable per-knowledge op already owns
 	//    its finalizing slot because it was committed atomically with the state
 	//    transition above. A trigger failure is returned so the post-process
-	//    task retries only the trigger without double-accounting.
+	//    task retries only the trigger without double-accounting. A windowed KB
+	//    never wakes the consumer here: its op waits for the scheduler, which
+	//    owns this slot once the window opens.
 	var wikiEnqueueErr error
-	if willSpawnWiki {
+	if wikiSlotOwned {
 		wikiEnqueueErr = enqueueWikiIngestTrigger(
 			ctx, s.taskEnqueuer, payload.TenantID, payload.KnowledgeBaseID,
 		)
 		if wikiEnqueueErr != nil {
 			logger.Warnf(ctx, "[KnowledgePostProcess] Failed to enqueue wiki ingest for %s: %v",
 				payload.KnowledgeID, wikiEnqueueErr)
-		} else if wikiSlotOwned {
+		} else {
 			logger.Infof(ctx, "[KnowledgePostProcess] Enqueued wiki ingest task for %s", payload.KnowledgeID)
 		}
+	} else if willSpawnWiki {
+		logger.Infof(ctx, "[KnowledgePostProcess] Parked wiki ingest for %s until the %s window",
+			payload.KnowledgeID, kb.WikiConfig.Schedule())
 	}
 
 	// Reconcile the seeded counter against what was actually enqueued.
@@ -475,7 +505,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		if willSpawnSummary {
 			plannedOwned++
 		}
-		if willSpawnWiki {
+		if wikiSlotCounted {
 			plannedOwned++
 		}
 		actualOwned := enqueuedQuestionCount + enqueuedGraphCount
@@ -507,6 +537,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		"enqueued_question_count": enqueuedQuestionCount,
 		"enqueued_wiki":           wikiSlotOwned && wikiEnqueueErr == nil,
 		"wiki_slot_owned":         wikiSlotOwned,
+		"wiki_parked_for_window":  willSpawnWiki && !wikiSlotCounted,
 		"enqueued_graph":          enqueuedGraphCount > 0,
 		"enqueued_graph_count":    enqueuedGraphCount,
 		"enqueued_auto_tag":       enqueuedAutoTag,

@@ -48,7 +48,7 @@ func TestImageOCRRejectsInvalidContentBeforePersistence(t *testing.T) {
 			// truncation stays visible as its own status.
 			name: "truncated with readable text", raw: "1）初始化 注意 A：除秤号、网络设置外其余数据恢复出厂默认",
 			status: resultTruncated, code: "OCR_TRUNCATED",
-			err:   &vlm.TruncatedCompletionError{MaxTokens: 5000, Partial: "1）初始化 注意 A：除秤号、网络设置外其余数据恢复出厂默认"},
+			err: &vlm.TruncatedCompletionError{MaxTokens: 5000, Partial: "1）初始化 注意 A：除秤号、网络设置外其余数据恢复出厂默认"},
 		},
 		{
 			// The same budget cut over a runaway fill of empty table cells

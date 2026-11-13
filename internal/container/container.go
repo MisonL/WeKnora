@@ -59,6 +59,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/application/service/memory"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
 	"github.com/Tencent/WeKnora/internal/application/service/sandboxalloc"
+	"github.com/Tencent/WeKnora/internal/application/wikischedule"
 	"github.com/Tencent/WeKnora/internal/browserskill"
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/config"
@@ -561,6 +562,11 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(service.NewDataSourceService))
 	must(container.Invoke(startDataSourceScheduler))
 	logger.Debugf(ctx, "[Container] Data source sync framework registered")
+
+	// Wiki generation window (daily / weekly schedules)
+	must(container.Provide(wikischedule.NewScheduler))
+	must(container.Invoke(startWikiScheduler))
+	logger.Debugf(ctx, "[Container] Wiki schedule registered")
 	must(container.Invoke(startAuditLogRetention))
 	logger.Debugf(ctx, "[Container] Audit log retention runner registered")
 	must(container.Provide(service.NewHousekeepingService))
@@ -2189,6 +2195,24 @@ func startDataSourceScheduler(scheduler *datasource.Scheduler, cleaner interface
 
 	cleaner.RegisterWithName("DataSourceScheduler", func() error {
 		scheduler.StopWithin(cleanupStepTimeout)
+		return nil
+	})
+}
+
+// startWikiScheduler starts the wiki generation window scheduler and registers
+// cleanup. A knowledge base with schedule_mode=daily or weekly holds its wiki
+// ops until this cron drains them, so a failed start is logged loudly but does
+// not abort the container: those KBs keep queueing and resume on the next tick
+// after a restart.
+func startWikiScheduler(scheduler *wikischedule.Scheduler, cleaner interfaces.ResourceCleaner) {
+	if scheduler == nil {
+		return
+	}
+	if err := scheduler.Start(context.Background()); err != nil {
+		logger.Warnf(context.Background(), "[Container] wiki scheduler start failed: %v", err)
+	}
+	cleaner.RegisterWithName("WikiScheduler", func() error {
+		scheduler.Stop()
 		return nil
 	})
 }

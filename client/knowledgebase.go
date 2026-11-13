@@ -382,6 +382,19 @@ type PatchKnowledgeBaseRequest struct {
 	FAQConfig        *PatchFAQConfig             `json:"faq_config,omitempty"`
 	AutoTagConfig    *PatchAutoTagConfig         `json:"auto_tag_config,omitempty"`
 	ImageProcessing  *PatchImageProcessingConfig `json:"image_processing_config,omitempty"`
+	WikiConfig       *PatchWikiConfig            `json:"wiki_config,omitempty"`
+}
+
+// PatchWikiConfig is the partial wiki update. Nil fields stay as they are, so a
+// schedule change can be sent without restating the ingest tunables.
+type PatchWikiConfig struct {
+	AutoGenerate *bool   `json:"auto_generate,omitempty"`
+	ScheduleMode *string `json:"schedule_mode,omitempty"`
+	// ScheduleTime is one "HH:MM" or a comma-separated list such as
+	// "12:00,18:00" for several runs a day.
+	ScheduleTime *string `json:"schedule_time,omitempty"`
+	// Weekdays are 0-6 with Sunday=0; required when schedule_mode is weekly.
+	ScheduleWeekdays *[]int `json:"schedule_weekdays,omitempty"`
 }
 
 // PatchChunkingConfig is the partial chunking update. Nil fields stay as they are.

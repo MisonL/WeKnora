@@ -42,18 +42,20 @@ func TestFinalizeWikiSubtaskSkipsSupersededAttempt(t *testing.T) {
 	tests := []struct {
 		name       string
 		attempt    int
+		parked     bool
 		wantDrains int
 	}{
 		{name: "superseded attempt", attempt: 1},
 		{name: "current attempt", attempt: 2, wantDrains: 1},
 		{name: "op queued before attempts were recorded", attempt: 0, wantDrains: 1},
+		{name: "op parked for a scheduled window", attempt: 2, parked: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			repo := &flakyFinalizeRepo{}
 			svc := &wikiIngestService{knowledgeRepo: repo, spanTracker: newAttemptTracker(2)}
 
-			svc.finalizeWikiSubtask(context.Background(), "k-1", test.attempt)
+			svc.finalizeWikiSubtask(context.Background(), "k-1", test.attempt, test.parked)
 
 			assert.Equal(t, test.wantDrains, repo.successes)
 		})

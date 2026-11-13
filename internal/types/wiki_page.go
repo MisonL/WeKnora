@@ -3,6 +3,7 @@ package types
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 
@@ -534,10 +535,44 @@ func (g WikiExtractionGranularity) Normalize() WikiExtractionGranularity {
 // Applicable to document-type knowledge bases with wiki feature enabled.
 // Whether the wiki feature is turned on is controlled by IndexingStrategy.WikiEnabled;
 // this struct only carries wiki-specific tunables.
+
+// WikiScheduleMode is when background Wiki generation runs.
+type WikiScheduleMode string
+
+const (
+	// WikiScheduleOnChange runs a debounced pass after each document. The
+	// historical behaviour, kept for knowledge bases that predate the switch.
+	WikiScheduleOnChange WikiScheduleMode = "on_change"
+	// WikiScheduleDaily collects changes and runs once a day at ScheduleTime.
+	WikiScheduleDaily WikiScheduleMode = "daily"
+	// WikiScheduleWeekly collects changes and runs on the chosen weekdays.
+	WikiScheduleWeekly WikiScheduleMode = "weekly"
+	// WikiScheduleManual stops background generation; pages are generated
+	// only through the manual APIs.
+	WikiScheduleManual WikiScheduleMode = "manual"
+)
+
+// WikiConfig holds the Wiki generation settings of one knowledge base:
+// whether background generation runs, when it runs, and the synthesis and
+// ingest tuning knobs.
 type WikiConfig struct {
 	// AutoGenerate disables background Wiki generation when false. Omitted means true.
 	// Manual page APIs and Wiki retrieval remain available while Wiki is enabled.
 	AutoGenerate *bool `yaml:"auto_generate,omitempty" json:"auto_generate,omitempty" default:"true" extensions:"x-agent=wiki_auto_generate"`
+	// ScheduleMode decides when background generation runs. Empty or "on_change"
+	// keeps the historical behaviour (a debounced run after every document
+	// finishes processing). "daily" and "weekly" hold changes until the next
+	// window, so a bulk import produces one synthesis pass instead of dozens.
+	// "manual" turns background generation off entirely.
+	ScheduleMode WikiScheduleMode `yaml:"schedule_mode,omitempty" json:"schedule_mode,omitempty" enums:"on_change,daily,weekly,manual" extensions:"x-agent=wiki_schedule_mode"`
+	// ScheduleTime is the window's local wall-clock time, "HH:MM" in the tenant
+	// server's time zone. A comma-separated list schedules several runs a day:
+	// "12:00,18:00" runs daily at noon and six, and a weekly mode runs them on
+	// each selected weekday. Only read for daily and weekly; empty means 02:00.
+	ScheduleTime string `yaml:"schedule_time,omitempty" json:"schedule_time,omitempty" extensions:"x-agent=wiki_schedule_time"`
+	// ScheduleWeekdays lists 0-6 (Sunday=0) for weekly mode. Empty means every
+	// day, which is what daily mode already does.
+	ScheduleWeekdays []int `yaml:"schedule_weekdays,omitempty" json:"schedule_weekdays,omitempty" extensions:"x-agent=wiki_schedule_weekdays"`
 	// SynthesisModelID is the model that writes Wiki pages. Empty uses summary_model_id.
 	SynthesisModelID string `yaml:"synthesis_model_id" json:"synthesis_model_id" extensions:"x-agent=wiki_synthesis_model_id"`
 	// MaxPagesPerIngest limits pages created or updated per ingest. 0 means no limit.
@@ -592,6 +627,93 @@ type WikiConfig struct {
 // before the switch existed.
 func (c *WikiConfig) IsAutoGenerateEnabled() bool {
 	return c == nil || c.AutoGenerate == nil || *c.AutoGenerate
+}
+
+// Schedule resolves the mode. A config saved before the switch has no mode and
+// keeps generating on change, so upgrading does not silently stop a wiki.
+func (c *WikiConfig) Schedule() WikiScheduleMode {
+	if c == nil || c.ScheduleMode == "" {
+		return WikiScheduleOnChange
+	}
+	return c.ScheduleMode
+}
+
+// RunsOnChange reports whether a finished document should trigger generation
+// immediately. False for the windowed modes and for manual.
+func (c *WikiConfig) RunsOnChange() bool {
+	return c.Schedule() == WikiScheduleOnChange && c.IsAutoGenerateEnabled()
+}
+
+// IsScheduled reports whether generation is held for a daily or weekly window.
+// The queue keeps accumulating in these modes; the scheduler drains it.
+func (c *WikiConfig) IsScheduled() bool {
+	switch c.Schedule() {
+	case WikiScheduleDaily, WikiScheduleWeekly:
+		return true
+	default:
+		return false
+	}
+}
+
+// TimeOfDay returns the first configured run of the day as hour and minute,
+// defaulting to 02:00 when ScheduleTime is empty. ok is false when the stored
+// value is not a valid HH:MM list, which the update path rejects; a config
+// written before validation existed must not make the scheduler panic.
+func (c *WikiConfig) TimeOfDay() (hour, minute int, ok bool) {
+	times, ok := c.TimeOfDayList()
+	if !ok {
+		return 0, 0, false
+	}
+	return times[0][0], times[0][1], true
+}
+
+// TimeOfDayList returns every configured run of the day in the order stored,
+// defaulting to a single 02:00. Duplicates collapse so one wall-clock minute
+// never registers two cron entries.
+func (c *WikiConfig) TimeOfDayList() ([][2]int, bool) {
+	raw := "02:00"
+	if c != nil && strings.TrimSpace(c.ScheduleTime) != "" {
+		raw = c.ScheduleTime
+	}
+	seen := make(map[[2]int]struct{}, 4)
+	out := make([][2]int, 0, 4)
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, false
+		}
+		h, m, found := strings.Cut(part, ":")
+		hour, errH := strconv.Atoi(strings.TrimSpace(h))
+		minute, errM := strconv.Atoi(strings.TrimSpace(m))
+		if !found || errH != nil || errM != nil || hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+			return nil, false
+		}
+		key := [2]int{hour, minute}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+// WeekdaysOrDefault returns the selected weekdays, or every day when none are
+// selected. Values outside 0-6 are dropped.
+func (c *WikiConfig) WeekdaysOrDefault() []int {
+	out := make([]int, 0, 7)
+	for _, d := range c.ScheduleWeekdays {
+		if d >= 0 && d <= 6 {
+			out = append(out, d)
+		}
+	}
+	if len(out) == 0 {
+		return []int{0, 1, 2, 3, 4, 5, 6}
+	}
+	return out
 }
 
 // IngestBatchSizeOrDefault returns IngestBatchSize when set (> 0),

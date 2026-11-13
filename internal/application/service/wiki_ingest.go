@@ -320,6 +320,10 @@ type WikiIngestPayload struct {
 	// Automatic triggers leave it empty and keep their normal batch selection.
 	KnowledgeID string `json:"knowledge_id,omitempty"`
 	Language    string `json:"language,omitempty"`
+	// Scheduled marks a wake from the wiki window scheduler. A knowledge base
+	// on schedule_mode daily/weekly holds its ingest ops until that wake, so a
+	// batch started without this marker leaves them queued (retracts still run).
+	Scheduled bool `json:"scheduled,omitempty"`
 }
 
 // WikiRetractPayload is the asynq task payload for wiki content retraction
@@ -1297,7 +1301,7 @@ func (s *wikiIngestService) trimPendingList(ctx context.Context, ids []int64) er
 // already zero: FinalizeSubtask guards both the decrement (count > 0) and
 // the promote (parse_status = finalizing AND count = 0), so an op enqueued
 // before this accounting shipped is a harmless no-op.
-func (s *wikiIngestService) finalizeWikiSubtask(ctx context.Context, knowledgeID string, attempt int) {
+func (s *wikiIngestService) finalizeWikiSubtask(ctx context.Context, knowledgeID string, attempt int, skipDrain bool) {
 	// Wiki is only finalized when its op reaches a terminal state, so this is
 	// always an intended drain (retErr=nil, final=true). Detached context: the
 	// wiki batch worker may be mid-shutdown or have a cancelled ctx when this
@@ -1306,7 +1310,7 @@ func (s *wikiIngestService) finalizeWikiSubtask(ctx context.Context, knowledgeID
 	// An op from a superseded attempt skips the drain: reparse zeroed that
 	// attempt's counter, and draining now would release a slot of the new
 	// run, promoting it to completed before its own enrichment finished.
-	superseded := attemptSuperseded(ctx, s.tracker(), knowledgeID, attempt)
+	superseded := attemptSuperseded(ctx, s.tracker(), knowledgeID, attempt) || skipDrain
 	finalizeSubtaskDetached(ctx, s.knowledgeRepo, knowledgeID, "wiki", nil, superseded, true)
 }
 
@@ -1366,7 +1370,7 @@ func (s *wikiIngestService) requeueFailedOps(ctx context.Context, payload WikiIn
 		// for deleted knowledge that has no counter to drain). The
 		// matching +1 was seeded by KnowledgePostProcess.SetFinalizing.
 		if op.Op == WikiOpIngest {
-			s.finalizeWikiSubtask(ctx, op.KnowledgeID, op.Attempt)
+			s.finalizeWikiSubtask(ctx, op.KnowledgeID, op.Attempt, false)
 		}
 		logger.Warnf(ctx, "wiki ingest: dropping op %s (%s) after %d failures (limit %d)", op.KnowledgeID, op.DocTitle, count, wikiMaxFailRetries)
 		if s.deadLetterRepo != nil {
