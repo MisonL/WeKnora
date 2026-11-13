@@ -574,6 +574,30 @@ func (h *InitializationHandler) applyKBStorageBinding(
 	if strings.TrimSpace(req.StorageBackendID) == "" && strings.TrimSpace(req.StorageProvider) == "" {
 		return nil
 	}
+	// A bound backend owns the provider projection. A client that names only a
+	// provider — without the backend it belongs to — must not move that
+	// projection off the bound instance: the existing files stay where the
+	// binding points, so honouring the provider would make the row advertise
+	// one engine while new uploads went to another. Echoing the bound provider
+	// is a no-op that also repairs a projection that was never populated.
+	//
+	// A binding that no longer resolves is left alone rather than rejected:
+	// the KB is already unusable for file I/O at that point, and failing here
+	// would lock an admin out of the very settings needed to repair it.
+	if strings.TrimSpace(req.StorageBackendID) == "" && kb.StorageBackendID != nil {
+		if boundID := strings.TrimSpace(*kb.StorageBackendID); boundID != "" {
+			tenant, _ := types.TenantInfoFromContext(ctx)
+			if bound, resolveErr := h.storageResolver.ResolveBackend(ctx, tenant, boundID, ""); resolveErr == nil && bound != nil {
+				requested := strings.ToLower(strings.TrimSpace(req.StorageProvider))
+				if requested != "" && requested != strings.ToLower(bound.Provider) {
+					return errors.NewBadRequestError(
+						"Storage provider conflicts with the bound storage instance; change the storage backend instead")
+				}
+				kb.SetStorageProvider(bound.Provider)
+			}
+			return nil
+		}
+	}
 	// Bind the concrete storage instance. Provider remains a compatibility
 	// projection for older clients and historical rows.
 	if strings.TrimSpace(req.StorageBackendID) != "" {

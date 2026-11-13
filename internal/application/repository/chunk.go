@@ -47,6 +47,23 @@ const updateByIDsBatchSize = 5000
 
 // CreateChunks creates multiple chunks in batches inside a single transaction.
 //
+// chunkFlagsForInsert resolves the flags value the insert must carry explicitly.
+//
+// The column is NOT NULL DEFAULT 1, but GORM writes NULL for a nil pointer
+// field instead of omitting the column, so the insert has to always bind a
+// value. Non-FAQ chunks therefore fall back to the same default the schema
+// would have applied; FAQ chunks keep an explicit zero, which is how
+// is_recommended=false is persisted.
+func chunkFlagsForInsert(chunk *types.Chunk) types.ChunkFlags {
+	if chunk == nil {
+		return types.ChunkFlagRecommended
+	}
+	if chunk.ChunkType != types.ChunkTypeFAQ && chunk.Flags == 0 {
+		return types.ChunkFlagRecommended
+	}
+	return chunk.Flags
+}
+
 // SourceContent is intentionally left empty on create. It records the parser
 // output only once a user edits the chunk (see chunkService.UpdateDocumentChunk,
 // which backfills it from Content on the first edit). Writing a copy of Content
@@ -68,12 +85,12 @@ func (r *chunkRepository) CreateChunks(ctx context.Context, chunks []*types.Chun
 	}
 
 	// GORM substitutes default:true / default:1 for zero bool/int values even
-	// with Select("*"). A non-nil pointer makes both true and false explicit on
-	// insert, while embedding the original chunk keeps generated seq_ids and
-	// timestamps on it. Flags stays nil (so the DB default of "recommended"
-	// applies) unless the chunk is FAQ-typed or carries explicit flags: FAQ is
-	// the only consumer of the recommended flag, and it must be able to
-	// persist an explicit is_recommended=false (Flags == 0).
+	// with Select("*"), and it writes NULL for a nil pointer field rather than
+	// omitting the column — which bypasses a NOT NULL DEFAULT and fails the
+	// insert outright. Both shadowed fields are therefore always non-nil:
+	// IsEnabled carries the real value, and Flags carries the DB default
+	// (recommended) unless the chunk is FAQ-typed or already carries flags,
+	// where an explicit zero has to be persisted as "not recommended".
 	type chunkInsert struct {
 		*types.Chunk
 		IsEnabled *bool
@@ -81,11 +98,8 @@ func (r *chunkRepository) CreateChunks(ctx context.Context, chunks []*types.Chun
 	}
 	rows := make([]chunkInsert, len(chunks))
 	for i, chunk := range chunks {
-		var flags *types.ChunkFlags
-		if chunk.ChunkType == types.ChunkTypeFAQ || chunk.Flags != 0 {
-			flags = &chunk.Flags
-		}
-		rows[i] = chunkInsert{Chunk: chunk, IsEnabled: &chunk.IsEnabled, Flags: flags}
+		chunk.Flags = chunkFlagsForInsert(chunk)
+		rows[i] = chunkInsert{Chunk: chunk, IsEnabled: &chunk.IsEnabled, Flags: &chunk.Flags}
 	}
 
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

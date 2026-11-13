@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -257,6 +259,7 @@ const (
 	keyOCRPreview         = "ocr.preview"
 	keyOCRPrompt          = "ocr.prompt"
 	keyOCRRejectionReason = "ocr.rejection_reason"
+	keyOCRPartial         = "ocr.partial"
 )
 
 // The describe side's keys. The caption action writes the caption.* set; the
@@ -342,6 +345,12 @@ var outcomeValues = []string{
 // The one value several of those vocabularies share: the action ran, read its
 // gate, and found itself switched off.
 const resultSkippedDisabled = "skipped_disabled"
+
+// resultTruncated marks OCR text that was kept although the model ran out of
+// budget before finishing the page. It reads as usable content everywhere a
+// "done" result does; the distinct value keeps the incompleteness visible in
+// the trace and the outcome summary.
+const resultTruncated = "truncated"
 
 // The thinking switches are read by name at the call sites that wire them into a
 // run: a pipeline offers the switch of the action it actually schedules, and the
@@ -523,7 +532,28 @@ func (r *runContext) predictCaption(ctx context.Context, prompt, purpose string)
 // pipeline offers for it. The image_ocr purpose labels the VLM call in the
 // usage log so it can be told apart from the observation step.
 func (r *runContext) predictOCR(ctx context.Context, prompt string) (string, error) {
-	return r.think(types.WithLLMCallMetadata(ctx, "image_ocr", ""), prompt, r.ocrThinkingKey)
+	on := r.BoolParamOr(r.ocrThinkingKey, false)
+	r.out[r.ocrThinkingKey] = on
+	budget := ocrMaxTokens()
+	return r.model.PredictWithOptions(ctx, [][]byte{r.imageBytes}, prompt,
+		&vlm.PredictOptions{Thinking: &on, MaxTokens: &budget})
+}
+
+// defaultOCRMaxTokens sizes a transcription. A screenshot or a short manual
+// page fits in a few hundred tokens, but a dense full-page manual scan can run
+// past the caption-oriented VLM default (5000) and be cut mid-table. Raise it
+// via OCR_MAX_TOKENS; the per-image request still pays only for what it emits.
+const defaultOCRMaxTokens = 16000
+
+// ocrMaxTokens returns the completion budget for a transcription, read from
+// OCR_MAX_TOKENS when set and positive.
+func ocrMaxTokens() int {
+	if v := strings.TrimSpace(os.Getenv("OCR_MAX_TOKENS")); v != "" {
+		if tokens, err := strconv.Atoi(v); err == nil && tokens > 0 {
+			return tokens
+		}
+	}
+	return defaultOCRMaxTokens
 }
 
 // think asks the model with the thinking switch the pipeline wired to this
@@ -888,8 +918,20 @@ func runOCRAction(ctx context.Context, r *runContext) error {
 		}
 		r.out[keyOCRResult] = "failed"
 		r.out[keyOCRErrorCode] = "OCR_REQUEST_FAILED"
-		if errors.Is(err, vlm.ErrTruncatedCompletion) {
+		var truncated *vlm.TruncatedCompletionError
+		if errors.As(err, &truncated) {
 			r.out[keyOCRErrorCode] = "OCR_TRUNCATED"
+			// The page ran past the budget. Whatever was transcribed before
+			// the cut is real text the user can search, so index it instead
+			// of discarding the whole page: a manual page holds dozens of
+			// settings, and dropping all of them over the last few lines
+			// costs far more than the tail being absent.
+			if kept, ok := r.keepTruncatedOCR(truncated.Partial); ok {
+				ocrText = kept
+				r.out[keyOCRResult] = resultTruncated
+				resolve()
+				return nil
+			}
 		}
 		r.out[keyOCRError] = err.Error()
 		resolve()
@@ -921,4 +963,25 @@ func runOCRAction(ctx context.Context, r *runContext) error {
 	r.out[keyOCRResult] = "skipped_no_text"
 	resolve()
 	return nil
+}
+
+// keepTruncatedOCR decides whether the prefix of a budget-stopped
+// transcription is worth indexing. It goes through the same validator as a
+// complete reply, so a runaway fill of empty table cells or a decoding loop is
+// still rejected; only genuine readable text survives the cut.
+func (r *runContext) keepTruncatedOCR(partial string) (string, bool) {
+	text, err := validateOCRText(partial)
+	if err != nil {
+		r.out[keyOCRRejectionReason] = "truncated_" + err.(*ocrValidationError).reason
+		return "", false
+	}
+	if text == "" {
+		return "", false
+	}
+	r.imageInfo.OCRText = text
+	r.out[keyOCRRawChars] = len([]rune(partial))
+	r.out[keyOCRChars] = len([]rune(text))
+	r.out[keyOCRPreview] = previewText(text, 200)
+	r.out[keyOCRPartial] = true
+	return text, true
 }

@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/models/vlm"
@@ -13,16 +12,21 @@ import (
 // errorVLM fails every prediction, standing in for a model endpoint that
 // answered non-2xx: a 429 while the provider throttles, a 5xx, a timeout, or a
 // 4xx such as 400/413/431 the endpoint rejected the request with.
-type errorVLM struct{ err error }
+type errorVLM struct {
+	err error
+	// reply stands in for a completion that was cut off: the real client
+	// returns the visible prefix together with the truncation error.
+	reply string
+}
 
 func (m *errorVLM) Predict(_ context.Context, _ [][]byte, _ string) (string, error) {
-	return "", m.err
+	return m.reply, m.err
 }
 
 func (m *errorVLM) PredictWithOptions(
 	_ context.Context, _ [][]byte, _ string, _ *vlm.PredictOptions,
 ) (string, error) {
-	return "", m.err
+	return m.reply, m.err
 }
 
 func (m *errorVLM) GetModelName() string { return "error" }
@@ -91,9 +95,10 @@ func TestRunOCRActionRecordsFailureWithoutFailing(t *testing.T) {
 
 // TestRunOCRActionCodesTruncation pins the budget-exhaustion branch: an error
 // wrapping vlm.ErrTruncatedCompletion is re-coded OCR_TRUNCATED so the trace
-// distinguishes "the model ran out of budget" from "the request failed".
+// distinguishes "the model ran out of budget" from "the request failed". With
+// no usable prefix on the error there is nothing to index and the image fails.
 func TestRunOCRActionCodesTruncation(t *testing.T) {
-	r := ocrRunContext(&errorVLM{err: fmt.Errorf("request: %w", vlm.ErrTruncatedCompletion)})
+	r := ocrRunContext(&errorVLM{err: &vlm.TruncatedCompletionError{MaxTokens: 16000}})
 
 	if err := runOCRAction(context.Background(), r); err != nil {
 		t.Fatalf("runOCRAction error = %v, want nil", err)
@@ -158,5 +163,34 @@ func TestDefaultPipelineRecordsOCRFailure(t *testing.T) {
 	}
 	if got := r.out[keyOCRError]; got == "" {
 		t.Error("ocr_error not recorded for a failed call")
+	}
+}
+
+// TestRunOCRActionKeepsTruncatedText covers the case the production logs
+// showed: a dense page stopped at the budget after transcribing most of it.
+// Dropping the page loses every setting it listed, so the readable prefix is
+// indexed and only the incompleteness is recorded.
+func TestRunOCRActionKeepsTruncatedText(t *testing.T) {
+	partial := "1）初始化\n2）WLAN设置\n3）网络配置 172.16.0.254/24"
+	r := ocrRunContext(&errorVLM{err: &vlm.TruncatedCompletionError{MaxTokens: 16000, Partial: partial},
+		reply: partial})
+
+	if err := runOCRAction(context.Background(), r); err != nil {
+		t.Fatalf("runOCRAction error = %v, want nil", err)
+	}
+	if got := r.out[keyOCRResult]; got != resultTruncated {
+		t.Errorf("ocr_status = %v, want %s", got, resultTruncated)
+	}
+	if r.imageInfo.OCRText != partial {
+		t.Errorf("ocr text = %q, want the transcribed prefix kept", r.imageInfo.OCRText)
+	}
+	if got := r.out[keyOCRPartial]; got != true {
+		t.Errorf("ocr.partial = %v, want true", got)
+	}
+	if got := r.out[keyOCRChars]; got != len([]rune(partial)) {
+		t.Errorf("ocr.chars = %v, want %d", got, len([]rune(partial)))
+	}
+	if _, ok := r.out[keyOCRError]; ok {
+		t.Errorf("a kept transcription must not be reported as an error: %v", r.out[keyOCRError])
 	}
 }

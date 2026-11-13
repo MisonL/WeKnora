@@ -43,7 +43,28 @@ type PredictOptions struct {
 	// An OCR caller cannot tell that apart from an image with no text, so the
 	// switch is per-action rather than per-model.
 	Thinking *bool
+	// MaxTokens overrides VLM_MAX_TOKENS for this call. Transcription needs a
+	// budget sized to the amount of text in the image, not one shared with
+	// short captioning calls: a dense manual page can exceed the global cap
+	// while a screenshot caption needs a fraction of it.
+	MaxTokens *int
 }
+
+// TruncatedCompletionError reports a completion that hit the caller's token
+// budget. Partial is whatever visible text the model produced before it was
+// cut. Callers that only need the text transcribed (OCR) can keep Partial and
+// record the truncation; callers that need a complete, well-formed answer must
+// treat the call as failed.
+type TruncatedCompletionError struct {
+	MaxTokens int
+	Partial   string
+}
+
+func (e *TruncatedCompletionError) Error() string {
+	return fmt.Sprintf("%v at %d tokens (finish_reason=length)", ErrTruncatedCompletion, e.MaxTokens)
+}
+
+func (e *TruncatedCompletionError) Unwrap() error { return ErrTruncatedCompletion }
 
 // Config holds the configuration needed to create a VLM instance.
 type Config struct {

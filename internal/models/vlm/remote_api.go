@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
@@ -139,6 +140,9 @@ func (v *RemoteAPIVLM) PredictWithOptions(
 		v.modelName, len(imgBytesList), totalImageSize)
 
 	maxTokens := vlmMaxTokens()
+	if opts != nil && opts.MaxTokens != nil && *opts.MaxTokens > 0 {
+		maxTokens = *opts.MaxTokens
+	}
 	chatOpts := &chat.ChatOptions{
 		Temperature: v.temperature,
 		MaxTokens:   maxTokens,
@@ -158,9 +162,15 @@ func (v *RemoteAPIVLM) PredictWithOptions(
 	}
 	content := resp.Content
 	if resp.FinishReason == "length" {
-		// Non-empty partial output is still incomplete and must not be indexed
-		// as successful OCR. Returning an error also marks the model trace failed.
-		return "", fmt.Errorf("%w at %d tokens (finish_reason=length)", ErrTruncatedCompletion, maxTokens)
+		// A partial transcription is still useful to an OCR caller, so it
+		// rides along on the error instead of being dropped: the caller
+		// decides whether an incomplete page is worth indexing. It is still
+		// an error so a caller that needs a whole answer cannot mistake a
+		// cut-off completion for a successful one.
+		// The caller gets the usable prefix, never the raw loop tail: a page
+		// that was cut is still worth indexing, a decoding loop is not.
+		partial := usablePrefix(content)
+		return partial, &TruncatedCompletionError{MaxTokens: maxTokens, Partial: partial}
 	}
 	logger.Infof(ctx, "[VLM] response received, len=%d", len(content))
 	return content, nil
@@ -176,4 +186,43 @@ func detectImageMIME(data []byte) string {
 		return ct
 	}
 	return "image/png"
+}
+
+// usablePrefix trims a cut-off completion down to transcribable text. A model
+// that exhausts its budget on a decoding loop returns a long fill of empty
+// table cells; handing that to the caller as "partial text" would index
+// thousands of blank rows as though they said something. Cut the repeated
+// tail, then refuse anything without a letter or a digit.
+func usablePrefix(content string) string {
+	content = strings.TrimSpace(cutRepeatedTail(content))
+	if !strings.ContainsFunc(content, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) {
+		return ""
+	}
+	return content
+}
+
+// cutRepeatedTail shortens content whose tail is the same few-token phrase
+// repeated back-to-back, which is what a model does once it starts looping.
+// A human-transcribed page does repeat structure (table rows, menu items), so
+// only a tail longer than repeatedTailBudget is shortened, and it is cut at
+// the start of the run rather than rewritten.
+func cutRepeatedTail(content string) string {
+	const (
+		minPeriod    = 2
+		maxPeriod    = 40
+		repeatsToCut = 8
+	)
+	runes := []rune(content)
+	n := len(runes)
+	for period := minPeriod; period <= maxPeriod && period*repeatsToCut <= n; period++ {
+		// Count how many times the final `period`-rune unit repeats backwards.
+		reps := 1
+		for start := n - period*2; start >= 0 && string(runes[start:start+period]) == string(runes[n-period:n]); start -= period {
+			reps++
+		}
+		if reps >= repeatsToCut {
+			return string(runes[:n-period*reps])
+		}
+	}
+	return content
 }

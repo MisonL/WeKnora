@@ -133,9 +133,51 @@ prepare_patched_anydoc
 # resolver drift must fail the build rather than ship an unaudited tree.
 cargo build --release --locked --manifest-path "$crate_dir/Cargo.toml" --target "$target"
 
+# Newer rustc stable embeds LLVM bitcode sections (.llvmbc, .llvmcmd, ...) in
+# the staticlib. Go 1.26 refuses to link an archive that carries them — they
+# are only useful for cross-language LTO, which this cgo link does not use —
+# and it reports one section per run. Strip every .llvm* section before cgo
+# consumes the archive, so the build does not depend on which rustc `stable`
+# resolves to that day.
+#
+# Unlike the upstream fix (Tencent/WeKnora#5417), a missing tool or a section
+# that survives stripping is an error here, not a warning: this runs in an
+# image build, and deferring the failure to the Go link step is how the build
+# breaks silently the next time rustc adds a section.
+disallowed_lto_sections() {
+  # The exact set Go refuses, from cmd/go/internal/work/security.go.
+  readelf -S "$1" 2>/dev/null | grep -oE '\.(gnu\.(debug)?lto_[a-zA-Z0-9_]+|llvm[a-zA-Z0-9_]*|llvm\.lto[a-zA-Z0-9_]*)' | sort -u || true
+}
+
+strip_llvm_lto_sections() {
+  local lib="$1"
+  if ! command -v readelf >/dev/null 2>&1 || ! command -v objcopy >/dev/null 2>&1; then
+    echo "error: readelf and objcopy are required to strip LLVM LTO sections from $lib" >&2
+    return 1
+  fi
+  local sections section
+  sections=$(disallowed_lto_sections "$lib")
+  if [ -n "$sections" ]; then
+    while IFS= read -r section; do
+      [ -n "$section" ] || continue
+      objcopy --remove-section="$section" "$lib" 2>/dev/null || true
+    done <<< "$sections"
+  fi
+  # Re-read the archive: Go rejects the first offending section it finds, so a
+  # silent leftover would only surface much later, in the link step.
+  local remaining
+  remaining=$(disallowed_lto_sections "$lib")
+  if [ -n "$remaining" ]; then
+    echo "error: LLVM LTO sections survived stripping from $lib:" >&2
+    echo "$remaining" >&2
+    return 1
+  fi
+}
+
 dest="$crate_dir/lib/$lib_dir"
 mkdir -p "$dest"
 cp "$crate_dir/target/$target/release/$lib_name" "$dest/$lib_name"
+strip_llvm_lto_sections "$dest/$lib_name"
 
 echo "Wrote $dest/$lib_name"
 echo "Build WeKnora with the archive: go build -tags anydoc ./cmd/server"

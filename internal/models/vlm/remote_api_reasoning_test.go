@@ -131,8 +131,9 @@ func TestRemoteAPIVLMKeepsMaxTokensForNonReasoningModel(t *testing.T) {
 	}
 }
 
-// A completion stopped by the budget is not successful OCR, even when the
-// response has a non-empty prefix or a long run of repeated empty table cells.
+// A completion stopped by the budget is never successful OCR. A prefix is
+// carried on the error for an OCR caller that can use it, but a runaway fill
+// of empty table cells is not text and must not ride along.
 func TestRemoteAPIVLMReportsTruncatedCompletion(t *testing.T) {
 	withVLMSSRFWhitelist(t, "127.0.0.1")
 	for _, content := range []string{"", "partial extracted text", strings.Repeat("|  ", 2500)} {
@@ -152,9 +153,65 @@ func TestRemoteAPIVLMReportsTruncatedCompletion(t *testing.T) {
 				t.Fatal(err)
 			}
 			got, err := v.Predict(t.Context(), [][]byte{testPNG}, "extract text")
-			if got != "" || !errors.Is(err, ErrTruncatedCompletion) {
+			if !errors.Is(err, ErrTruncatedCompletion) {
 				t.Fatalf("content=%q error=%v", got, err)
 			}
+			var trunc *TruncatedCompletionError
+			if !errors.As(err, &trunc) {
+				t.Fatalf("error %v does not carry the truncation detail", err)
+			}
+			if got != trunc.Partial {
+				t.Errorf("returned content=%q, error carries %q", got, trunc.Partial)
+			}
+			if content == strings.Repeat("|  ", 2500) && strings.TrimSpace(got) != "" {
+				t.Errorf("a fill of empty table cells was kept as text: %q", firstRunes(got, 40))
+			}
+			if strings.Contains(content, "partial extracted text") && !strings.Contains(got, "partial extracted text") {
+				t.Errorf("a genuine prefix was dropped: %q", got)
+			}
 		})
+	}
+}
+
+// firstRunes keeps failure messages readable when the value is thousands of
+// repeated filler cells.
+func firstRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "..."
+}
+
+// TestPredictOptionsMaxTokensOverride pins the per-call budget: a caller whose
+// output is sized by the image (OCR of a dense page) must be able to ask for
+// more than the VLM_MAX_TOKENS default without changing every other call.
+func TestPredictOptionsMaxTokensOverride(t *testing.T) {
+	withVLMSSRFWhitelist(t, "127.0.0.1")
+	t.Setenv("VLM_MAX_TOKENS", "6000")
+
+	var lastRequest map[string]interface{}
+	server := newVLMChatTestServer(t, &lastRequest)
+	defer server.Close()
+
+	v, err := NewRemoteAPIVLM(&Config{BaseURL: server.URL, ModelName: "qwen2.5-vl-7b-instruct", APIKey: "sk-test"})
+	if err != nil {
+		t.Fatalf("NewRemoteAPIVLM: %v", err)
+	}
+	tokens := 16000
+	if _, err := v.PredictWithOptions(t.Context(), [][]byte{testPNG}, "transcribe", &PredictOptions{MaxTokens: &tokens}); err != nil {
+		t.Fatalf("PredictWithOptions: %v", err)
+	}
+	if got := lastRequest["max_tokens"]; got != float64(16000) {
+		t.Errorf("max_tokens = %v, want the per-call override 16000", got)
+	}
+
+	zero := 0
+	lastRequest = nil
+	if _, err := v.PredictWithOptions(t.Context(), [][]byte{testPNG}, "transcribe", &PredictOptions{MaxTokens: &zero}); err != nil {
+		t.Fatalf("PredictWithOptions zero: %v", err)
+	}
+	if got := lastRequest["max_tokens"]; got != float64(6000) {
+		t.Errorf("max_tokens = %v, want the VLM_MAX_TOKENS default when the override is not positive", got)
 	}
 }

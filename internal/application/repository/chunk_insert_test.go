@@ -53,3 +53,42 @@ func TestCreateChunks_PostgresPreservesEnabledStateAndReturnsSeqIDs(t *testing.T
 	require.False(t, chunks[0].CreatedAt.IsZero())
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+// A non-FAQ chunk must bind an explicit flags value: leaving the pointer nil
+// made GORM write NULL into a NOT NULL DEFAULT column, which failed every
+// document ingest with `null value in column "flags"`.
+func TestChunkFlagsForInsert(t *testing.T) {
+	cases := []struct {
+		name      string
+		chunkType types.ChunkType
+		flags     types.ChunkFlags
+		want      types.ChunkFlags
+	}{
+		{
+			name:      "document chunk defaults to recommended",
+			chunkType: types.ChunkTypeText,
+			want:      types.ChunkFlagRecommended,
+		},
+		{
+			name:      "document chunk keeps explicit flags",
+			chunkType: types.ChunkTypeText, flags: 4, want: 4,
+		},
+		{
+			name:      "faq keeps explicit zero",
+			chunkType: types.ChunkTypeFAQ, want: 0,
+		},
+		{
+			name:      "faq keeps recommended",
+			chunkType: types.ChunkTypeFAQ,
+			flags:     types.ChunkFlagRecommended,
+			want:      types.ChunkFlagRecommended,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			chunk := &types.Chunk{ChunkType: tc.chunkType, Flags: tc.flags}
+			require.Equal(t, tc.want, chunkFlagsForInsert(chunk))
+		})
+	}
+	require.Equal(t, types.ChunkFlagRecommended, chunkFlagsForInsert(nil))
+}

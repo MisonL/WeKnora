@@ -193,3 +193,65 @@ func TestApplyKBStorageBindingExplicitRequests(t *testing.T) {
 		})
 	}
 }
+
+// A bound backend is authoritative for the provider projection: a provider-only
+// request may echo it, but must neither move the projection to another engine
+// nor fail a KB whose binding no longer resolves.
+func TestApplyKBStorageBindingBoundBackendOwnsProjection(t *testing.T) {
+	t.Setenv("STORAGE_ALLOW_LIST", "local,oss")
+	const boundID = "backend-oss"
+	cases := []struct {
+		name         string
+		kbProvider   *types.StorageProviderConfig
+		request      KBModelConfigRequest
+		resolveErr   error
+		wantProvider string
+		wantError    bool
+	}{
+		{
+			name:         "provider conflicting with the binding is rejected",
+			kbProvider:   &types.StorageProviderConfig{Provider: "oss"},
+			request:      KBModelConfigRequest{StorageProvider: "local"},
+			wantProvider: "oss", wantError: true,
+		},
+		{
+			name:         "provider echoing the binding is accepted",
+			kbProvider:   &types.StorageProviderConfig{Provider: "oss"},
+			request:      KBModelConfigRequest{StorageProvider: " OSS "},
+			wantProvider: "oss",
+		},
+		{
+			name:         "empty projection is repaired from the binding",
+			request:      KBModelConfigRequest{StorageProvider: "oss"},
+			wantProvider: "oss",
+		},
+		{
+			name:         "unresolvable binding leaves the projection alone",
+			kbProvider:   &types.StorageProviderConfig{Provider: "oss"},
+			request:      KBModelConfigRequest{StorageProvider: "local"},
+			resolveErr:   stderrors.New("backend deleted"),
+			wantProvider: "oss",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id := boundID
+			kb := &types.KnowledgeBase{ID: "kb-1", StorageProviderConfig: tc.kbProvider, StorageBackendID: &id}
+			resolver := &stubStorageBindingResolver{
+				backend: &types.StorageBackend{ID: boundID, Provider: "oss"}, err: tc.resolveErr,
+			}
+			h := &InitializationHandler{storageResolver: resolver}
+			err := h.applyKBStorageBinding(context.Background(), kb, kb.ID, &tc.request)
+			if tc.wantError {
+				var appErr *apperrors.AppError
+				require.ErrorAs(t, err, &appErr)
+				require.Equal(t, http.StatusBadRequest, appErr.HTTPCode)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tc.wantProvider, kb.GetStorageProvider())
+			require.Equal(t, boundID, *kb.StorageBackendID)
+			require.Equal(t, 1, resolver.calls)
+		})
+	}
+}

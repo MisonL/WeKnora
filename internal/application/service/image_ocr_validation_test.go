@@ -38,7 +38,24 @@ func TestImageOCRRejectsInvalidContentBeforePersistence(t *testing.T) {
 	for _, tc := range []struct {
 		name, raw, status, code string
 		err                     error
+		// partialErr makes the fake fail the way the real client does: the
+		// visible prefix rides on the error instead of being dropped.
+		partialErr bool
 	}{
+		{
+			// A page cut off by the budget still carries real text. The
+			// transcribed part is kept so the page stays searchable; the
+			// truncation stays visible as its own status.
+			name: "truncated with readable text", raw: "1）初始化 注意 A：除秤号、网络设置外其余数据恢复出厂默认",
+			status: resultTruncated, code: "OCR_TRUNCATED",
+			err:   &vlm.TruncatedCompletionError{MaxTokens: 5000, Partial: "1）初始化 注意 A：除秤号、网络设置外其余数据恢复出厂默认"},
+		},
+		{
+			// The same budget cut over a runaway fill of empty table cells
+			// yields nothing usable, so the page is still a failure.
+			name: "truncated with filler only", raw: strings.Repeat("|  ", 2500),
+			status: "failed", code: "OCR_TRUNCATED", partialErr: true,
+		},
 		{name: "recorded empty cells", raw: strings.Repeat("|  ", 2500), status: "failed", code: "OCR_INVALID_OUTPUT"},
 		{name: "repeated words", raw: strings.Repeat("传球按钮 ", 200), status: "failed", code: "OCR_INVALID_OUTPUT"},
 		{
@@ -48,7 +65,7 @@ func TestImageOCRRejectsInvalidContentBeforePersistence(t *testing.T) {
 		{name: "empty model output", status: "failed", code: "OCR_INVALID_OUTPUT"},
 		{
 			name: "truncated output", status: "failed", code: "OCR_TRUNCATED",
-			err: fmt.Errorf("request: %w", vlm.ErrTruncatedCompletion),
+			err: &vlm.TruncatedCompletionError{MaxTokens: 16000},
 		},
 		{name: "request failure", status: "failed", code: "OCR_REQUEST_FAILED", err: errors.New("model unavailable")},
 		{name: "no text", raw: "No text content.", status: "skipped_no_text"},
@@ -63,6 +80,9 @@ func TestImageOCRRejectsInvalidContentBeforePersistence(t *testing.T) {
 				svc := newAttrsTestService(&attrsFileService{body: testPNG(t)}, repo)
 				model := &attrsFakeVLM{reply: func(prompt string, _ int) (string, error) {
 					if prompt == vlmOCRPrompt {
+						if tc.partialErr {
+							return tc.raw, &vlm.TruncatedCompletionError{MaxTokens: 5000, Partial: tc.raw}
+						}
 						return tc.raw, tc.err
 					}
 					return "A game screenshot.", nil
@@ -81,8 +101,9 @@ func TestImageOCRRejectsInvalidContentBeforePersistence(t *testing.T) {
 					},
 					Attempt: 1,
 				}, model, types.VLMConfig{}, tracker, out)
-				if caption {
-					// A valid caption exists: the OCR failure is recorded, not
+				if caption || tc.status == resultTruncated {
+					// A valid caption exists, or the cut page still yielded
+					// usable text: the incompleteness is recorded, not
 					// propagated — failing the image would retry it and
 					// duplicate the caption chunk (#4132).
 					require.NoError(t, err)
@@ -97,6 +118,20 @@ func TestImageOCRRejectsInvalidContentBeforePersistence(t *testing.T) {
 					require.NoError(t, err)
 				}
 				require.Equal(t, tc.status, out[keyOCRResult])
+				if tc.status == resultTruncated {
+					// Keep the span marked incomplete so operators can see
+					// the page was cut, but the transcribed part is indexed.
+					require.Equal(t, "OCR_TRUNCATED", tracker.failed["multimodal.image[0].ocr"])
+					require.NotEmpty(t, out[keyOCRChars], "kept OCR text must be counted")
+					require.Contains(t, out, keyOCRPreview)
+					require.Equal(t, true, out[keyOCRPartial])
+					require.NotContains(t, out, keyOCRError)
+					// The image carries usable content either way.
+					require.NoError(t, err)
+					require.Equal(t, "done", out["outcome"])
+					return
+				}
+				require.NotContains(t, out, keyOCRPartial)
 				require.Equal(t, 0, out[keyOCRChars])
 				require.NotContains(t, out, "ocr_preview")
 				require.Equal(t, tc.code, tracker.failed["multimodal.image[0].ocr"])
