@@ -644,6 +644,16 @@ func (s *knowledgeBaseService) UpdateKnowledgeBase(ctx context.Context,
 			kb.FAQConfig = config.FAQConfig
 		}
 		if config.WikiConfig != nil {
+			// PUT replaces the whole section, and every client that predates the
+			// schedule switch sends wiki_config without schedule fields. Treat an
+			// empty mode as "not carried" so an unrelated edit cannot silently
+			// reset a knowledge base back to on_change; going back on purpose
+			// means sending schedule_mode="on_change" explicitly.
+			if config.WikiConfig.ScheduleMode == "" && kb.WikiConfig != nil {
+				config.WikiConfig.ScheduleMode = kb.WikiConfig.ScheduleMode
+				config.WikiConfig.ScheduleTime = kb.WikiConfig.ScheduleTime
+				config.WikiConfig.ScheduleWeekdays = kb.WikiConfig.ScheduleWeekdays
+			}
 			kb.WikiConfig = config.WikiConfig
 		}
 		if config.AutoTagConfig != nil {

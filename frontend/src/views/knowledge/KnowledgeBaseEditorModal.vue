@@ -1794,7 +1794,7 @@ const buildSubmitData = () => {
   if (formData.value.type !== 'faq') {
     data.wiki_config = {
       auto_generate: formData.value.wikiConfig?.autoGenerate ?? true,
-      schedule_mode: formData.value.wikiConfig?.scheduleMode || 'on_change',
+      schedule_mode: formData.value.wikiConfig?.scheduleMode || '',
       schedule_time: formData.value.wikiConfig?.scheduleTime || '02:00',
       schedule_weekdays: formData.value.wikiConfig?.scheduleWeekdays || [],
       synthesis_model_id: formData.value.modelConfig?.wikiSynthesisModelId || '',
@@ -1903,7 +1903,7 @@ const doSubmit = async () => {
       if (formData.value.wikiConfig && formData.value.type !== 'faq') {
         updateConfig.wiki_config = {
           auto_generate: formData.value.wikiConfig.autoGenerate ?? true,
-          schedule_mode: formData.value.wikiConfig.scheduleMode || 'on_change',
+          schedule_mode: formData.value.wikiConfig.scheduleMode || '',
           schedule_time: formData.value.wikiConfig.scheduleTime || '02:00',
           schedule_weekdays: formData.value.wikiConfig.scheduleWeekdays || [],
           synthesis_model_id: formData.value.modelConfig?.wikiSynthesisModelId || '',

@@ -68,12 +68,14 @@ test('Wiki generation schedule loads from the KB and is submitted on create and 
   // stored window, which would silently pin a daily KB after an unrelated edit.
   const createPayload = source.match(/data\.wiki_config = \{([\s\S]*?)\n    \}/)?.[1]
   assert.ok(createPayload, 'expected to find the create payload')
-  assert.match(createPayload, /schedule_mode: formData\.value\.wikiConfig\?\.scheduleMode \|\| 'on_change'/)
+  // Empty mode means "not carried": the server keeps the stored schedule, so a
+  // PUT from an older client cannot reset a daily KB back to on_change.
+  assert.match(createPayload, /schedule_mode: formData\.value\.wikiConfig\?\.scheduleMode \|\| ''/)
   assert.match(createPayload, /schedule_time: formData\.value\.wikiConfig\?\.scheduleTime \|\| '02:00'/)
   assert.match(createPayload, /schedule_weekdays: formData\.value\.wikiConfig\?\.scheduleWeekdays \|\| \[\]/)
   const updatePayload = source.match(/updateConfig\.wiki_config = \{([\s\S]*?)\n      \}/)?.[1]
   assert.ok(updatePayload, 'expected to find the update payload')
-  assert.match(updatePayload, /schedule_mode: formData\.value\.wikiConfig\.scheduleMode \|\| 'on_change'/)
+  assert.match(updatePayload, /schedule_mode: formData\.value\.wikiConfig\.scheduleMode \|\| ''/)
 })
 
 test('Wiki schedule controls only show when Wiki generation is on', () => {
