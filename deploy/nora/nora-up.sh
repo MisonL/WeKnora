@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Production wrapper for the QDAMA Nora stack.
+# Production wrapper for a self-hosted WeKnora stack.
 #
 # Every service in docker-compose.yml that this deployment customises (app and
 # frontend) lives in docker-compose.app-oss.yml, which Compose does not load
 # automatically. Running a bare `docker compose up -d` would silently recreate
 # those containers from the official images and drop the STS / FAQ fixes.
 #
-# Install as /opt/nora/bin/nora-up.sh and always start or update the stack
+# Install as <deploy-root>/bin/nora-up.sh and always start or update the stack
 # through it:
 #   bin/nora-up.sh up -d
 #   bin/nora-up.sh up -d --no-deps --force-recreate app frontend
@@ -28,7 +28,7 @@ for f in "${files[@]}"; do
   fi
 done
 
-args=(-p nora)
+args=(-p "${COMPOSE_PROJECT:-nora}")
 for f in "${files[@]}"; do
   args+=(-f "$f")
 done

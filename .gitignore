@@ -5,6 +5,11 @@
 !.gitignore
 !.github/
 
+# 本地部署覆盖层：从仓库里的 *.example.yml 模板复制后填入自己的端口、桶、
+# 角色与白名单，不提交。模板本身是通用的，环境相关值不进代码树。
+docker-compose.staging.yml
+docker-compose.app-oss.local.yml
+
 # 敏感文件
 *.pem
 *_key

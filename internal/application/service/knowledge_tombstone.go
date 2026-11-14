@@ -18,9 +18,9 @@ import (
 // and its chunks keep theirs, but nothing ever removes either. The sweeps in
 // knowledge_housekeeping.go only settle their status so they stop being
 // scanned — every bulk delete therefore leaves a permanent set of rows and
-// chunk tombstones behind (measured on the QDAMA deployment: 198 documents,
-// ~36.7k chunk rows, ~6.5k processing spans, 0 of them reachable by any API or
-// retrieval query).
+// chunk tombstones behind (a production measurement after a few rounds of
+// cleanup: ~200 documents, ~37k chunk rows and ~6.5k processing spans, none of
+// them reachable by any API or retrieval query).
 //
 // Recovering a soft-deleted document has never been possible: the delete flow
 // removes the source object from file storage and the vectors from the index

@@ -1,0 +1,103 @@
+# Staging rehearsal overlay for a Co-hosted production host (2C4G is typical).
+#
+# Purpose: rehearse the v0.9.0 + OSS/STS deployment on the production host with
+# an isolated compose project, without touching the running production stack.
+# A rehearsal that needs STS must run on a host whose caller AK is IP-bound
+# enough to pass it, which is why this rides along on that host.
+#
+# Every deployment-specific value is a placeholder or comes from the shell
+# environment; copy this file to docker-compose.staging.yml in your own deploy
+# tree and fill them in. Nothing here identifies a particular environment.
+#
+# NOT auto-loaded. Staging reads the SAME secret file as production via a
+# symlink so no secret is ever duplicated on the host. The paths below assume
+# the production root is /opt/app (see deploy/nora/nora-up.sh); adjust them:
+#
+#   sudo install -d /opt/app-stg
+#   sudo ln -sfn /opt/app/.env /opt/app-stg/.env
+#   sudo cp -a /opt/app/config /opt/app-stg/config
+#   # copy docker-compose.yml and this file from the repo, then:
+#   sudo -E env APP_PORT=127.0.0.1:8001 FRONTEND_PORT=8002 \
+#        OSS_PATH_PREFIX=weknora-stg/ OSS_ROLE_SESSION_NAME=weknora-stg \
+#     docker compose -p app-stg \
+#       -f docker-compose.yml \
+#       -f deploy/nora/docker-compose.staging.yml up -d
+#
+#   # Rehearsal is finished with:
+#   docker compose -p app-stg -f docker-compose.yml \
+#     -f deploy/nora/docker-compose.staging.yml down -v   # volumes are app-stg_*
+#   sudo rm -rf /opt/app-stg
+#
+# Tear it down as soon as the rehearsal ends: on a 2C4G host it competes with
+# production for memory, and two docreader stacks have already driven the host
+# into the kernel OOM killer once.
+#
+# Safety notes:
+#   - Ports: the base file publishes ${APP_PORT}/${FRONTEND_PORT}; passing
+#     APP_PORT/FRONTEND_PORT in the shell environment re-binds staging to
+#     8001/8002 (shell env wins over the .env file for interpolation), so it
+#     cannot collide with the running production containers.
+#   - Volumes and the compose network are project-scoped (app-stg_*), so no
+#     shared state with the production project is possible.
+#   - OSS objects go under OSS_PATH_PREFIX with a distinct
+#     OSS_ROLE_SESSION_NAME so rehearsal artifacts are easy to find and clean.
+services:
+  frontend:
+    image: weknora-ui:${NORA_IMAGE_TAG:-v0.9.0-oss-sts-r9}
+    pull_policy: never
+    container_name: AppStg-frontend
+  app:
+    image: weknora-app:${NORA_IMAGE_TAG:-v0.9.0-oss-sts-r9}
+    pull_policy: never
+    container_name: AppStg-app
+    volumes:
+      # Declarative built-in models. Production mounts this through its own
+      # override file; the base compose leaves the line commented out. Without
+      # it the models table stays empty and FAQ import fails on a missing
+      # embedding model, so the rehearsal must mount it too.
+      - ./config/builtin_models.yaml:/app/config/builtin_models.yaml:ro
+    environment:
+      # v0.9.0 validates every model base URL at runtime (chat/embedding/rerank
+      # transports), unlike v0.8.3. If the builtin models point at an internal
+      # relay because the direct model hosts are unreachable from this network,
+      # the relay must be whitelisted or every model call fails with
+      # "direct IP address access is not allowed".
+      #
+      # This is also the production fix: whitelist the relay BEFORE the
+      # v0.9.0 cutover. Staging overrides it here so the rehearsal never edits
+      # the shared production .env. Leave empty when no relay is needed.
+      - SSRF_WHITELIST=${SSRF_WHITELIST:-}
+      # ---- OSS/STS rehearsal -------------------------------------------
+      # The base compose only forwards the eight legacy OSS_* variables, and
+      # staging shares production's .env through a symlink, so the role
+      # variables cannot come from the file without editing production. They
+      # are set here instead; only the caller AK/SK and the account-specific
+      # identifiers are interpolated from the shell so no secret or account
+      # detail is written to this file.
+      #
+      # Production does not need this block: once OSS_* live in the production
+      # .env, the service-level `env_file: .env` delivers them.
+      - STORAGE_TYPE=${STORAGE_TYPE:-}
+      - OSS_AUTH_TYPE=${OSS_AUTH_TYPE:-}
+      - OSS_ROLE_ARN=${OSS_ROLE_ARN:-}
+      - OSS_ROLE_SESSION_NAME=${OSS_ROLE_SESSION_NAME:-weknora-stg}
+      - OSS_ROLE_SESSION_EXPIRATION=${OSS_ROLE_SESSION_EXPIRATION:-3600}
+      - OSS_ENDPOINT=${OSS_ENDPOINT:-}
+      - OSS_REGION=${OSS_REGION:-}
+      - OSS_BUCKET_NAME=${OSS_BUCKET_NAME:-}
+      - OSS_PATH_PREFIX=${OSS_PATH_PREFIX:-weknora-stg/}
+      - OSS_PRESIGN_TTL_SECONDS=${OSS_PRESIGN_TTL_SECONDS:-3000}
+      - OSS_ACCESS_KEY=${OSS_ACCESS_KEY:-}
+      - OSS_SECRET_KEY=${OSS_SECRET_KEY:-}
+  docreader:
+    image: ${DOCREADER_IMAGE:-docker.m.daocloud.io/wechatopenai/weknora-docreader:v0.9.0}
+    pull_policy: never
+    container_name: AppStg-docreader
+  postgres:
+    image: docker.m.daocloud.io/paradedb/paradedb:v0.25.11-pg17
+    pull_policy: never
+    container_name: AppStg-postgres
+  redis:
+    image: docker.m.daocloud.io/library/redis:7.4.6-alpine
+    pull_policy: never
+    container_name: AppStg-redis

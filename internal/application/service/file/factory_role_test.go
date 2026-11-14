@@ -15,11 +15,11 @@ func roleStorageEngineConfig() *types.StorageEngineConfig {
 		OSS: &types.OSSEngineConfig{
 			Endpoint:   "oss-cn-hangzhou.aliyuncs.com",
 			Region:     "cn-hangzhou",
-			BucketName: "noraoss01",
+			BucketName: "example-bucket",
 			AccessKey:  "caller-ak",
 			SecretKey:  "caller-sk",
 			AuthType:   types.OSSAuthTypeRAMRoleARN,
-			RoleARN:    "acs:ram::1645446608222577:role/nora-prd-br",
+			RoleARN:    "acs:ram::1234567890123456:role/weknora-readonly",
 		},
 	}
 }

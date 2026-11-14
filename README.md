@@ -38,6 +38,52 @@
   <a href="https://trendshift.io/repositories/15289"><img src="https://trendshift.io/api/badge/repositories/15289" alt="Tencent/WeKnora | Trendshift" width="220" height="48"/></a>
 </p>
 
+## Fork changes
+
+This is a fork of [Tencent/WeKnora](https://github.com/Tencent/WeKnora). Beyond upstream it carries the changes below, maintained as a standalone fork and merged forward from `upstream/main`; [FORK.md](./FORK.md) records the branch, release and merge conventions. The only boundary is keeping the fork's own operational identifiers (hosts, accounts, buckets, roles) out of the tree — everything listed here is generic.
+
+### Added
+
+| Feature | What it does |
+|---|---|
+| OSS storage via STS (`ram_role_arn`) | Alibaba Cloud OSS credentials are obtained per instance through AssumeRole (`github.com/aliyun/credentials-go`) instead of a static AK. Adds a startup probe, a refresh backoff that keeps serving cached credentials while the STS endpoint is failing, and `GET /system/admin/diagnostics/sts` (auth mode, refresh counters, token lifetime, last error; system admins only). |
+| Storage write gate | A `ram_role_arn` backend must come from the environment: it cannot be created or edited from the UI/API, and it is read-only (fail-closed), so a workspace cannot point storage at an arbitrary role. |
+| Scheduled wiki generation | A knowledge base chooses when Wiki generation runs: `on_change` (default, one run per document), `daily` or `weekly`, with several run times per day. Documents parsed between windows park their ingest op and are consumed at the next window instead of blocking the queue. Exposed in the knowledge base editor, `PUT /initialization/config`, and `weknora kb schedule`. |
+| Soft-delete tombstone purge | Housekeeping now physically removes soft-deleted documents past a retention (opt-in via `WEKNORA_TOMBSTONE_RETENTION_DAYS`, `WEKNORA_TOMBSTONE_DRY_RUN` to preview) together with their chunks, chunk revisions, vectors, processing spans, queued ops and tag links. Previously every bulk delete left rows behind forever. |
+
+### Fixed
+
+| Area | Problem and fix |
+|---|---|
+| AES key validation | A malformed `SYSTEM_AES_KEY` was tolerated at startup, which silently left every encrypted column unreadable and every write storing plaintext. Startup now validates it (32 bytes / 64 hex / base64) and refuses to boot. |
+| IM channel credentials | `im_channels.credentials` is stored as one `enc:v1` string instead of a JSON document of plaintext secrets, and is kept out of logs; a write that would touch an undecryptable channel is refused. |
+| Undecryptable secrets | When the key is missing or rotated, loaders used to blank the credential field and write it back on save, destroying ciphertext the original key could recover. The ciphertext is now kept and restored on re-encode (workspace engine config, MCP auth, data source credentials). |
+| Partial updates | Several PATCH/PUT handlers decoded into structs whose scalars cannot tell "omitted" from "zero", so touching one field reset every other setting. Request types now record field presence during unmarshal, including on requests that fail later validation. |
+| LLM retries | Transport retries multiplied by caller retry budgets (a request storm from one transient failure), and a long `Retry-After` was honoured in full. Retries are classified and bounded, `Retry-After` is capped, and a caller that owns its retries can opt out of transport retries. Cancellation is no longer reported as failure. |
+| FAQ import / export | The retry cursor used a display counter polluted by skipped and merged entries, so a retry replayed or skipped a slice. Operational fields (enabled/recommended) are synced and `SourceID` is hashed so a re-import updates the same row. Failed-entry CSV downloads fall back to the authenticated `/files` proxy. |
+| IM Q&A queue | Each dequeued request runs behind a panic barrier and fails closed when the queue cannot be accounted for; the Q&A call gets its own timeout instead of inheriting the request lifetime; `/search` is rate limited. |
+| Retrieval | Generated-question rows stayed in recall after generation was turned off (ParadeDB needs a keyword form of the column-comparison filter alongside the vector one). |
+| Chunk insert | An embedded `*types.Chunk` with its own `Flags` field made GORM bind NULL and defeated `NOT NULL DEFAULT 1`, failing every insert. |
+| OCR budget | A dense page stopped at the 5000-token caption budget and the whole page was discarded. The budget is settable (`OCR_MAX_TOKENS`, default 16000), a budget stop returns the usable prefix, and a decoding loop of empty table cells is refused rather than indexed. |
+| DB connection pool | An unset `DB_MAX_OPEN_CONNS` meant `database/sql`'s unlimited default, so a burst of requests opened one connection each until Postgres refused them. The cap now defaults to 20; explicit values still win. |
+
+### Build, CI and deployment
+
+| Change | Why |
+|---|---|
+| Aliyun mirrors by default | Go, apt, npm and pip builds default to domestic mirrors so a bare `docker build` needs no extra flags; overridable through the same environment variables. |
+| anydoc LTO strip | Newer rustc embeds LLVM LTO sections in the staticlib that Go cannot link; the build strips them and fails loudly instead of warning and continuing. |
+| docreader CI | The runner is pinned to a Playwright-supported image and the interpreter comes from `uv`. |
+| Deployment templates | `deploy/nora/`: an incremental image publisher (`build-delta.sh`) for hosts reached over a slow link, a production wrapper that always loads the fork's compose overrides (`nora-up.sh`), and a staging rehearsal overlay template. App, UI and docreader images each take their own tag variable (`NORA_IMAGE_TAG`, `NORA_UI_IMAGE_TAG`, `DOCREADER_IMAGE`). |
+
+### Fork-only behavioral notes
+
+- A protected AES key is mandatory to boot; an empty or malformed value is a startup error rather than a silent downgrade.
+- An OSS `ram_role_arn` backend cannot be created from the UI; it must exist in the environment configuration.
+- Wiki generation no longer follows every document by default if a schedule is set — the schedule wins.
+
+The upstream sections below describe the project as a whole, unchanged by this fork.
+
 ## Overview
 
 [WeKnora](https://weknora.weixin.qq.com) is an open-source, LLM-powered knowledge framework for enterprise document understanding, semantic retrieval and reasoning. It brings a team's documents together so they can be searched, reasoned over and kept up to date.

@@ -9,7 +9,7 @@ import (
 )
 
 func TestValidateOSSRoleAuth(t *testing.T) {
-	validARN := "acs:ram::1645446608222577:role/nora-prd-br"
+	validARN := "acs:ram::1234567890123456:role/weknora-readonly"
 	cases := []struct {
 		name       string
 		roleARN    string
@@ -58,7 +58,7 @@ func TestStorageBackendConfigValidateForProviderOSS(t *testing.T) {
 
 	role := base
 	role.AuthType = OSSAuthTypeRAMRoleARN
-	role.RoleARN = "acs:ram::1645446608222577:role/nora-prd-br"
+	role.RoleARN = "acs:ram::1234567890123456:role/weknora-readonly"
 	require.NoError(t, role.ValidateForProvider("oss"))
 
 	missingRole := base

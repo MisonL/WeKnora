@@ -25,6 +25,7 @@
 </p>
 
 <p align="center">
+  <a href="#分叉改动">分叉改动</a> ·
   <a href="#项目介绍">项目介绍</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#最新更新">最新更新</a> ·
@@ -37,6 +38,52 @@
 <p align="center">
   <a href="https://trendshift.io/repositories/15289"><img src="https://trendshift.io/api/badge/repositories/15289" alt="Tencent/WeKnora | Trendshift" width="220" height="48"/></a>
 </p>
+
+## 分叉改动
+
+本仓库是 [Tencent/WeKnora](https://github.com/Tencent/WeKnora) 的分叉。在上游之外，本分叉包含下列改动，以独立分叉方式维护并定期从 `upstream/main` 合并；分支、发布与合并约定见 [FORK.md](./FORK.md)。唯一的边界是：分叉自身的运营标识（主机、账号、桶、角色）不进入代码树，此处列出的内容都是通用的。
+
+### 新增功能
+
+| 功能 | 说明 |
+|---|---|
+| 通过 STS 使用 OSS（`ram_role_arn`） | 阿里云 OSS 凭据改为按实例通过 AssumeRole（`github.com/aliyun/credentials-go`）获取，不再依赖静态 AK。附带启动探针、STS 端点故障期间继续使用有效缓存凭据的退避策略，以及 `GET /system/admin/diagnostics/sts`（认证模式、刷新计数、令牌寿命、最近错误码；仅系统管理员）。 |
+| 存储写入闸门 | `ram_role_arn` 后端只能来自环境配置：不能通过 UI/API 创建或修改，且为只读（fail-closed），避免把某个空间的存储指向任意角色。 |
+| Wiki 定时生成 | 知识库可自行决定 Wiki 生成时机：`on_change`（默认，每篇文档触发一次）、`daily` 或 `weekly`，一天可配置多个时间点。窗口之间解析完成的文档会把摄入操作暂存，在下一个窗口统一消费，不再阻塞队列。已在知识库编辑器、`PUT /initialization/config` 与 `weknora kb schedule` 中开放。 |
+| 软删除墓碑清理 | 巡检现在会物理清理超过保留期的软删除文档（需显式开启 `WEKNORA_TOMBSTONE_RETENTION_DAYS`，`WEKNORA_TOMBSTONE_DRY_RUN` 可先演练），连同其 chunk、chunk 版本、向量、处理 span、队列项与标签关联一并删除。此前每次批量删除都会永久留下残留行。 |
+
+### 修复
+
+| 范围 | 问题与修复 |
+|---|---|
+| AES 密钥校验 | `SYSTEM_AES_KEY` 格式错误时启动曾被放行，导致所有加密列读不出来、所有写入落成明文。现在启动时校验（32 字节 / 64 hex / base64）并拒绝启动。 |
+| IM 渠道凭据 | `im_channels.credentials` 以单个 `enc:v1` 字符串存储，不再保存明文 JSON，并排除在日志之外；写入无法解密的渠道会被拒绝，避免覆盖原密钥仍可恢复的密文。 |
+| 无法解密的密文 | 密钥缺失或轮换时，加载路径曾把凭据字段清空并在保存时写回，破坏原密钥仍可恢复的密文。现在保留密文并在重新加密时还原（空间引擎配置、MCP 认证、数据源凭据）。 |
+| 部分更新清空字段 | 多个 PATCH/PUT 处理器解码到无法区分「未传」与「零值」的结构体，改一个字段会重置其余设置。请求类型现在在反序列化时记录字段是否出现，后续校验失败的请求也不例外。 |
+| LLM 重试 | 传输层重试与调用方重试预算相乘（一次瞬时故障触发请求风暴），过长的 `Retry-After` 被完全遵守。现在重试分级且有上限，`Retry-After` 有封顶，自带重试的调用方可关闭传输重试；取消不再上报为失败。 |
+| FAQ 导入导出 | 重试游标使用了会被跳过/合并条目污染的展示计数器，重试时会重放或漏掉一批。运营字段（启用/推荐）会同步，`SourceID` 改为哈希，重复导入更新同一行；失败条目 CSV 下载回退到鉴权的 `/files` 代理。 |
+| IM 问答队列 | 出队请求在 panic 屏障后执行，队列无法核算时 fail-closed；问答调用使用独立超时而非继承请求生命周期；`/search` 限流。 |
+| 检索 | 关闭生成问题后，生成问题行仍会出现在召回里（ParadeDB 的列比较过滤需要关键字形式）。 |
+| Chunk 插入 | 内嵌 `*types.Chunk` 自带的 `Flags` 字段使 GORM 绑定 NULL，绕过 `NOT NULL DEFAULT 1`，导致所有插入失败。 |
+| OCR 预算 | 密集页面在 5000 token 的 caption 预算处截断后整页丢弃。预算可配置（`OCR_MAX_TOKENS`，默认 16000），到预算时返回可用前缀，空表格单元的解码死循环会拒绝入库。 |
+| 数据库连接池 | 未设 `DB_MAX_OPEN_CONNS` 时使用 `database/sql` 的无上限默认值，并发突增会打开大量连接直到 Postgres 拒绝。现在默认上限 20，显式设置仍优先。 |
+
+### 构建、CI 与部署
+
+| 改动 | 原因 |
+|---|---|
+| 默认使用阿里云镜像源 | Go、apt、npm、pip 默认走国内镜像源，裸 `docker build` 无需额外参数；均可通过同名环境变量覆盖。 |
+| anydoc LTO 剥离 | 新版 rustc 在静态库中嵌入 Go 无法链接的 LLVM LTO 段；构建时会剥离，且缺失时直接报错而非警告后继续。 |
+| docreader CI | 运行镜像固定到 Playwright 支持的版本，解释器由 `uv` 安装。 |
+| 部署模板 | `deploy/nora/`：面向慢链路主机的增量镜像发布脚本（`build-delta.sh`）、始终加载分叉 compose 覆盖层的生产包装脚本（`nora-up.sh`）、预发布排练覆盖层模板。app、UI、docreader 镜像各有独立的 tag 变量（`NORA_IMAGE_TAG`、`NORA_UI_IMAGE_TAG`、`DOCREADER_IMAGE`）。 |
+
+### 分叉带来的行为差异
+
+- AES 密钥是启动的硬性条件；空值或格式错误是启动错误，而不是静默降级。
+- OSS `ram_role_arn` 后端无法从 UI 创建，必须存在于环境配置中。
+- 设置了定时计划后，Wiki 生成不再跟随每篇文档——以计划为准。
+
+以下上游章节描述的是项目整体，本分叉未做改动。
 
 ## 项目介绍
 
