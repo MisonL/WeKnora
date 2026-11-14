@@ -7,9 +7,21 @@ services:
   # The tag must carry the release sequence (rN): the image is rebuilt per
   # release and only the tagged build is what production actually runs.
   # Override NORA_IMAGE_TAG in /opt/nora/.env to pin a different build.
+  #
+  # The UI moves on its own cadence and shares only the release sequence, so it
+  # gets its own override: before this existed, bumping NORA_IMAGE_TAG for an
+  # app-only release made compose try to pull a weknora-ui:<tag> that was never
+  # built, and the recreate failed with "image not found".
   app:
     image: weknora-app:${NORA_IMAGE_TAG:-v0.9.0-oss-sts-r9}
     pull_policy: never
   frontend:
-    image: weknora-ui:${NORA_IMAGE_TAG:-v0.9.0-oss-sts-r9}
+    image: weknora-ui:${NORA_UI_IMAGE_TAG:-${NORA_IMAGE_TAG:-v0.9.0-oss-sts-r9}}
+    pull_policy: never
+  # Production runs docreader under its own "v0.9.0" tag, not NORA_IMAGE_TAG.
+  # The base compose leaves it on :latest, so without this pin a host without
+  # egress to the registry (pull_policy: never) fails to render the stack at
+  # all. Override DOCREADER_IMAGE in /opt/nora/.env to change it.
+  docreader:
+    image: ${DOCREADER_IMAGE:-docker.m.daocloud.io/wechatopenai/weknora-docreader:v0.9.0}
     pull_policy: never

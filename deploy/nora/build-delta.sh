@@ -18,6 +18,15 @@
 # The base image must exist on the target host under the same tag. Paths that
 # differ are detected by size+sha256; only those are shipped.
 #
+# Do NOT chain releases through this script: each result is the previous tag
+# plus one more copy of the binary (~290MB), so a few deltas in a row dwarf the
+# rollback-image budget (r17 had reached 3.98GB). Build the release locally with
+# `docker build`, then run this once against the ssh host so the whole binary
+# replaces the base copy; keep only the newest result and drop older tags.
+#
+# The pre-checks copy both images' complete file lists out with `docker cp`
+# before deciding, so the local disk needs roughly twice the image size free.
+#
 # The overlay is additive — FROM base + COPY, which merges directories and never
 # deletes — so the script refuses (exit 3) unless the two images differ only in
 # file *contents* inside PATHS:

@@ -95,6 +95,10 @@ git config merge.conflictstyle zdiff3  # 冲突块带公共祖先，便于分辨
 
 增量发布用 `deploy/nora/build-delta.sh`：只传与目标机已有镜像不同的文件，在目标机上用 `FROM` + `COPY` 组装，避免通过慢链路搬 2.45 GB。生产回滚镜像的保留策略见 [[nora-image-rotation-policy]]。
 
+**不要连续用增量镜像发布。** delta 镜像基于上一个 r 叠加，每发一版就把整个二进制（~290MB）再加一层，r17 时已 3.98GB，几轮就会挤占回滚镜像的磁盘预算。正确做法是「本机 `docker build` 全量重建（必要时先 `go clean -cache`）→ 用 build-delta 把**整份二进制**覆盖到主机上的新 tag（例如 `rN-full`）→ 只保留最新一份，旧的 `rmi`」。`docker-compose.app-oss.yml` 里 app、frontend、docreader 三个镜像各自独立可覆盖：`NORA_IMAGE_TAG`、`NORA_UI_IMAGE_TAG`、`DOCREADER_IMAGE`。docreader 必须钉死——base compose 是 `:latest` 且 `pull_policy: never`，主机没有外网拉取时整个栈会渲染失败。`build-delta.sh` 会先给新旧镜像各做一份完整文件清单并比对，旧镜像里多出的文件会被 `docker cp` 到临时目录，本地磁盘需预留约 2 GB。
+
+**预发布环境用完即拆。** `/opt/nora-stg` 的排练栈不许常驻：它会和生产在 2C4G 上抢内存（2026-11-14 曾因此触发内核 OOM，杀掉 docreader 的 python 进程）。排练结束执行 `docker compose -p nora-stg … down -v`，容器、网络、卷和只被它引用的镜像一起清掉；演示用的 overlay 文件按 `deploy/nora/docker-compose.staging.yml` 头的注释重建。
+
 ## 五、验证清单
 
 合并、rebase 或压缩历史后必跑：
@@ -142,6 +146,7 @@ git worktree remove --force /tmp/nora-baseline
 3. **`im_channels.credentials` 整列加密**（`internal/im/credentials_crypto.go`）——对应 [[weknora-im-credentials-encrypted]]。回滚旧镜像前必须先还原明文行。
 4. **`PUT /initialization/config` 的 presence-aware 合并**——上游已原生实现，我们只保留 `initialization_partial_test.go` 的 11 场景作为契约；上游若改动这块，以测试为准。
 5. **部署脚本 `deploy/nora/`**（build-delta 增量发布、staging overlay、`nora-up.sh` 强制带 `-f` 加载 override）。
+6. **软删除墓碑清理**（`service/knowledge_tombstone.go`，housekeeping 的 Sweep E）：上游从不物理清理 `deleted_at` 行。用 `WEKNORA_TOMBSTONE_RETENTION_DAYS` 显式开启，清理 `knowledges` 及其 chunk、chunk 版本、向量、处理 span、队列项与标签关联；`WEKNORA_TOMBSTONE_DRY_RUN` 只统计不删除。上游若自带同类实现，以行为等价为准，勿两套并行。
 
 ## 七、合并陷阱（已踩过的坑）
 

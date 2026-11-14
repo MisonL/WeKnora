@@ -337,6 +337,10 @@ func (h *HousekeepingService) runSweep(ctx context.Context) {
 	}
 	// Sweep D: terminal rows still carrying open spans.
 	h.reapTerminalSpans(ctx)
+
+	// Sweep E: soft-deleted documents past retention. Opt-in via
+	// WEKNORA_TOMBSTONE_RETENTION_DAYS; no-op otherwise and in dry-run mode.
+	h.purgeTombstones(ctx)
 }
 
 // wikiHoldLimit bounds how long a durable Wiki ingest op keeps its row out of
