@@ -30,7 +30,7 @@ git branch -d nora/<topic>
 
 | tag | 内容 |
 |---|---|
-| `nora-v0.9.0-r9` | 生产在用镜像对应的源码（`ba7d26394`），**不要删** |
+| `nora-v0.9.0-r9` | r9 镜像对应的源码（`ba7d26394`）。已不是生产版本（生产为 r17），作为该版源码的锚点保留 |
 | `pre-rewrite-main-20261112` | 2026-11-12 压缩历史前的 `main`（`1a498bf3c`），已推到 origin |
 | `pre-squash-stash-2026*`（3 个） | 压缩前工作树里三个 WIP 快照，仅本地，排查旧思路时用 |
 | `nora-{faq-csv-fix,security-aes,sts-core}-2026*` | 11-05/11-06 各特性分支删除前的备份 |
