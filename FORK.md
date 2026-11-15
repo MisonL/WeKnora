@@ -8,7 +8,7 @@
 | 位置 | 用途 |
 |---|---|
 | `/Volumes/Work/code/WeKnora` | **唯一工作树**，停在 `main` |
-| `origin` = `github.com/MisonL/WeKnora` | 自己的 fork（public），远端有 `main`、历史遗留的 `nora/sts` 与发布 tag |
+| `origin` = `github.com/MisonL/WeKnora` | 自己的 fork（public），远端只有 `main` 和发布/留档 tag（`nora/sts` 已于 2026-11-14 删除） |
 | `upstream` = `github.com/Tencent/WeKnora` | 上游 |
 
 **单一工作区**：不使用 linked worktree。需要隔离时临时开分支：
@@ -34,6 +34,7 @@ git branch -d nora/<topic>
 | `pre-rewrite-main-20261112` | 2026-11-12 压缩历史前的 `main`（`1a498bf3c`），已推到 origin |
 | `pre-squash-stash-2026*`（3 个） | 压缩前工作树里三个 WIP 快照，仅本地，排查旧思路时用 |
 | `nora-{faq-csv-fix,security-aes,sts-core}-2026*` | 11-05/11-06 各特性分支删除前的备份 |
+| `nora-archive-nora-sts-20261110` | 已删除的 `nora/sts` 分支头（`61cb3dce3`）。该分支 11-10 已合入 `main`，之后不再提交，`main` 是其超集；保留 tag 只为让旧历史仍可追溯 |
 
 ## 二、提交规范
 
