@@ -4,6 +4,7 @@ import { generateRandomString, MAX_FILE_SIZE_MB, MAX_SKILL_BUNDLE_SIZE_MB } from
 import i18n from '@/i18n'
 import { getApiBaseUrl } from './api-base';
 import { isSkillBundleUploadUrl } from './uploadLimit';
+import { structuredServerError } from './requestError';
 import { isTimeoutError, uploadTimeoutMs } from './requestTimeouts';
 import {
   forceReloginRedirect,
@@ -196,6 +197,19 @@ instance.interceptors.response.use(
     // 处理 Nginx 413 Request Entity Too Large
     const ERR_ENTITY_TOO_LARGE = 413;
     if (error.response.status === ERR_ENTITY_TOO_LARGE) {
+      const data = error.response.data;
+      // The app's own 413 (FAQ and other JSON routes, code 1011) names the
+      // limit it applied and carries details. Replacing that with the proxy's
+      // file-size guess would tell the user to shrink a file that is not a
+      // file. Only a body without the envelope is treated as a proxy refusal.
+      const structured = structuredServerError(data);
+      if (structured) {
+        return Promise.reject(withHttpStatus({
+          status: ERR_ENTITY_TOO_LARGE,
+          message: structured.message,
+          ...(typeof data === 'object' ? data : {})
+        }, ERR_ENTITY_TOO_LARGE));
+      }
       const skillUpload = isSkillBundleUploadUrl(error.config?.url)
       return Promise.reject(withHttpStatus({
         status: ERR_ENTITY_TOO_LARGE,
@@ -222,10 +236,17 @@ instance.interceptors.response.use(
     } else if (typeof data === 'string') {
       errorMessage = data;
     }
+    // Retry-After is carried as a number of seconds so the upload queue can
+    // space its retries on the server's own estimate instead of a fixed guess.
+    const retryAfterRaw = error.response?.headers?.['retry-after'];
+    const retryAfter = typeof retryAfterRaw === 'string' && /^\d+$/.test(retryAfterRaw.trim())
+      ? Number(retryAfterRaw.trim())
+      : undefined;
     return Promise.reject(withHttpStatus({
       status,
       message: errorMessage,
-      ...(typeof data === 'object' ? data : {}) 
+      ...(retryAfter !== undefined ? { retryAfter } : {}),
+      ...(typeof data === 'object' ? data : {})
     }, status));
   }
 );

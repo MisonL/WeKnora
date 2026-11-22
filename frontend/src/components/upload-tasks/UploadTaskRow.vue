@@ -32,6 +32,11 @@ const action = computed<RowAction | null>(() => {
       return null
     case 'failed':
     case 'cancelled':
+      // A stored-but-unqueued row re-uploads nothing: the file is already there
+      // and the row is marked failed, so the duplicate check would let the same
+      // bytes in again as a second document. Send the user to the existing row,
+      // where "reparse" is the fix.
+      if (item.stored) return item.knowledgeId ? 'open' : null
       if (item.transfer === 'failed' || item.transfer === 'cancelled') return 'retry'
       return item.knowledgeId && item.parseStatus !== 'deleted' ? 'open' : null
     default:
@@ -65,7 +70,9 @@ const meta = computed(() => {
     case 'ready':
       return t(item.parseStatus === 'finalizing' ? 'uploadTasks.phaseFinalizing' : 'uploadTasks.phaseReady')
     case 'failed': {
-      const label = t(item.transfer === 'failed' ? 'uploadTasks.phaseUploadFailed' : 'uploadTasks.phaseParseFailed')
+      const label = t(item.stored
+        ? 'uploadTasks.phaseStored'
+        : item.transfer === 'failed' ? 'uploadTasks.phaseUploadFailed' : 'uploadTasks.phaseParseFailed')
       return reason.value ? `${label} · ${reason.value}` : label
     }
     case 'duplicate':

@@ -48,6 +48,8 @@ export interface TransferEnd {
 export interface Timers {
   setTimer: (fn: () => void, ms: number) => unknown
   clearTimer: (handle: unknown) => void
+  /** Injectable clock, for tests that need time to pass. Defaults to Date.now. */
+  now?: () => number
 }
 
 export const defaultTimers: Timers = {
@@ -86,11 +88,19 @@ export interface UploadQueueDeps {
  */
 const MISSING_POLLS_BEFORE_DELETED = 3
 
+/** Attempts a 429-refused upload gets before it is shown as failed. */
+const BUSY_RETRIES = 5
+/** Gap before a 429-refused upload is offered to the queue again. */
+const BUSY_RETRY_DELAY_MS = 2000
+/** Upper bound on a single 429 backoff, whatever the header said. */
+const BUSY_MAX_RETRY_DELAY_MS = 60 * 1000
+
 let idSeq = 0
 const nextId = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${(idSeq++).toString(36)}`
 
 export function createUploadQueue(items: UploadItem[], batches: UploadBatch[], deps: UploadQueueDeps) {
   const { setTimer, clearTimer } = deps.timers ?? defaultTimers
+  const now = deps.timers?.now ?? (() => Date.now())
 
   // File payloads and abort handles stay out of the (possibly reactive) items:
   // proxying a File buys nothing and the panel never renders them.
@@ -102,6 +112,15 @@ export function createUploadQueue(items: UploadItem[], batches: UploadBatch[], d
   let pollTimer: unknown = null
 
   const batchOf = (item: UploadItem) => batches.find(batch => batch.id === item.batchId)
+
+  // A 429 hands the file back to the queue instead of failing it. The server
+  // admits a limited number of uploads at once; a caller that treats the
+  // refusal as a failure shows an error for a file that would have gone
+  // through moments later. Entries mark files that are waiting out a backoff;
+  // attempts keeps the total bounded so a server that stays full eventually
+  // shows the failure instead of holding the file forever.
+  const busyRetries = new Set<string>()
+  const busyAttempts = new Map<string, number>()
   const findItem = (id: string) => items.find(item => item.id === id)
 
   const isBusy = (kbId: string) => items.some(item =>
@@ -114,8 +133,54 @@ export function createUploadQueue(items: UploadItem[], batches: UploadBatch[], d
   // which only sees rows already written, catch the second copy.
   const dedupKey = (item: UploadItem) => `${batchOf(item)?.kbId}:${item.size}`
 
+  // Mirrors the server's UPLOAD_BIG_BYTES default: a file this size or larger
+  // is admitted only on its own, so the queue runs one at a time. A deployment
+  // that raises the server knob simply gets the 429 path it already handles.
+  const uploadBigBytes = 32 << 20
+
+  // One timer for the whole queue: the attempt that already runs at the end of
+  // the backoff pumps every waiting item, so N refused files do not each arm
+  // their own timer. Kept out of the poll timer, which only runs while rows
+  // are parsing.
+  let busyRetryTimer: unknown = null
+  // When the armed timer is due. A later refusal is counted from the moment it
+  // arrives, not from when the timer was armed: a hint that lands near the end
+  // of the window still has to wait its full length, or the file is retried
+  // before the server said to, spends one of its attempts on a queue that is
+  // still full, and can fail for a reason the hint already predicted.
+  let busyRetryDueAt = 0
+  // A server that states how long to wait gets that wait; the default is for
+  // the 429s that carry no hint. Clamped so a misconfigured or hostile header
+  // cannot park a file for an hour.
+  const clampBusyDelay = (ms: number) => Math.min(Math.max(ms, BUSY_RETRY_DELAY_MS), BUSY_MAX_RETRY_DELAY_MS)
+  const scheduleBusyRetry = (delayMs = BUSY_RETRY_DELAY_MS) => {
+    const dueAt = now() + clampBusyDelay(delayMs)
+    if (busyRetryTimer !== null) {
+      if (dueAt <= busyRetryDueAt) return
+      clearTimer(busyRetryTimer)
+    }
+    busyRetryDueAt = dueAt
+    busyRetryTimer = setTimer(() => {
+      busyRetryTimer = null
+      busyRetryDueAt = 0
+      // The backoff has passed for every refused file, so they are eligible
+      // again and the attempt itself clears the mark.
+      busyRetries.clear()
+      pump()
+    }, Math.max(0, dueAt - now()))
+  }
+
+  // Files waiting out a 429 backoff are never eligible: starting one early is
+  // exactly what the refusal asked not to happen.
+  //
+  // Nothing starts while the window is open, not only the refused files: a file
+  // added or retried mid-window would otherwise send at once and collect the
+  // same refusal. The timer clears the marks before it pumps, so a backoff that
+  // has passed still starts.
   const pump = () => {
-    for (const item of pickNextToStart(items, deps.concurrency, dedupKey)) void transfer(item)
+    if (busyRetryTimer !== null && now() < busyRetryDueAt) return
+    const eligible = items.filter(item => !busyRetries.has(item.id))
+    for (const item of pickNextToStart(eligible, deps.concurrency, dedupKey, uploadBigBytes)) void transfer(item)
   }
 
   const transfer = async (item: UploadItem) => {
@@ -156,6 +221,9 @@ export function createUploadQueue(items: UploadItem[], batches: UploadBatch[], d
     }
     if (!latestAttempt) return
 
+    // A stored-but-unqueued upload still created a row, so the document list
+    // needs the same refresh an ordinary upload triggers.
+    let rowCreated = false
     if (aborted || item.transfer !== 'uploading') {
       // Cancelled mid-flight; the abort rejection carries nothing worth showing.
       if (item.transfer === 'uploading') item.transfer = 'cancelled'
@@ -172,12 +240,37 @@ export function createUploadQueue(items: UploadItem[], batches: UploadBatch[], d
         item.transfer = 'duplicate'
         item.knowledgeId = outcome.knowledgeId
         payloads.delete(item.id)
+      } else if (outcome.kind === 'busy' && (busyAttempts.get(item.id) ?? 0) < BUSY_RETRIES) {
+        busyAttempts.set(item.id, (busyAttempts.get(item.id) ?? 0) + 1)
+        busyRetries.add(item.id)
+        item.transfer = 'queued'
+        item.loaded = 0
+        scheduleBusyRetry(outcome.retryAfterMs)
+      } else if (outcome.kind === 'stored') {
+        // The bytes are safely stored; only the parse job is missing. Show it
+        // as a failed transfer so it is not silently counted as uploaded, but
+        // keep the row id: the stored row is already marked failed, and failed
+        // rows do not block the duplicate check -- re-uploading would create a
+        // second row for the same bytes. The document list is where the
+        // reparse happens.
+        item.transfer = 'failed'
+        item.stored = true
+        item.knowledgeId = outcome.knowledgeId
+        item.error = outcome.message
+        payloads.delete(item.id)
+        rowCreated = true
       } else {
         item.transfer = 'failed'
         item.error = outcome.message
       }
     }
-    deps.onTransferEnd(batch.kbId, { uploaded: item.transfer === 'uploaded', settled: !isBusy(batch.kbId) })
+    deps.onTransferEnd(batch.kbId, {
+      uploaded: item.transfer === 'uploaded' || rowCreated,
+      settled: !isBusy(batch.kbId),
+    })
+    // Anything else that is waiting may start now. A file refused with 429 is
+    // already 'queued' but must wait for the backoff: starting it here would
+    // hammer the full server, which is the opposite of what a refusal asks for.
     pump()
   }
 
@@ -229,6 +322,8 @@ export function createUploadQueue(items: UploadItem[], batches: UploadBatch[], d
     item.transfer = 'queued'
     item.loaded = 0
     item.error = undefined
+    busyAttempts.delete(id)
+    busyRetries.delete(id)
     pump()
   }
 
@@ -326,6 +421,15 @@ export function createUploadQueue(items: UploadItem[], batches: UploadBatch[], d
       clearTimer(pollTimer)
       pollTimer = null
     }
+    // A pending busy timer would fire against the next queue and clear marks
+    // that no longer exist; the per-file backoff state would outlive its files.
+    if (busyRetryTimer !== null) {
+      clearTimer(busyRetryTimer)
+      busyRetryTimer = null
+    }
+    busyRetryDueAt = 0
+    busyRetries.clear()
+    busyAttempts.clear()
     // Files that landed before the clear may still be waiting for a refresh.
     for (const kbId of busyKbs) deps.onTransferEnd(kbId, { uploaded: false, settled: true })
   }

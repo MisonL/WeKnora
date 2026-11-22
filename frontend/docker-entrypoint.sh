@@ -9,6 +9,34 @@ esac
 # 生成运行时配置文件，注入环境变量到前端
 FILE_MB=${MAX_FILE_SIZE_MB:-50}
 SKILL_MB=${MAX_SKILL_BUNDLE_SIZE_MB:-256}
+# FAQ 单次导入条数上限，与后端 WEKNORA_FAQ_IMPORT_MAX_ENTRIES 对齐。
+#
+# 支持的输入范围：可选的 "+"、十进制数字、首尾的 ASCII 空白（空格/Tab/CR/LF），
+# 允许前导零。这是管理员在部署配置里实际会写的形状。
+#
+# 为什么必须规范化：config.js 是普通脚本，"01000" 在那里是八进制 512；
+# " 2000 " / "+2000" 在 shell 里被拒会回落 1000。两边一旦不一致，前端会拦住
+# 后端本来允许的请求。
+#
+# 已知且刻意不处理：Unicode 空白（如 U+00A0、垂直制表符）在 shell 的 [[:space:]]
+# 里不算空白，后端 TrimSpace 却会去掉，结果前端回落 1000、后端按实际数字生效。
+# 这类输入只可能来自手写配置错误，误差在 1000 量级，不会放大后端的条数上限，
+# 因此不为它引入完整的 unicode.IsSpace 复刻。中间夹空白的 "20 00" 两边都已
+# 回落 1000，不再有差异。
+trim_ws() {
+  # Only trim the ends: stripping inner whitespace is what turns a typo like
+  # "20 00" into a value the server will not accept.
+  printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+FAQ_ENTRIES=$(trim_ws "${WEKNORA_FAQ_IMPORT_MAX_ENTRIES:-}")
+FAQ_ENTRIES=${FAQ_ENTRIES#+}
+case "$FAQ_ENTRIES" in
+  ''|*[!0-9]*) FAQ_ENTRIES=1000 ;;
+esac
+# 去掉前导零（"01000" -> "1000"），避免被 JS 当成八进制。
+FAQ_ENTRIES=$(printf '%s' "$FAQ_ENTRIES" | sed 's/^0*//')
+[ -n "$FAQ_ENTRIES" ] || FAQ_ENTRIES=0
+[ "$FAQ_ENTRIES" -gt 0 ] 2>/dev/null || FAQ_ENTRIES=1000
 if [ "$SKILL_MB" -lt "$FILE_MB" ] 2>/dev/null; then
   SKILL_MB=$FILE_MB
 fi
@@ -20,6 +48,7 @@ cat > /usr/share/nginx/html/config.js << EOF
 window.__RUNTIME_CONFIG__ = {
   MAX_FILE_SIZE_MB: ${FILE_MB},
   MAX_SKILL_BUNDLE_SIZE_MB: ${SKILL_MB},
+  FAQ_IMPORT_MAX_ENTRIES: ${FAQ_ENTRIES},
   DEFAULT_LOCALE: "${RUNTIME_DEFAULT_LOCALE}"
 };
 EOF

@@ -25,6 +25,15 @@ export interface UploadItem {
   /** Backend parse_status once uploaded; 'deleted' when the row disappeared. */
   parseStatus?: string
   parseError?: string
+  /**
+   * The bytes reached the server and the row exists, but no parse job could be
+   * queued (503 / code 2500). Such an item is shown as failed yet is not
+   * retryable by re-uploading: the row was marked failed, and failed rows are
+   * exempt from the duplicate check, so the retry would store the same bytes a
+   * second time and leave two rows. The existing row is the thing to reparse,
+   * which is why the panel opens the document instead.
+   */
+  stored?: boolean
 }
 
 /**
@@ -164,7 +173,9 @@ export function summarizeItems(items: readonly UploadItem[]): UploadSummary {
       summary.sentBytes += Math.min(item.loaded, item.size)
     }
     if (item.transfer === 'uploaded') summary.uploaded++
-    if (item.transfer === 'failed') summary.retryable++
+    // A stored-but-unqueued row cannot be retried by uploading again, so it
+    // must not inflate the "retry N failed" count.
+    if (item.transfer === 'failed' && !item.stored) summary.retryable++
   }
 
   if (summary.waiting + summary.uploading > 0) summary.stage = 'uploading'
@@ -186,23 +197,35 @@ export function summarizeItems(items: readonly UploadItem[]): UploadSummary {
  * Queued items to start now so that no more than `concurrency` transfers run
  * at once. Items sharing a `conflictKey` with a running or just-picked item
  * wait their turn, and the next free slot goes to a later item instead.
+ *
+ * Only one item at or above `bigBytes` is in flight at a time: the server
+ * admits a single big upload regardless of the total, so starting a second one
+ * is a 429 the queue could have avoided (and one of the file's retry attempts
+ * spent on it). Infinity disables the rule.
  */
 export function pickNextToStart<T extends UploadItem>(
   items: readonly T[],
   concurrency: number,
   conflictKey?: (item: T) => string,
+  bigBytes = Infinity,
 ): T[] {
   let running = 0
+  let bigRunning = false
   const busyKeys = new Set<string>()
   for (const item of items) {
     if (item.transfer !== 'uploading') continue
     running++
+    if (item.size >= bigBytes) bigRunning = true
     if (conflictKey) busyKeys.add(conflictKey(item))
   }
   const picked: T[] = []
   for (const item of items) {
     if (running >= concurrency) break
     if (item.transfer !== 'queued') continue
+    if (item.size >= bigBytes) {
+      if (bigRunning) continue
+      bigRunning = true
+    }
     const key = conflictKey?.(item)
     if (key !== undefined) {
       if (busyKeys.has(key)) continue
@@ -217,7 +240,16 @@ export function pickNextToStart<T extends UploadItem>(
 export type UploadOutcome =
   | { kind: 'uploaded'; knowledgeId?: string; parseStatus?: string }
   | { kind: 'duplicate'; knowledgeId?: string; message?: string }
+  // busy: the server's upload admission was full (429), so the same file will
+  // go through shortly and the queue offers it again instead of failing it.
+  // retryAfterMs is the server's Retry-After, in milliseconds.
+  | { kind: 'busy'; message?: string; retryAfterMs?: number }
   | { kind: 'failed'; message?: string }
+  // stored: the file reached the server and its row exists, but no parse job
+  // could be queued (HTTP 503, code 2500). Retrying the upload is the wrong
+  // move -- the file is already there -- so the panel keeps the row id and
+  // tells the user to reparse instead. knowledgeId is what makes that possible.
+  | { kind: 'stored'; knowledgeId?: string; message?: string }
 
 /**
  * Classify a resolved or rejected upload call. request.ts rejects non-2xx
@@ -231,6 +263,29 @@ export function classifyUploadResult(result: any): UploadOutcome {
   }
   if (result?.success === true) {
     return { kind: 'uploaded', knowledgeId: result?.data?.id, parseStatus: result?.data?.parse_status }
+  }
+  if (result?.status === 429) {
+    // A 429 that names the row is the parse-work budget refusing the job after
+    // the file was already stored. Retrying it re-uploads the bytes as a
+    // second row (failed rows are exempt from the duplicate check), so it is
+    // treated like the stored 503. Only a 429 with no row is the admission
+    // gate, which is safe to wait on and retry.
+    const storedId = result?.details?.knowledge_id ?? result?.error?.details?.knowledge_id
+    if (storedId) {
+      return { kind: 'stored', knowledgeId: storedId, message: result?.error?.message || result?.message }
+    }
+    const seconds = typeof result?.retryAfter === 'number' ? result.retryAfter : 0
+    return { kind: 'busy', message: result?.error?.message || result?.message, retryAfterMs: seconds * 1000 }
+  }
+  // The upload was stored and only its parse job is missing. Checked before the
+  // generic failure branch so the panel does not offer a re-upload that would
+  // hit the duplicate check.
+  if (result?.status === 503 && code === 2500) {
+    return {
+      kind: 'stored',
+      knowledgeId: result?.details?.knowledge_id ?? result?.error?.details?.knowledge_id,
+      message: result?.error?.message || result?.message,
+    }
   }
   return { kind: 'failed', message: result?.error?.message || result?.message }
 }

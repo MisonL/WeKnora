@@ -317,3 +317,151 @@ test('list refresh throttle: mid-batch at most once per interval, one final refr
   clock.runAll()
   assert.equal(emitted.length, 3)
 })
+
+test('a 429 hands the file back to the queue instead of failing it', async () => {
+  const { calls, clock, queue, batch, byName } = setup({ concurrency: 1 })
+  queue.add(batch(), [{ file: file('a', 100) }])
+  calls[0].reject({ status: 429, success: false, error: { code: 1006, message: 'busy' } })
+  await flush()
+
+  assert.equal(byName('a').transfer, 'queued')
+  assert.equal(calls.length, 1, 'the retry waits for the backoff, not for the next pump')
+  clock.runAll()
+  assert.equal(calls.length, 2, 'the file is offered again after the backoff')
+
+  calls[1].resolve({ success: true, data: { id: 'k-a' } })
+  await flush()
+  assert.equal(byName('a').transfer, 'uploaded')
+})
+
+test('a server that stays busy eventually shows the failure, and retry starts over', async () => {
+  const { calls, clock, queue, batch, byName } = setup({ concurrency: 1 })
+  queue.add(batch(), [{ file: file('a', 100) }])
+  for (let i = 0; i < 6; i++) {
+    calls[i].reject({ status: 429, success: false, error: { code: 1006, message: 'busy' } })
+    await flush()
+    clock.runAll()
+  }
+  assert.equal(byName('a').transfer, 'failed')
+  assert.equal(calls.length, 6)
+
+  queue.retry(byName('a').id)
+  assert.equal(calls.length, 7, 'a manual retry is not blocked by the spent attempts')
+})
+
+test('a file refused at the same moment another finishes still waits out its backoff', async () => {
+  const { calls, clock, queue, batch, byName } = setup({ concurrency: 2 })
+  queue.add(batch(), [{ file: file('a', 1) }, { file: file('b', 2) }])
+  calls[0].reject({ status: 429, success: false, error: { code: 1006, message: 'busy' } })
+  calls[1].resolve({ success: true, data: { id: 'k-b' } })
+  await flush()
+
+  assert.equal(byName('a').transfer, 'queued')
+  assert.equal(calls.length, 2, 'the free slot must not restart the refused file before its backoff')
+  clock.runAll()
+  assert.equal(calls.length, 3)
+  assert.equal(calls[2].payload.file.name, 'a')
+})
+
+test('a 429 that states Retry-After waits that long, within limits', async () => {
+  const { calls, clock, queue, batch, byName } = setup({ concurrency: 1 })
+  queue.add(batch(), [{ file: file('a', 100) }, { file: file('b', 200) }])
+  calls[0].reject({ status: 429, success: false, retryAfter: 5, error: { code: 1006, message: 'busy' } })
+  await flush()
+  assert.equal(byName('a').transfer, 'queued')
+  const delays = [...clock.pending].map(t => t.ms)
+  assert.ok(delays.includes(5000), `expected a 5s timer, got ${delays}`)
+
+  // A hostile or misconfigured header cannot park the file for an hour.
+  clock.runAll() // the first backoff ends; b may start now
+  assert.equal(calls.length, 2)
+  calls[1].reject({ status: 429, success: false, retryAfter: 999999, error: { code: 1006, message: 'busy' } })
+  await flush()
+  const after = [...clock.pending].map(t => t.ms)
+  assert.ok(after.every(ms => ms <= 60000), `delays must stay bounded, got ${after}`)
+})
+
+// While the server has said "wait", a new file must not start either. It is
+// not the refused file, but sending it now collects the same 429.
+test('a file added during a backoff window waits for the window', async () => {
+  const { calls, clock, queue, batch } = setup({ concurrency: 2 })
+  queue.add(batch(), [{ file: file('a', 100) }])
+  calls[0].reject({ status: 429, success: false, retryAfter: 5, error: { code: 1006, message: 'busy' } })
+  await flush()
+
+  queue.add(batch(), [{ file: file('late', 300) }])
+  assert.equal(calls.length, 1, 'the window blocks every start, not only the refused file')
+
+  clock.runAll()
+  assert.deepEqual(calls.map(c => c.payload.file.name), ['a', 'a', 'late'],
+    'the window ends by offering the refused file and the new one')
+})
+
+// The server stored the file but could not queue its parse job (503 / 2500).
+// The row exists (and is marked failed, which the duplicate check exempts), so
+// the panel must keep its id and must not offer the file for another upload --
+// that attempt would store the same bytes as a second document.
+test('a stored-but-unqueued upload keeps its row and is not retried as a re-upload', async () => {
+  const { calls, ends, queue, batch, byName } = setup()
+  queue.add(batch(), [{ file: file('manual', 1) }])
+
+  calls[0].reject({
+    status: 503,
+    success: false,
+    error: {
+      code: 2500,
+      message: '文件已保存，但解析任务未能入队，请稍后重新解析',
+      details: { knowledge_id: 'kn-9', title: 'manual', parse_status: 'failed' },
+    },
+  })
+  await flush()
+
+  assert.equal(byName('manual').transfer, 'failed')
+  assert.equal(byName('manual').stored, true, 'the row is marked stored so the panel offers reparse, not retry')
+  assert.equal(byName('manual').knowledgeId, 'kn-9', 'the stored row id must survive the failure')
+  // "uploaded" here means "the server has a row", which is what the document
+  // list refresh keys on -- the file did reach storage.
+  assert.deepEqual(ends.at(-1), ['kb1', { uploaded: true, settled: true }])
+
+  // The payload is dropped, so a retry cannot re-send the same bytes.
+  queue.retryFailed()
+  assert.equal(calls.length, 1, 'a stored row must not be uploaded again')
+})
+
+// The backoff timer is shared by the whole queue, so the first refusal used to
+// fix the wait for every later one. A later 429 that asks for a longer wait has
+// to replace it: otherwise the file is retried before the server said to,
+// spends an attempt, and can fail while the queue is still full.
+test('a later 429 with a longer Retry-After extends the shared backoff', async () => {
+  const { calls, clock, queue, batch } = setup({ concurrency: 2 })
+  queue.add(batch(), [{ file: file('a', 1) }, { file: file('b', 2) }])
+
+  calls[0].reject({ status: 429, success: false, retryAfter: 5, error: { code: 1006, message: 'busy' } })
+  await flush()
+  assert.deepEqual([...clock.pending].map(t => t.ms), [5000])
+
+  calls[1].reject({ status: 429, success: false, retryAfter: 20, error: { code: 1006, message: 'busy' } })
+  await flush()
+  assert.deepEqual([...clock.pending].map(t => t.ms), [20000],
+    'the longer hint replaces the armed timer instead of being ignored')
+
+  // A shorter hint does not shorten the wait either.
+  clock.runAll()
+  assert.equal(calls.length, 4)
+})
+
+// clear() ends the queue; a timer armed for the old files must not fire into
+// the new one, and the per-file backoff bookkeeping must not outlive them.
+test('clear() cancels a pending busy retry', async () => {
+  const { calls, clock, queue, batch } = setup({ concurrency: 1 })
+  queue.add(batch(), [{ file: file('a', 1) }])
+  calls[0].reject({ status: 429, success: false, retryAfter: 5, error: { code: 1006, message: 'busy' } })
+  await flush()
+  assert.equal(clock.pending.size, 1)
+
+  queue.clear()
+  assert.equal(clock.pending.size, 0, 'the backoff timer belongs to the cleared queue')
+
+  queue.add(batch(), [{ file: file('b', 2) }])
+  assert.equal(calls.length, 2, 'the new file starts immediately')
+})

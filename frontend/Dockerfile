@@ -53,12 +53,17 @@ RUN npm run build
 # ---------------------------------------------------------------------------
 # Stage 2: nginx runtime
 # ---------------------------------------------------------------------------
-# Base image pinned by digest for reproducibility. Do NOT switch back to the
-# floating `nginx:stable-alpine` tag: it drifts with every stable release and a
-# newer Alpine base (3.24+) fails to start on old hosts such as CentOS 7
-# (kernel 3.10 + old libseccomp), which broke v0.7.0. This digest is
-# nginx 1.30.3 / Alpine 3.23.5, the same base as the working v0.6.3 image.
-FROM nginx:1.30.3-alpine@sha256:0d3b80406a13a767339fbe2f41406d6c7da727ab89cf8fae399e81f780f814d1
+# Base image pinned by digest for reproducibility and security. Do NOT switch
+# back to a floating tag, and do not pin an older base than this one: nginx
+# 1.30.7 is the stable release that fixes the "nginx2root" remote code
+# execution cluster (CVE-2026-123007 / -123633 / -123634 / -121810 / -113425,
+# plus every other 2026 advisory up to 1.30.7), so anything earlier is a
+# reachable, unauthenticated RCE on an HTTPS listener. An older Alpine base
+# is not required anymore: the one thing a downgrade bought was CentOS 7 /
+# old-kernel startup, but a maintained kernel and libseccomp start Alpine 3.24
+# without issue (CentOS 7 with kernel 3.10 / libseccomp 2.3 cannot) -- and the
+# build handles multiarch via digest index only.
+FROM nginx:1.30.7-alpine@sha256:bef154735288bc38d99fac41ae63730684bcc661503673a04a0f9bc526ba8598
 
 COPY --from=builder /frontend/dist /usr/share/nginx/html
 

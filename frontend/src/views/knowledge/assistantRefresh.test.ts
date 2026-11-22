@@ -5,6 +5,8 @@ import * as marked from 'marked'
 import * as literalTilde from '../../utils/markedLiteralTilde.ts'
 import * as sorting from '../../utils/resourceSorting.ts'
 import { change, fixture, flush } from '../../test-utils/vueFixture.ts'
+import { stripFormulaMarker } from '../../utils/faqCsvText.ts'
+import { parseBooleanField, spreadsheetEntryFields } from '../../utils/faqSpreadsheet.ts'
 
 test('refreshes data source controls after assistant changes and stops on unmount', async t => {
   const f = fixture(t)
@@ -57,6 +59,11 @@ test('refreshes the FAQ entries and tags once per burst for its own KB only', as
     // these two helpers. They are unused by this test's assertions.
     '@/utils/protectedFileAccess': { buildProtectedFileRequest: () => null },
     '@/utils/protectedResource': { responseFileName: () => 'faq_failed_entries.csv' },
+    // The import guard reads the entry cap from the runtime config through this
+    // helper; only the value matters here, no assertion depends on it.
+    '@/utils': { FAQ_IMPORT_MAX_ENTRIES: 1000 },
+    '@/utils/faqCsvText': { stripFormulaMarker },
+    '@/utils/faqSpreadsheet': { parseBooleanField, spreadsheetEntryFields },
     xlsx: {}, papaparse: {},
   }, { kbId: 'kb' })
   await flush()

@@ -19,8 +19,10 @@ import { summarizeItems, type UploadItem } from './uploadTasksState'
 /**
  * Parallel transfers. The server hashes and stores every file before it
  * answers, so a small number keeps the pipe full without piling work on it.
+ * Kept at or below the server's UPLOAD_MAX_CONCURRENCY (default 2): a third
+ * transfer in flight is refused with 429 rather than waiting its turn.
  */
-const CONCURRENCY = 3
+const CONCURRENCY = 2
 const POLL_INTERVAL_MS = 3000
 /** Keeps the ids=… query string of one status request well under URL length limits. */
 const POLL_CHUNK_SIZE = 40

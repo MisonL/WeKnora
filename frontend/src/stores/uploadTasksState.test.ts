@@ -99,6 +99,18 @@ test('cancelled transfers leave the bar denominator and byte totals', () => {
   assert.equal(summary.bar.ready, 1)
 })
 
+test('a stored row counts as failed but not as retryable', () => {
+  // Its bytes are on the server, so "retry N failed" would queue a second
+  // upload of the same file: the row is marked failed, and failed rows are
+  // exempt from the duplicate check. Reparse is the only way forward.
+  const summary = summarizeItems([
+    item({ transfer: 'failed', stored: true, knowledgeId: 'kn-1' }),
+    item({ transfer: 'failed' }),
+  ])
+  assert.equal(summary.failed, 2)
+  assert.equal(summary.retryable, 1)
+})
+
 test('pickNextToStart fills free slots in queue order', () => {
   const items = [
     item({ transfer: 'uploading' }),
@@ -137,7 +149,51 @@ test('classifyUploadResult reads success, duplicate rejections and failures', ()
     { kind: 'failed', message: 'too large' },
   )
   assert.deepEqual(classifyUploadResult({ message: 'Network error' }), { kind: 'failed', message: 'Network error' })
+  assert.deepEqual(
+    classifyUploadResult({ status: 429, success: false, error: { code: 1006, message: '服务器正在处理其他上传，请稍后重试' } }),
+    { kind: 'busy', message: '服务器正在处理其他上传，请稍后重试', retryAfterMs: 0 },
+  )
+  assert.deepEqual(
+    classifyUploadResult({ status: 429, success: false, retryAfter: 5, error: { code: 1006, message: 'busy' } }),
+    { kind: 'busy', message: 'busy', retryAfterMs: 5000 },
+  )
   assert.deepEqual(classifyUploadResult(undefined), { kind: 'failed', message: undefined })
+})
+
+// A document that was stored but never queued for parsing is its own outcome:
+// re-uploading it would store the same bytes again (failed rows are exempt from
+// the duplicate check), so the panel has to keep the row id and point at a
+// reparse instead.
+test('classifyUploadResult marks a stored-but-unqueued upload as stored, not failed', () => {
+  assert.deepEqual(
+    classifyUploadResult({
+      status: 503,
+      success: false,
+      error: {
+        code: 2500,
+        message: '文件已保存，但解析任务未能入队，请稍后重新解析',
+        details: { knowledge_id: 'kn-7', title: 'a.pdf', parse_status: 'failed' },
+      },
+    }),
+    { kind: 'stored', knowledgeId: 'kn-7', message: '文件已保存，但解析任务未能入队，请稍后重新解析' },
+  )
+
+  // A 429 that carries the row is the same "stored, reparse later" case as the
+  // 503: retrying it would store the bytes again.
+  assert.deepEqual(
+    classifyUploadResult({
+      status: 429,
+      success: false,
+      error: { code: 1006, message: '文件已保存，但服务器正在处理的文档较多，暂未开始解析', details: { knowledge_id: 'kn-9' } },
+    }),
+    { kind: 'stored', knowledgeId: 'kn-9', message: '文件已保存，但服务器正在处理的文档较多，暂未开始解析' },
+  )
+
+  // A plain 503 is still a failure: only the typed code means "the row exists".
+  assert.deepEqual(
+    classifyUploadResult({ status: 503, success: false, error: { code: 1008, message: 'down' } }),
+    { kind: 'failed', message: 'down' },
+  )
 })
 
 test('estimateRate waits for a one second window and ignores stale samples', () => {
@@ -160,4 +216,24 @@ test('remaining time is rounded into a stable unit', () => {
   assert.deepEqual(splitDuration(57), { unit: 'minutes', value: 1 })
   assert.deepEqual(splitDuration(610), { unit: 'minutes', value: 11 })
   assert.deepEqual(splitDuration(5400), { unit: 'hours', value: 1.5 })
+})
+
+// The server admits at most one upload at or above UPLOAD_BIG_BYTES, so a
+// second big file started beside it is a 429 the queue can avoid -- and it
+// spends one of that file's five busy attempts on a wait it could have skipped.
+test('pickNextToStart runs only one big upload at a time', () => {
+  const big = 40
+  const items = [
+    item({ id: 'big-running', transfer: 'uploading', size: 100 }),
+    item({ id: 'big-queued', size: 100 }),
+    item({ id: 'small', size: 10 }),
+    item({ id: 'big-fits', size: 100 }),
+  ]
+  const picked = pickNextToStart(items, 3, undefined, big).map(i => i.id)
+  assert.deepEqual(picked, ['small'], 'no second big file while one is in flight')
+
+  // With nothing big running, the first big file starts, and the slot it
+  // occupies does not admit the next one.
+  const idle = [item({ id: 'b1', size: 100 }), item({ id: 'b2', size: 100 }), item({ id: 's1', size: 1 })]
+  assert.deepEqual(pickNextToStart(idle, 3, undefined, big).map(i => i.id), ['b1', 's1'])
 })

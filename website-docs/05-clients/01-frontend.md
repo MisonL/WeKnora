@@ -329,7 +329,7 @@ RAG 流水线的可视化进度（`views/chat/components/RagPipelineProgress.vue
 `frontend/Dockerfile`：
 
 - 自 v0.8.2 起为两阶段构建：digest 锁定的 `node:24-bookworm-slim` 以 `$BUILDPLATFORM` 执行 `npm ci` + `npm run build`，再把 `dist/` 拷贝到运行层。构建时不再需要宿主机安装 Node / npm，也无需预先生成 `dist/`（`scripts/build_frontend_dist.sh` 仍供 Lite / 桌面打包使用）；
-- 运行层基础镜像固定为 digest 锁定的 `nginx:1.30.3-alpine`（注释明确禁止改回浮动 tag——更新的 Alpine 3.24+ 在 CentOS 7 旧内核上无法启动，曾导致 v0.7.0 故障）；
+- 运行层基础镜像固定为 digest 锁定的 `nginx:1.30.7-alpine`。不要改回浮动 tag 或降到更老的 digest：1.30.7 是修复「nginx2root」远程代码执行漏洞族（CVE-2026-123007 / -123633 / -123634 / -121810 / -113425）及此前全部 2026 公告的 stable 版本，降级会再次暴露可在 HTTPS 上被未认证远程利用的 RCE；
 - `nginx.conf` 作为模板放入 `/etc/nginx/templates/default.conf.template`；`/api/`、`/mcp/` 与技能上传共用的代理参数在 `nginx-api-proxy.conf`（原样拷贝为 `/etc/nginx/api-proxy.conf`），http 级片段在 `nginx-http.conf`（去掉查询串的 `api_no_query` 日志格式）。暴露 80 端口，入口为 `docker-entrypoint.sh`。
 
 镜像构建参数：

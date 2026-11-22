@@ -64,7 +64,7 @@
                       {{ importResult!.import_mode === 'append' ? $t('faqManager.import.appendMode') :
                         $t('faqManager.import.replaceMode') }}
                     </t-tag>
-                    <t-button v-if="importResult!.failed_entries_url && importResult!.failed_count > 0"
+                    <t-button v-if="canDownloadFailedEntries"
                       variant="text" theme="danger" size="small" class="faq-import-strip__link"
                       @click="downloadFailedEntries">
                       {{ $t('faqManager.import.downloadReasons') }}
@@ -869,10 +869,12 @@
 
 <script setup lang="ts">
 import { useAssistantDataChange } from '@/utils/assistantDataChange'
+import { FAQ_IMPORT_MAX_ENTRIES } from '@/utils'
+import { stripFormulaMarker } from '@/utils/faqCsvText'
 import AssistantActionButton from '@/components/assistant/AssistantActionButton.vue'
 import { ref, reactive, watch, onMounted, computed, nextTick, onUnmounted, h } from 'vue'
 import KnowledgeTagFilter from './KnowledgeTagFilter.vue'
-import { MessagePlugin, Icon as TIcon } from 'tdesign-vue-next'
+import { MessagePlugin, Icon as TIcon, DialogPlugin } from 'tdesign-vue-next'
 import { buildProtectedFileRequest } from '@/utils/protectedFileAccess'
 import { responseFileName } from '@/utils/protectedResource'
 import { useConfirmDelete } from '@/components/settings/useConfirmDelete'
@@ -905,6 +907,7 @@ import KBSwitcherDropdown from '@/components/KBSwitcherDropdown.vue'
 import FAQBatchBar from './FAQBatchBar.vue'
 import KbTagManageDrawer from './KbTagManageDrawer.vue'
 import { useUIStore } from '@/stores/ui'
+import { parseBooleanField, spreadsheetEntryFields } from '@/utils/faqSpreadsheet'
 
 interface FAQEntry {
   id: number
@@ -934,6 +937,7 @@ interface FAQEntryPayload {
   similar_questions: string[]
   negative_questions: string[]
   answers: string[]
+  answer_strategy?: 'all' | 'random'
   tag_id?: number
   tag_name?: string
   is_enabled?: boolean
@@ -1255,6 +1259,16 @@ type FAQImportResultView = {
 const importResult = ref<FAQImportResultView | null>(null)
 const importResultExpanded = ref(false)
 
+// The failed-entries CSV holds partial failures too (the server merges both
+// kinds into one export), so an import whose entries all landed with
+// conflicting questions stripped still has something to download and
+// failed_count alone would hide it.
+const canDownloadFailedEntries = computed(() => {
+  const result = importResult.value
+  if (!result?.failed_entries_url) return false
+  return result.failed_count > 0 || result.partial_failed_count > 0
+})
+
 const showImportResultBadge = computed(() => (
   !!importResult.value
   && importResult.value.display_status === 'open'
@@ -1505,6 +1519,21 @@ const loadEntries = async (append = false) => {
     loading.value = true
     currentPage = 1
     entries.value = []
+    // A non-append refresh resets the selection, so anything restored from the
+    // queue goes back into it first: otherwise an unrelated refresh (a single
+    // deletion, a tag change) silently drops the rows still waiting to be
+    // retried, and a later batch would miss them.
+    // Everything restored from the queue is still unconfirmed: being on
+    // screen only meant it had loaded, never that the batch had reached it.
+    // It goes back into the queue before the selection is cleared, so the
+    // refresh below restores it again. Ids that were deleted in the meantime
+    // are settled by the delete itself, not guessed at here.
+    const requeue = restoredUnconfirmed.value.filter(id => !settledIds.has(id))
+    if (requeue.length > 0) {
+      const queued = pendingRetry.value && pendingRetry.value.kbId === props.kbId ? pendingRetry.value : null
+      recordPendingRetry(props.kbId, [], requeue, queued?.tag ?? undefined)
+    }
+    restoredUnconfirmed.value = []
     selectedRowKeys.value = []
     Object.keys(entryStatusLoading).forEach((key) => {
       delete entryStatusLoading[Number(key)]
@@ -1549,6 +1578,10 @@ const loadEntries = async (append = false) => {
     // 判断是否还有更多数据
     hasMore.value = entries.value.length < (pageData.total || 0)
     currentPage++
+
+    // A batch that left entries unconfirmed keeps them selected as their page
+    // loads, including the page a scroll append brings in.
+    restorePendingRetry()
 
     // 等待 DOM 更新后重新布局
     await nextTick()
@@ -1611,9 +1644,15 @@ const handleCardSelect = (entryId: number, checked: boolean) => {
   }
 }
 
+// Clearing the selection is the operator saying "forget this batch", so it
+// also drops the retry queue: otherwise the next page load would tick the
+// failed entries again, which is the opposite of what was asked.
 const clearFAQSelection = () => {
   if (batchActionLoading.value) return
   selectedRowKeys.value = []
+  pendingRetry.value = null
+  restoredUnconfirmed.value = []
+  settledIds.clear()
 }
 
 const resetEditorForm = () => {
@@ -1728,17 +1767,209 @@ const handleSubmitEntry = async () => {
   }
 }
 
+// Every FAQ batch endpoint accepts at most this many entries per request. The
+// table loads 20 rows per page, but selections accumulate across scroll-loaded
+// pages and are never cleared, so a selection can be larger than one page —
+// batch actions therefore split into chunks instead of letting the server
+// reject the whole request.
+const FAQ_BATCH_CHUNK_SIZE = 20
+
+// forEachFaqChunk runs fn over the selection in server-sized chunks, so one
+// failing chunk does not discard the batches that already succeeded.
+//
+// It also reports which ids failed, because the caller keeps those selected:
+// the partial-failure message tells the user the rest can be retried, and that
+// is only true if the failed entries are still ticked.
+async function forEachFaqChunk(
+  ids: number[],
+  fn: (chunk: number[]) => Promise<unknown>,
+): Promise<{ appliedIds: number[]; failedIds: number[]; firstError: any }> {
+  const appliedIds: number[] = []
+  const failedIds: number[] = []
+  let firstError: any = null
+  for (let i = 0; i < ids.length; i += FAQ_BATCH_CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + FAQ_BATCH_CHUNK_SIZE)
+    try {
+      await fn(chunk)
+      appliedIds.push(...chunk)
+    } catch (error: any) {
+      failedIds.push(...chunk)
+      if (!firstError) firstError = error
+    }
+  }
+  return { appliedIds, failedIds, firstError }
+}
+
+// partialFailureMessage words a chunked batch's outcome. The failed entries
+// stay selected, so the advice to retry them is actionable.
+function partialFailureMessage(appliedIds: number[], failedIds: number[], firstError: any): string {
+  return t('knowledgeEditor.faq.batchPartial', {
+    done: appliedIds.length,
+    failed: failedIds.length,
+    reason: firstError?.message || t('common.operationFailed'),
+  })
+}
+
+// pendingRetry holds the entries a batch left unconfirmed, together with the
+// knowledge base they belong to. loadEntries() resets the selection on every
+// non-append refresh, so writing selectedRowKeys before the refresh is lost;
+// the set is restored after it instead, and only while the view still shows
+// the base it was collected in.
+//
+// It is a queue, not a single snapshot: ids beyond the loaded window wait here
+// until their page arrives, and a second batch only rewrites the ids it
+// actually handled. Replacing the whole record would drop the earlier batch's
+// unloaded failures the moment the operator retried the loaded ones.
+const pendingRetry = ref<{ kbId: string; ids: number[]; tag?: number | null } | null>(null)
+
+// restoredUnconfirmed holds the ids that came back from the queue and are now
+// merely selected. Being loaded is not being confirmed: the selection is reset
+// on every non-append refresh, so without this list a single deletion or a
+// filter change would drop rows the operator still has to retry. Ids leave it
+// only when they are settled -- a batch that includes them, a successful
+// single-row action, or the operator clearing the selection.
+const restoredUnconfirmed = ref<number[]>([])
+
+// settledIds records ids a batch reported as done in this flow. A finished
+// entry must not come back through the queue: a delete that succeeded has no
+// row left to retry, and re-queueing it would aim the next batch at a row that
+// is already gone.
+const settledIds = new Set<number>()
+
+// settleIds removes ids from the restored list and marks them settled, so a
+// refresh that runs before the next batch cannot put them back in the queue.
+function settleIds(ids: number[]) {
+  if (ids.length === 0) return
+  const drop = new Set(ids)
+  for (const id of ids) settledIds.add(id)
+  if (restoredUnconfirmed.value.some(id => drop.has(id))) {
+    restoredUnconfirmed.value = restoredUnconfirmed.value.filter(id => !drop.has(id))
+  }
+  forgetPendingRetry(props.kbId, ids)
+}
+
+// recordPendingRetry folds one batch's outcome into the queue. `sent` is every
+// id the request carried and `unconfirmed` is what has to stay recoverable;
+// for a delete those differ (a succeeded row is gone), for an idempotent
+// update they are the same list. Only `sent` ids are settled -- anything a
+// previous batch left queued and this one never sent stays queued.
+// `tag` carries the target of an idempotent tag update. Retrying a tag batch
+// has to re-issue the same target: the dialog starts empty, so a retry taken
+// from it would send null and strip the tag from the rows that had already
+// succeeded. A batch that is not a tag update leaves it unset.
+function recordPendingRetry(kbId: string, sent: number[], unconfirmed: number[], tag?: number | null) {
+  const same = pendingRetry.value && pendingRetry.value.kbId === kbId ? pendingRetry.value : null
+  const current = same ? same.ids : []
+  const settled = new Set(sent)
+  const merged = new Set(current.filter(id => !settled.has(id)))
+  for (const id of unconfirmed) merged.add(id)
+  const ids = [...merged]
+  // The settlement below runs even when the queue empties: an empty queue is
+  // the result of the last batch, not a reason to skip recording what it did.
+  if (ids.length === 0) {
+    pendingRetry.value = null
+  } else {
+    const nextTag = tag !== undefined ? tag : same?.tag
+    pendingRetry.value = nextTag === undefined ? { kbId, ids } : { kbId, ids, tag: nextTag }
+  }
+  // Only what the batch reported as done is settled; for a delete that is the
+  // sent ids that were not reported back as failures.
+  const done = sent.filter(id => !unconfirmed.includes(id))
+  dropRestoredUnconfirmed(sent)
+  if (done.length > 0) {
+    const settledNow = new Set(done)
+    for (const id of done) settledIds.add(id)
+    const kept = restoredUnconfirmed.value.filter(id => !settledNow.has(id))
+    if (kept.length !== restoredUnconfirmed.value.length) restoredUnconfirmed.value = kept
+  }
+}
+
+// dropRestoredUnconfirmed settles ids that were only remembered because a
+// previous batch failed. A batch that carried them has either changed them or
+// reported them again, and in both cases the queue now holds the truth.
+function dropRestoredUnconfirmed(ids: number[]) {
+  if (restoredUnconfirmed.value.length === 0) return
+  const settled = new Set(ids)
+  const kept = restoredUnconfirmed.value.filter(id => !settled.has(id))
+  if (kept.length !== restoredUnconfirmed.value.length) restoredUnconfirmed.value = kept
+}
+
+// forgetPendingRetry drops a set of ids from the queue without touching the
+// selection. It is what a partial batch reports for the ids it did not confirm:
+// those rows are gone or already changed, so ticking them again would aim the
+// next action at rows the queue no longer has a reason to remember.
+function forgetPendingRetry(kbId: string, ids: number[]) {
+  const pending = pendingRetry.value
+  if (!pending || pending.kbId !== kbId) return
+  const drop = new Set(ids)
+  const kept = pending.ids.filter(id => !drop.has(id))
+  pendingRetry.value = kept.length > 0 ? { kbId: pending.kbId, ids: kept } : null
+}
+
+// restorePendingRetry folds the pending selection into whatever is currently
+// loaded. It runs after every list load, including the append that scroll
+// load-more triggers, so an entry that was on page 3 comes back when its page
+// arrives.
+//
+// Absence from the list is not evidence of deletion: the list is one page of
+// twenty, newest first, and a chunk that succeeded can push a failed entry past
+// the loaded window. So ids are never dropped for being unlisted -- only when
+// the operator leaves the knowledge base they belong to.
+//
+// The restore merges instead of replacing: each page adds the ids it just
+// brought into view to whatever is already selected. Assigning the present set
+// would erase the previous page's ids from the selection, because they left
+// the queue when they were restored and a later page's present set can no
+// longer contain them.
+function restorePendingRetry() {
+  const pending = pendingRetry.value
+  if (!pending) return
+  if (pending.kbId !== props.kbId) {
+    pendingRetry.value = null
+    restoredUnconfirmed.value = []
+    settledIds.clear()
+    return
+  }
+  const loaded = new Set(entries.value.map(entry => entry.id))
+  const present = pending.ids.filter(id => loaded.has(id))
+  const stillPending = pending.ids.filter(id => !loaded.has(id))
+  // `tag` survives the restore: the ids still queued are the ones a retry
+  // will act on, and they need the original target to act correctly.
+  pendingRetry.value = stillPending.length > 0 ? { ...pending, ids: stillPending } : null
+  if (present.length > 0) {
+    restoredUnconfirmed.value = [...new Set([...restoredUnconfirmed.value, ...present])]
+    selectedRowKeys.value = [...new Set([...selectedRowKeys.value, ...present])]
+  }
+}
+
 const handleBatchDelete = async () => {
   if (!canManage.value || !selectedRowKeys.value.length || !props.kbId || batchActionLoading.value) return
   const selectedIds = [...selectedRowKeys.value]
+  // All chunks must land on the knowledge base the selection was made in: an
+  // in-flight run outlives a route change, and props.kbId would then point the
+  // remaining chunks at a different base.
+  const targetKbId = props.kbId
   batchDeleteLoading.value = true
   try {
-    await deleteFAQEntries(props.kbId, selectedIds)
-    MessagePlugin.success(t('knowledgeEditor.faq.batchDeleteSuccess', { count: selectedIds.length }))
+    const { appliedIds, failedIds, firstError } = await forEachFaqChunk(selectedIds, chunk =>
+      deleteFAQEntries(targetKbId, chunk),
+    )
+    if (failedIds.length > 0) {
+      MessagePlugin.error(partialFailureMessage(appliedIds, failedIds, firstError))
+    } else {
+      MessagePlugin.success(t('knowledgeEditor.faq.batchDeleteSuccess', { count: appliedIds.length }))
+    }
+    // Queue only the failed entries: the successful ones no longer exist, and
+    // keeping them would leave restorePendingRetry ticking rows the server has
+    // already forgotten. The failed ids are merged into whatever earlier
+    // batches left queued -- `sent` is the whole selection, so an id this batch
+    // never carried (a retry of one page only) is not treated as settled.
+    recordPendingRetry(targetKbId, selectedIds, failedIds)
+    // The successful rows are gone from the server, so they also leave the
+    // queue restore would keep ticking; only the failed ones come back.
+    forgetPendingRetry(targetKbId, appliedIds)
     selectedRowKeys.value = []
     await loadEntries()
-  } catch (error: any) {
-    MessagePlugin.error(error?.message || t('common.operationFailed'))
   } finally {
     batchDeleteLoading.value = false
   }
@@ -1750,27 +1981,41 @@ const batchTagValue = ref<string>('')
 
 const openBatchTagDialog = () => {
   if (!canEdit.value || !selectedRowKeys.value.length || batchActionLoading.value) return
-  batchTagValue.value = ''
+  // A retry has to repeat the operation it is retrying. The queue remembers
+  // the tag the failed batch was aiming at; without it the dialog opens empty
+  // and confirming sends null, which removes the tag instead of setting it.
+  const queued = pendingRetry.value && pendingRetry.value.kbId === props.kbId ? pendingRetry.value.tag : undefined
+  batchTagValue.value = queued != null ? String(queued) : ''
   batchTagDialogVisible.value = true
 }
 
 const handleBatchTag = async () => {
   if (!canEdit.value || !selectedRowKeys.value.length || !props.kbId || batchActionLoading.value) return
   const selectedIds = [...selectedRowKeys.value]
+  const targetKbId = props.kbId
   batchTagLoading.value = true
   try {
-    const updates: Record<number, number | null> = {}
-    selectedIds.forEach(id => {
-      updates[id] = batchTagValue.value ? Number(batchTagValue.value) : null
+    const tagValue = batchTagValue.value ? Number(batchTagValue.value) : null
+    const { appliedIds, failedIds, firstError } = await forEachFaqChunk(selectedIds, chunk => {
+      const updates: Record<number, number | null> = {}
+      chunk.forEach(id => {
+        updates[id] = tagValue
+      })
+      return updateFAQEntryTagBatch(targetKbId, { updates })
     })
-    await updateFAQEntryTagBatch(props.kbId, { updates })
-    MessagePlugin.success(t('knowledgeEditor.messages.updateSuccess'))
+    if (failedIds.length > 0) {
+      MessagePlugin.error(partialFailureMessage(appliedIds, failedIds, firstError))
+    } else {
+      MessagePlugin.success(t('knowledgeEditor.messages.updateSuccess'))
+    }
     batchTagDialogVisible.value = false
-    selectedRowKeys.value = []
+    // Tag changes are idempotent, so the whole selection can stay ticked for a
+    // retry of the chunks that did not report success.
+    // Queue first: the refresh that follows restores whatever page it fetches,
+    // and it can only do that for ids already in the queue.
+    recordPendingRetry(targetKbId, selectedIds, failedIds.length > 0 ? selectedIds : [], tagValue)
     await loadEntries()
     await loadTags(true)
-  } catch (error: any) {
-    MessagePlugin.error(error?.message || t('common.operationFailed'))
   } finally {
     batchTagLoading.value = false
   }
@@ -1779,18 +2024,27 @@ const handleBatchTag = async () => {
 const handleBatchStatusChange = async (isEnabled: boolean) => {
   if (!canEdit.value || !selectedRowKeys.value.length || !props.kbId || batchActionLoading.value) return
   const selectedIds = [...selectedRowKeys.value]
+  const targetKbId = props.kbId
   batchStatusAction.value = isEnabled ? 'enable' : 'disable'
   try {
-    const by_id: Record<number, { is_enabled: boolean }> = {}
-    selectedIds.forEach(id => {
-      by_id[id] = { is_enabled: isEnabled }
+    const { appliedIds, failedIds, firstError } = await forEachFaqChunk(selectedIds, chunk => {
+      const by_id: Record<number, { is_enabled: boolean }> = {}
+      chunk.forEach(id => {
+        by_id[id] = { is_enabled: isEnabled }
+      })
+      return updateFAQEntryFieldsBatch(targetKbId, { by_id })
     })
-    await updateFAQEntryFieldsBatch(props.kbId, { by_id })
-    MessagePlugin.success(t(isEnabled ? 'knowledgeEditor.faq.statusEnableSuccess' : 'knowledgeEditor.faq.statusDisableSuccess'))
-    selectedRowKeys.value = []
+    if (failedIds.length > 0) {
+      MessagePlugin.error(partialFailureMessage(appliedIds, failedIds, firstError))
+    } else {
+      MessagePlugin.success(t(isEnabled ? 'knowledgeEditor.faq.statusEnableSuccess' : 'knowledgeEditor.faq.statusDisableSuccess'))
+    }
+    // Enable/disable is idempotent; keep the whole selection so a retry covers
+    // the chunks that did not report success.
+    // Queue first: the refresh that follows restores whatever page it fetches,
+    // and it can only do that for ids already in the queue.
+    recordPendingRetry(targetKbId, selectedIds, failedIds.length > 0 ? selectedIds : [])
     await loadEntries()
-  } catch (error: any) {
-    MessagePlugin.error(error?.message || t('common.operationFailed'))
   } finally {
     batchStatusAction.value = null
   }
@@ -1801,13 +2055,22 @@ const handleMenuEdit = (entry: FAQEntry) => {
   openEditor(entry)
 }
 
+// Deletes one entry and settles it in the retry bookkeeping. The row is gone,
+// so it needs no retry: without this the refresh that follows would put it
+// back in the queue for a delete that would only 404.
+const deleteFAQEntryById = async (id: number) => {
+  const targetKbId = props.kbId
+  await deleteFAQEntries(targetKbId, [id])
+  settleIds([id])
+}
+
 const handleMenuDelete = (entry: FAQEntry) => {
   entry.showMore = false
   confirmDelete({
     body: t('knowledgeEditor.faq.confirmDelete'),
     onConfirm: async () => {
       try {
-        await deleteFAQEntries(props.kbId, [entry.id])
+        await deleteFAQEntryById(entry.id)
         MessagePlugin.success(t('knowledgeEditor.faqImport.deleteSuccess'))
         await loadEntries()
       } catch (error: any) {
@@ -1903,16 +2166,17 @@ const parseCSVFile = async (file: File): Promise<FAQEntryPayload[]> => {
             const record: Record<string, string> = {}
             // 将行数据转换为记录对象
             Object.keys(row).forEach((key) => {
-              record[key] = String(row[key] || '').trim()
+              record[key] = stripFormulaMarker(String(row[key] || '').trim())
             })
 
-            const isDisabled = parseBooleanField(record['是否停用'], false)
+            const isDisabled = parseBooleanField(record['是否停用'])
             payloads.push(
               normalizePayload({
                 standard_question: record['问题'] || record['standard_question'] || record['question'] || '',
                 answers: splitByDelimiter(record['机器人回答'] || record['answers']),
                 similar_questions: splitByDelimiter(record['相似问题'] || record['similar_questions']),
                 negative_questions: splitByDelimiter(record['反例问题'] || record['negative_questions']),
+                ...spreadsheetEntryFields(record),
                 tag_id: record['tag_id'] ? Number(record['tag_id']) : undefined,
                 tag_name: record['标签'] || record['分类'] || record['tag_name'] || '',
                 is_enabled: isDisabled !== undefined ? !isDisabled : undefined, // 是否停用：FALSE表示启用，TRUE表示停用，所以取反
@@ -1951,15 +2215,16 @@ const parseExcelFile = async (file: File): Promise<FAQEntryPayload[]> => {
       // 对于中文字段名，不转换为小写；对于英文字段名，转换为小写
       const finalKey = /[\u4e00-\u9fa5]/.test(normalizedKey) ? normalizedKey : normalizedKey.toLowerCase()
       // 确保值是字符串类型
-      normalizedRow[finalKey] = String(row[key] || '').trim()
+      normalizedRow[finalKey] = stripFormulaMarker(String(row[key] || '').trim())
     })
 
-    const isDisabled = parseBooleanField(normalizedRow['是否停用'], false)
+    const isDisabled = parseBooleanField(normalizedRow['是否停用'])
     return normalizePayload({
       standard_question: normalizedRow['问题'] || normalizedRow['standard_question'] || normalizedRow['question'] || '',
       answers: splitByDelimiter(normalizedRow['机器人回答'] || normalizedRow['answers']),
       similar_questions: splitByDelimiter(normalizedRow['相似问题'] || normalizedRow['similar_questions']),
       negative_questions: splitByDelimiter(normalizedRow['反例问题'] || normalizedRow['negative_questions']),
+      ...spreadsheetEntryFields(normalizedRow),
       tag_id: normalizedRow['tag_id'] ? Number(normalizedRow['tag_id']) : undefined,
       tag_name: normalizedRow['标签'] || normalizedRow['分类'] || normalizedRow['tag_name'] || '',
       is_enabled: isDisabled !== undefined ? !isDisabled : undefined, // 是否停用：FALSE表示启用，TRUE表示停用，所以取反
@@ -1985,27 +2250,18 @@ const splitByDelimiter = (value?: string) => {
   return [trimmedValue]
 }
 
-// 解析布尔字段（支持多种格式：TRUE/FALSE, true/false, 是/否, 1/0等）
-const parseBooleanField = (value?: string, defaultValue: boolean = true): boolean | undefined => {
-  if (!value) return undefined
-  const normalized = value.trim().toUpperCase()
-  if (normalized === 'TRUE' || normalized === '1' || normalized === '是' || normalized === 'YES') {
-    return true
-  }
-  if (normalized === 'FALSE' || normalized === '0' || normalized === '否' || normalized === 'NO') {
-    return false
-  }
-  return defaultValue
-}
-
 const normalizePayload = (payload: Partial<FAQEntryPayload>): FAQEntryPayload => ({
   standard_question: payload.standard_question || '',
   answers: payload.answers?.filter(Boolean) || [],
   similar_questions: payload.similar_questions?.filter(Boolean) || [],
   negative_questions: payload.negative_questions?.filter(Boolean) || [],
+  // Both are omissions by default: the server keeps the current value on an
+  // update, and a spreadsheet that never mentions them must not reset them.
+  ...(payload.answer_strategy ? { answer_strategy: payload.answer_strategy } : {}),
   tag_id: payload.tag_id || undefined,
   tag_name: payload.tag_name || '',
   is_enabled: payload.is_enabled !== undefined ? payload.is_enabled : undefined,
+  is_recommended: payload.is_recommended !== undefined ? payload.is_recommended : undefined,
 })
 
 const stopPolling = () => {
@@ -2366,6 +2622,69 @@ const handleImport = async () => {
       importState.importing = false
     }
     return
+  }
+
+  // The server accepts at most FAQ_IMPORT_MAX_ENTRIES (1000) per request and
+  // refuses over-limit batches before parsing them. Checking here keeps the
+  // user's import intact: the server's 400 would otherwise arrive after the
+  // modal had already committed to an import task id.
+  //
+  // Not chunked on purpose: `replace` treats entries missing from the batch as
+  // deletions, so submitting several replace batches in a row would delete
+  // everything outside the last one.
+  if (importState.preview.length > FAQ_IMPORT_MAX_ENTRIES) {
+    // The advice depends on the mode, and only append can be split. Under
+    // replace a smaller batch deletes every entry outside it, so the way out
+    // is a single complete submission or clearing the base first -- telling a
+    // replace caller to split would cost them their FAQ list.
+    const key =
+      importState.mode === 'replace' ? 'knowledgeEditor.faqImport.tooManyEntriesReplace' : 'knowledgeEditor.faqImport.tooManyEntries'
+    MessagePlugin.error(
+      t(key, {
+        limit: FAQ_IMPORT_MAX_ENTRIES,
+        count: importState.preview.length,
+      }),
+    )
+    return
+  }
+
+  // Replace deletes every entry the file does not carry, so it is only safe
+  // when the operator means to overwrite the whole list. This is not visible
+  // from the file: a 3-entry replace against a base of 997 entries deletes the
+  // other 997. Nothing else on screen says so -- the count check above refuses
+  // an over-limit replace but says nothing about an undersized one -- so state
+  // the consequence and wait for a confirmation before submitting.
+  if (importState.mode === 'replace' && overallFAQTotal.value > importState.preview.length) {
+    const removed = overallFAQTotal.value - importState.preview.length
+    const confirmed = await new Promise<boolean>(resolve => {
+      let settled = false
+      const dialog = DialogPlugin.confirm({
+        header: t('knowledgeEditor.faqImport.replaceConfirmTitle'),
+        body: t('knowledgeEditor.faqImport.replaceConfirmDelete', {
+          total: overallFAQTotal.value,
+          count: importState.preview.length,
+          removed,
+        }),
+        confirmBtn: { content: t('knowledgeEditor.faqImport.replaceConfirmButton'), theme: 'danger' },
+        cancelBtn: t('common.cancel'),
+        theme: 'danger',
+        onConfirm: () => {
+          settled = true
+          resolve(true)
+          dialog.hide()
+        },
+        onCancel: () => {
+          settled = true
+          resolve(false)
+          dialog.hide()
+        },
+        onClose: () => {
+          if (!settled) resolve(false)
+          dialog.hide()
+        },
+      })
+    })
+    if (!confirmed) return
   }
 
   importState.importing = true

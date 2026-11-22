@@ -1,6 +1,7 @@
 import { MessagePlugin } from "tdesign-vue-next";
 import i18n from '@/i18n';
 import { shouldRejectKnowledgeFileType } from "./fileTypeVerification";
+import { faqImportMaxEntries as parseFAQImportMaxEntries } from "./faqImportMaxEntries";
 
 // 声明全局运行时配置类型
 declare global {
@@ -8,6 +9,8 @@ declare global {
     __RUNTIME_CONFIG__?: {
       MAX_FILE_SIZE_MB?: number;
       MAX_SKILL_BUNDLE_SIZE_MB?: number;
+      // The entrypoint writes a bare integer; anything else is ignored below.
+      FAQ_IMPORT_MAX_ENTRIES?: number | string;
       DEFAULT_LOCALE?: string;
     };
   }
@@ -17,6 +20,11 @@ function positiveMegabytes(value: unknown, fallback: number): number {
   const n = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(n) && n > 0 ? n : fallback
 }
+
+export const FAQ_IMPORT_MAX_ENTRIES = parseFAQImportMaxEntries(
+  window.__RUNTIME_CONFIG__?.FAQ_IMPORT_MAX_ENTRIES
+    ?? import.meta.env.VITE_FAQ_IMPORT_MAX_ENTRIES,
+)
 
 // 从运行时配置获取最大文件大小(MB)，支持 Docker 环境动态配置
 // 优先级：运行时配置 > 构建时环境变量 > 默认值 50MB
