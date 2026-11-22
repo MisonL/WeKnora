@@ -277,7 +277,15 @@ func Wrapf(code ErrorCode, cause error, format string, args ...any) *Error {
 // ClassifyHTTPErrorOutputs() in the acceptance/contract test, which
 // enumerates the codes this helper can yield.
 func WrapHTTP(cause error, format string, args ...any) *Error {
-	return Wrapf(ClassifyHTTPError(cause), cause, format, args...)
+	wrapped := Wrapf(ClassifyHTTPError(cause), cause, format, args...)
+	// A server that states how long to wait should have that reach the caller:
+	// the retry envelope carries retry_after_seconds, and the agent protocol
+	// reads it instead of inventing a backoff.
+	var apiErr *sdk.APIError
+	if errors.As(cause, &apiErr) && apiErr.RetryAfter > 0 {
+		wrapped.RetryAfterSeconds = apiErr.RetryAfter
+	}
+	return wrapped
 }
 
 // ClassifySDKError maps SDK transport, HTTP, and terminal SSE stream errors to

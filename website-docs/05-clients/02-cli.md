@@ -200,7 +200,7 @@ JWT profile（同时持有 access + refresh token）会自动获得 401 透明�
 | 3 | 认证 / 授权失败 | `auth.*` | 重新 `weknora auth login` 后重试 |
 | 4 | 资源不存在 | `resource.not_found` | 核对资源 id |
 | 5 | 输入值非法（类型化校验，非解析错误） | `input.*`（除 confirmation_required） | 调整参数重试 |
-| 6 | 限流 | `server.rate_limited` | 退避后重试 |
+| 6 | 限流 | `server.rate_limited` | 错误信封带 `retry_after_seconds` 时按该值等待，否则自行退避后重试 |
 | 7 | 服务器 / 网络错误 | `server.*`, `network.*` | 瞬态错误，退避重试 |
 | 10 | 需要确认（高风险写操作） | `input.confirmation_required` | 询问人类；获明确批准后加 `-y` 重试 |
 | 124 | 操作超时 | `operation.timeout` | 提高 `--timeout` 或检查底层任务 |
@@ -410,6 +410,36 @@ weknora agent update agt_123 --add-kb <kb-id2> --temperature 0.3
 ```bash
 weknora model create bge-m3 --type Embedding --source local --base-url http://localhost:11434 --dimension 1024
 echo "$OPENAI_KEY" | weknora model create gpt-4o --type chat --source remote --provider openai --api-key-stdin
+```
+
+### faq — FAQ 批量导入 / 导出 / 进度（`cli/cmd/faq/`）
+
+| 子命令 | Use | 说明 |
+|---|---|---|
+| import | `import <payload.json>` | 分批导入/替换 FAQ：`--kb`（必填）、`--mode`（append / replace，缺省取文件内 mode，再缺省 append）、`--dry-run`、`--batch-size`（默认 1000；CLI 内置上限为 1000 条 / 32 MiB 请求体，不会查询服务端配置，服务端调得更低时需自行传更小的 `--batch-size`——调小它同时缩小每批的条目数与序列化后的请求体字节数，通常能把每批压回字节预算内，不必拆文件；只有单条条目自身序列化后就超过服务端字节上限时才无解，拆文件也一样）、`--failure-gate`（批内失败比例超过该百分比即停止，0 关闭）、`--snapshot`（默认 true，写前先导出可回滚的快照）、`--report`、`--wait`（默认 true）、`--timeout` |
+| export | `export --kb <id>` | 把整个知识库导出成导入同形状的 JSON 快照：`--out` 写文件（原子替换），否则写 stdout。列表接口每次 20 条，按页读完 |
+| progress | `progress <task-id>` | 读一次导入进度并返回 |
+| wait | `wait <task-id>` | 轮询到导入结束：`--timeout`（默认 30m，0 为不限）、`--interval`（默认 2s） |
+
+`replace` 模式在真正写入前（非 `--dry-run`）会核对“文件条数 = 服务端现有条数”，不一致直接拒绝：replace 会删除文件之外的所有条目，拆批提交或漏行都会造成成片误删。`--dry-run` 只校验不落库，不做该核对。
+
+退出码（import）：
+
+| 码 | 含义 |
+|---|---|
+| 0 | 没有 failed / partial 失败；或单批 `--wait=false` 只提交成功（结果归返回的 task-id）。skipped 条目不算失败，dry-run 也不落库 |
+| 1 | 某批提交失败 / 某批以失败结束 / failure gate 触发；或各批都是 completed 但存在 failed / partial 失败条目（这种最常见，不需要 gate 触发） |
+| 5 | 输入不合法，例如 `replace` 需要多批、或 `--wait=false` 时文件需要多批（服务端对同一知识库一次只接受一个导入任务） |
+| 124 | `--timeout` 等待超时（任务可能仍在服务端运行） |
+| 130 | 被信号中断 |
+
+`export` 读到“服务端返回的 total”与“实际读到的条数”不一致时会报错而不是返回短快照：短快照喂给 `import --mode replace` 会删掉它没列出的条目，通常是因为导出期间知识库被并发修改，空闲时重跑即可。
+
+```bash
+weknora faq export --kb kb_abc --out faq-backup.json
+weknora faq import faq-backup.json --kb kb_abc --mode replace --dry-run
+weknora faq import faq-backup.json --kb kb_abc --report run.json
+weknora faq wait task-faq_import_...
 ```
 
 ### api — 原始 HTTP 逃生舱（`cli/cmd/api/api.go`）

@@ -110,3 +110,25 @@ func TestClassifyHTTPError_500Generic_StaysServerError(t *testing.T) {
 		})
 	}
 }
+
+// The server's stated wait has to survive WrapHTTP: the envelope's
+// retry_after_seconds is what an agent uses to space its retries.
+func TestWrapHTTPCarriesRetryAfter(t *testing.T) {
+	apiErr := &sdk.APIError{StatusCode: 429, Body: "busy", Code: sdk.ServerErrTooManyRequests, RetryAfter: 42}
+	wrapped := WrapHTTP(apiErr, "upload %s", "a.pdf")
+
+	if wrapped.Code != CodeServerRateLimited {
+		t.Fatalf("code = %s, want %s", wrapped.Code, CodeServerRateLimited)
+	}
+	if wrapped.RetryAfterSeconds != 42 {
+		t.Fatalf("RetryAfterSeconds = %d, want 42", wrapped.RetryAfterSeconds)
+	}
+}
+
+// An error that carries no HTTP status has no wait to relay.
+func TestWrapHTTPLeavesRetryAfterUnsetWithoutOne(t *testing.T) {
+	wrapped := WrapHTTP(errors.New("dial tcp: refused"), "upload")
+	if wrapped.RetryAfterSeconds != 0 {
+		t.Fatalf("RetryAfterSeconds = %d, want 0", wrapped.RetryAfterSeconds)
+	}
+}

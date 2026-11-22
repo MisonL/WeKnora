@@ -25,6 +25,8 @@ var dryRunExpectation = map[string]bool{
 	"kb schedule":   true, // changes when Wiki generation runs
 	"model create":  true, "model update": true, "model delete": true,
 	"doc create": true, "doc upload": true, "doc fetch": true, "doc delete": true,
+	"faq import": true, // writes entries; --dry-run validates without writing
+
 	"doc reparse":  true, // re-triggers server-side parsing (a state change)
 	"doc update":   true, // edits title/description server-side
 	"chunk delete": true, "message delete": true,
@@ -39,6 +41,7 @@ var dryRunExpectation = map[string]bool{
 	// --- exempt: no state change to preview ---
 	// reads
 	"kb list": false, "kb view": false, "kb status": false, "kb check": false,
+	"faq export": false, "faq progress": false, "faq wait": false,
 	"kb config": false, // read-only inspection of a KB's model config
 	"doc list":  false, "doc view": false, "doc download": false,
 	"doc wait":   false, // polling read, no mutation

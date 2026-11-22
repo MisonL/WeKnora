@@ -18,10 +18,11 @@ import (
 	configcmd "github.com/Tencent/WeKnora/cli/cmd/config"
 	"github.com/Tencent/WeKnora/cli/cmd/doc"
 	"github.com/Tencent/WeKnora/cli/cmd/doctor"
+	faqcmd "github.com/Tencent/WeKnora/cli/cmd/faq"
 	"github.com/Tencent/WeKnora/cli/cmd/kb"
 	linkcmd "github.com/Tencent/WeKnora/cli/cmd/link"
-	messagecmd "github.com/Tencent/WeKnora/cli/cmd/message"
 	mcpcmd "github.com/Tencent/WeKnora/cli/cmd/mcp"
+	messagecmd "github.com/Tencent/WeKnora/cli/cmd/message"
 	modelcmd "github.com/Tencent/WeKnora/cli/cmd/model"
 	profilecmd "github.com/Tencent/WeKnora/cli/cmd/profile"
 	"github.com/Tencent/WeKnora/cli/cmd/search"
@@ -205,6 +206,7 @@ a curated read-only MCP tool surface for AI agents.`,
 	cmd.AddCommand(linkcmd.NewCmd(f))
 	cmd.AddCommand(linkcmd.NewCmdUnlink())
 	cmd.AddCommand(doc.NewCmd(f))
+	cmd.AddCommand(faqcmd.NewCmd(f))
 	cmd.AddCommand(apicmd.NewCmd(f))
 	cmd.AddCommand(chatcmd.NewCmd(f))
 	cmd.AddCommand(sessioncmd.NewCmd(f))

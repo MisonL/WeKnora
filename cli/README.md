@@ -19,6 +19,7 @@ Available Commands:
   completion  Generate the autocompletion script for the specified shell
   config      Inspect the CLI's resolved configuration
   doc         Manage documents in a knowledge base
+  faq         Import, export and track FAQ entries
   doctor      Run 4 self-checks: base URL, auth, server version, credential storage
   exit-codes  Exit code matrix and the agent action for each
   help        Help about any command
@@ -266,7 +267,7 @@ taxonomy.
 | `3`   | `auth.*` (token missing / expired / forbidden)         | re-auth, then retry |
 | `4`   | `resource.not_found`                                   | verify the resource id |
 | `5`   | `input.*` (other than `confirmation_required`)         | adjust args, retry |
-| `6`   | `server.rate_limited`                                  | back off, retry |
+| `6`   | `server.rate_limited`                                  | wait `retry_after_seconds` from the error envelope when present, else back off; retry |
 | `7`   | `server.*` / `network.*`                               | transient — retry with backoff |
 | `10`  | **`input.confirmation_required`** (high-risk write)    | ask the human, retry with `-y` only after explicit approval |
 | `124` | `operation.timeout` (e.g. `doc wait --timeout` reached) | raise `--timeout` or check the underlying job |

@@ -12,6 +12,29 @@ CLI history before v0.3 is recorded in the project root
 
 ## [Unreleased]
 
+### Added
+- `faq` command group: `import`, `export`, `progress`, `wait`.
+  - `faq import` applies the server's FAQ import rules itself: batches under
+    the entry and byte budgets (envelope included), strictly serial batches,
+    a failure-ratio gate, a hard refusal to split `replace`, an expected-count
+    check for single-batch `replace`, a never-overwritten pre-import snapshot,
+    and a run report carrying task ids and payload hashes. `--dry-run` reads
+    its counts from the task's own record, which is what the server wrote for
+    the plan it validated.
+  - `faq import`, `faq progress` and `faq wait` count a partially imported
+    entry -- one that landed with conflicting similar or negative questions
+    removed -- apart from a failed one, and include it in the failure gate and
+    the exit code. It had no field on the SDK's progress record, so
+    `failed_count` alone read as a clean import while a large share of the
+    batch had lost questions. The report and the text record keep the two
+    numbers separate.
+  - `faq wait` uses the same exit codes as `doc wait`: 0 completed with every
+    entry intact, 1 failed or partially imported entries, 124 timeout, 130
+    interrupted.
+  - Previously an FAQ import meant a raw `weknora api` POST plus hand-written
+    batching; that path is still available but carries none of these checks.
+
+
 ### Breaking
 - `chat` and `session ask` now distinguish JSON from NDJSON: the default
   `--format json` buffers a bounded answer-event projection into one
