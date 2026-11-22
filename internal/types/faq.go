@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"unicode"
 
 	"github.com/Tencent/WeKnora/internal/textconv"
+	"github.com/Tencent/WeKnora/internal/utils"
 )
 
 // FAQChunkMetadata 定义 FAQ 条目在 Chunk.Metadata 中的结构
@@ -298,6 +300,11 @@ type FAQExportEntry struct {
 	IsRecommended     bool           `json:"is_recommended"`
 }
 
+// FAQExternalSeqIDLimit is the first seq id the database sequence generates
+// for chunks. A client-supplied id must stay below it so it cannot collide
+// with a value the sequence hands out later.
+const FAQExternalSeqIDLimit int64 = 100000000
+
 // FAQEntryPayload 用于创建/更新 FAQ 条目的 payload
 type FAQEntryPayload struct {
 	// ID 可选，用于数据迁移时指定 seq_id（必须小于自增起始值 100000000）
@@ -325,6 +332,13 @@ const (
 	FAQBatchModeAppend  = "append"
 	FAQBatchModeReplace = "replace"
 )
+
+// FAQBatchMaxEntriesPerRequest caps how many entries one batch request may
+// carry. The web UI loads 20 rows per page and submits selections in chunks of
+// this size, so a larger list comes from a caller bypassing the product; the
+// services enforce the same bound as the handler because every id drives a
+// chunk update plus a retriever sync.
+const FAQBatchMaxEntriesPerRequest = 20
 
 // FAQBatchUpsertPayload 批量导入 FAQ 条目
 type FAQBatchUpsertPayload struct {
@@ -407,11 +421,42 @@ type FAQEntryFieldsUpdate struct {
 // 2. 按Tag更新：使用 ByTag 字段，将该Tag下所有条目应用相同的更新
 type FAQEntryFieldsBatchUpdate struct {
 	// ByID 按条目ID更新，key为条目ID (seq_id)
-	ByID map[int64]FAQEntryFieldsUpdate `json:"by_id,omitempty"`
+	//
+	// Capped at 20 like every other entry-list endpoint: each key drives a chunk
+	// update plus a retriever sync, so one request's work has to stay
+	// proportional to a bounded list. The web UI selects across scroll-loaded
+	// pages and submits in 20-item chunks.
+	ByID map[int64]FAQEntryFieldsUpdate `json:"by_id,omitempty" binding:"omitempty,max=20" extensions:"x-agent=entry_ids,x-agent-maximum=20"`
 	// ByTag 按Tag批量更新，key为TagID (seq_id)
+	//
+	// Left unbounded on purpose: updating a tag is defined to touch every entry
+	// carrying it, so a cap here would silently change what the operation means
+	// rather than bound it. The tag count is naturally small.
 	ByTag map[int64]FAQEntryFieldsUpdate `json:"by_tag,omitempty"`
 	// ExcludeIDs 在ByTag操作中需要排除的ID列表 (seq_id)
-	ExcludeIDs []int64 `json:"exclude_ids,omitempty"`
+	//
+	// The cap is conditional, so it is checked in Validate rather than by a tag:
+	// without a by_tag nothing reads this list, and bounding it there would
+	// reject a request that cannot change a row. With a by_tag every row missing
+	// from it is updated, which is why it can be neither split nor shortened.
+	ExcludeIDs []int64 `json:"exclude_ids,omitempty" extensions:"x-agent=entry_ids,x-agent-maximum=20"`
+}
+
+// ValidateFAQEntryFieldsBatch checks the constraints the struct tags cannot
+// express. gin's StructValidator never calls a method by convention, so the
+// handler calls this after binding.
+func ValidateFAQEntryFieldsBatch(r *FAQEntryFieldsBatchUpdate) error {
+	if r == nil {
+		return nil
+	}
+	if len(r.ByTag) > 0 && len(r.ExcludeIDs) > FAQBatchMaxEntriesPerRequest {
+		// A by_tag update changes every entry the exclusions do not name, and
+		// no smaller request does the same job: split it and each batch's
+		// exclusions are the other batch's targets; shorten the list and the
+		// dropped entries get updated.
+		return fmt.Errorf("%s", utils.FAQTooManyExclusionsMessage(FAQBatchMaxEntriesPerRequest, len(r.ExcludeIDs)))
+	}
+	return nil
 }
 
 // FAQImportTaskStatus 导入任务状态
@@ -431,9 +476,18 @@ const (
 // FAQImportProgress represents the progress of an FAQ import task stored in Redis
 // When Status is "completed", the result fields (SkippedCount, ImportMode, ImportedAt, DisplayStatus, ProcessingTime) are populated.
 type FAQImportProgress struct {
-	TaskID             string              `json:"task_id"`                        // UUID for the import task
-	KBID               string              `json:"kb_id"`                          // Knowledge Base ID
-	KnowledgeID        string              `json:"knowledge_id"`                   // FAQ Knowledge ID
+	TaskID      string `json:"task_id"`      // UUID for the import task
+	KBID        string `json:"kb_id"`        // Knowledge Base ID
+	KnowledgeID string `json:"knowledge_id"` // FAQ Knowledge ID
+	// TenantID is the tenant the import belongs to, which is not always the
+	// caller's tenant: a shared knowledge base's members poll a task another
+	// tenant started. Enrichment of a completed record reads the knowledge row
+	// under this tenant.
+	TenantID uint64 `json:"tenant_id,omitempty"`
+	// InstanceID identifies the enqueued run that wrote this record. A task id
+	// may be reused by a later submission; the record then belongs to the newer
+	// instance, and a stale queued instance must not overwrite or resume it.
+	InstanceID         string              `json:"instance_id,omitempty"`
 	Status             FAQImportTaskStatus `json:"status"`                         // Task status
 	Progress           int                 `json:"progress"`                       // 0-100 percentage
 	Total              int                 `json:"total"`                          // Total entries to import
@@ -464,7 +518,7 @@ type FAQImportProgress struct {
 	ImportMode     string    `json:"import_mode,omitempty"`     // 导入模式：append 或 replace
 	ImportedAt     time.Time `json:"imported_at,omitempty"`     // 导入完成时间
 	DisplayStatus  string    `json:"display_status,omitempty"`  // 显示状态：open 或 close
-	ProcessingTime int64     `json:"processing_time,omitempty"` // 处理耗时（毫秒）
+	ProcessingTime int64     `json:"processing_time,omitempty"` //处理耗时（秒）
 }
 
 // FAQImportMetadata 存储在Knowledge.Metadata中的FAQ导入任务信息
@@ -490,7 +544,10 @@ type FAQImportResult struct {
 	// 导入模式和时间信息
 	ImportMode string    `json:"import_mode"` // 导入模式：append 或 replace
 	ImportedAt time.Time `json:"imported_at"` // 导入完成时间
-	TaskID     string    `json:"task_id"`     // 导入任务ID
+	// ImportedAtMillis is the same instant at millisecond resolution, used to
+	// order imports that complete within one second. Older results lack it.
+	ImportedAtMillis int64  `json:"imported_at_ms,omitempty"`
+	TaskID           string `json:"task_id"` // 导入任务ID
 
 	// 失败详情对象路径（失败条目较多时提供下载）
 	FailedEntriesURL string `json:"failed_entries_url,omitempty"` // 失败条目CSV的对象存储路径；需走 /files 鉴权代理下载
@@ -499,7 +556,7 @@ type FAQImportResult struct {
 	DisplayStatus string `json:"display_status"` // 显示状态：open 或 close
 
 	// 额外统计信息
-	ProcessingTime int64 `json:"processing_time"` // 处理耗时（毫秒）
+	ProcessingTime int64 `json:"processing_time"` //处理耗时（秒）
 }
 
 // ToJSON converts the metadata to JSON type.

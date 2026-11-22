@@ -22,6 +22,10 @@ const (
 	ErrServiceUnavailable ErrorCode = 1008
 	ErrTimeout            ErrorCode = 1009
 	ErrValidation         ErrorCode = 1010
+	// ErrPayloadTooLarge distinguishes "your body exceeded the endpoint's
+	// limit" from a malformed request: the caller can shrink and retry, and a
+	// retry of the identical body will always fail the same way.
+	ErrPayloadTooLarge ErrorCode = 1011
 
 	// Tenant related error codes (2000-2099)
 	ErrTenantNotFound         ErrorCode = 2000
@@ -56,6 +60,15 @@ const (
 	// message text. HTTP semantics are identical to a bad request.
 	ErrImportPrerequisiteMissing ErrorCode = 2400
 
+	// Enqueue failures (2500-2599).
+	// The uploaded row exists and is stored, but no parse job could be
+	// queued, so nothing will ever process it. HTTP 503 rather than 200: a
+	// caller that treats this as success stops watching a document that is
+	// already known to be unparsed. The typed code lets clients tell this
+	// apart from a generic 5xx -- the fix is to reparse the returned row,
+	// not to re-upload the file.
+	ErrKnowledgeEnqueueFailed ErrorCode = 2500
+
 	// Add more error codes here
 )
 
@@ -65,6 +78,11 @@ type AppError struct {
 	Message  string    `json:"message"`
 	Details  any       `json:"details,omitempty"`
 	HTTPCode int       `json:"-"`
+	// RetryAfterSeconds, when positive, is sent as the Retry-After header on a
+	// 429 so a client can wait the right amount instead of guessing. Zero
+	// leaves the header off: an admission refusal with no estimate is still a
+	// valid 429.
+	RetryAfterSeconds int `json:"-"`
 }
 
 // Error implements the error interface
@@ -78,12 +96,28 @@ func (e *AppError) WithDetails(details any) *AppError {
 	return e
 }
 
+// WithRetryAfter sets the Retry-After hint a 429 response carries.
+func (e *AppError) WithRetryAfter(seconds int) *AppError {
+	e.RetryAfterSeconds = seconds
+	return e
+}
+
 // NewBadRequestError creates a bad request error
 func NewBadRequestError(message string) *AppError {
 	return &AppError{
 		Code:     ErrBadRequest,
 		Message:  message,
 		HTTPCode: http.StatusBadRequest,
+	}
+}
+
+// NewPayloadTooLargeError creates the HTTP 413 returned when a request body
+// exceeds the endpoint's byte budget.
+func NewPayloadTooLargeError(message string) *AppError {
+	return &AppError{
+		Code:     ErrPayloadTooLarge,
+		Message:  message,
+		HTTPCode: http.StatusRequestEntityTooLarge,
 	}
 }
 
@@ -180,6 +214,21 @@ func NewServiceUnavailableError(message string) *AppError {
 	}
 	return &AppError{
 		Code:     ErrServiceUnavailable,
+		Message:  message,
+		HTTPCode: http.StatusServiceUnavailable,
+	}
+}
+
+// NewKnowledgeEnqueueFailedError creates the 503 returned when an uploaded
+// document was stored but its parse job could not be queued. The message says
+// both halves, because the caller's next step depends on it: the file is safe,
+// and the row needs a reparse rather than a re-upload.
+func NewKnowledgeEnqueueFailedError(message string) *AppError {
+	if message == "" {
+		message = "文件已保存，但解析任务未能入队，请稍后重新解析"
+	}
+	return &AppError{
+		Code:     ErrKnowledgeEnqueueFailed,
 		Message:  message,
 		HTTPCode: http.StatusServiceUnavailable,
 	}

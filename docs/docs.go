@@ -7051,6 +7051,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
                         }
+                    },
+                    "413": {
+                        "description": "请求体超过 FAQ 字节预算（code 1011）",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
+                    },
+                    "429": {
+                        "description": "FAQ 导入请求过多（带 Retry-After）",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
                     }
                 }
             },
@@ -7102,6 +7114,12 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
+                    },
+                    "413": {
+                        "description": "请求体超过 FAQ 字节预算（code 1011）",
                         "schema": {
                             "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
                         }
@@ -7172,6 +7190,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
                         }
+                    },
+                    "413": {
+                        "description": "请求体超过 FAQ 字节预算（code 1011）",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
                     }
                 },
                 "x-agent": {
@@ -7238,6 +7262,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
                         }
+                    },
+                    "429": {
+                        "description": "服务器正在执行另一个导出（带 Retry-After）",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
                     }
                 }
             }
@@ -7293,6 +7323,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
                         }
+                    },
+                    "413": {
+                        "description": "请求体超过 FAQ 字节预算（code 1011）",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
                     }
                 }
             }
@@ -7345,6 +7381,12 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
+                    },
+                    "413": {
+                        "description": "请求体超过 FAQ 字节预算（code 1011）",
                         "schema": {
                             "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
                         }
@@ -7499,6 +7541,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
                         }
+                    },
+                    "413": {
+                        "description": "请求体超过 FAQ 字节预算（code 1011）",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
                     }
                 },
                 "x-agent": {
@@ -7589,6 +7637,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
                         }
+                    },
+                    "413": {
+                        "description": "请求体超过 FAQ 字节预算（code 1011）",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
                     }
                 },
                 "x-agent": {
@@ -7664,6 +7718,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
                         }
+                    },
+                    "413": {
+                        "description": "请求体超过 FAQ 字节预算（code 1011）",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
                     }
                 },
                 "x-agent": {
@@ -7729,6 +7789,12 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "知识库不存在或无导入记录",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
+                    },
+                    "413": {
+                        "description": "请求体超过 FAQ 字节预算（code 1011）",
                         "schema": {
                             "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
                         }
@@ -7799,6 +7865,12 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
+                    },
+                    "413": {
+                        "description": "请求体超过 FAQ 字节预算（code 1011）",
                         "schema": {
                             "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
                         }
@@ -8687,6 +8759,24 @@ const docTemplate = `{
                         "schema": {
                             "type": "object",
                             "additionalProperties": true
+                        }
+                    },
+                    "413": {
+                        "description": "文件超过 MAX_FILE_SIZE_MB（code 1011）",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
+                    },
+                    "429": {
+                        "description": "上传准入已满（code 1006）或解析任务预算已满（文件已落盘，details 带 knowledge_id）；响应带 Retry-After 秒数，可据此等待后重试",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
+                        }
+                    },
+                    "503": {
+                        "description": "文件已保存但解析任务入队失败（code 2500），error.details 带 knowledge_id，可直接重新解析",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_errors.AppError"
                         }
                     }
                 }
@@ -26388,6 +26478,7 @@ const docTemplate = `{
                 1008,
                 1009,
                 1010,
+                1011,
                 2000,
                 2001,
                 2002,
@@ -26401,7 +26492,8 @@ const docTemplate = `{
                 2200,
                 2201,
                 2300,
-                2400
+                2400,
+                2500
             ],
             "x-enum-varnames": [
                 "ErrBadRequest",
@@ -26415,6 +26507,7 @@ const docTemplate = `{
                 "ErrServiceUnavailable",
                 "ErrTimeout",
                 "ErrValidation",
+                "ErrPayloadTooLarge",
                 "ErrTenantNotFound",
                 "ErrTenantAlreadyExists",
                 "ErrTenantInactive",
@@ -26428,7 +26521,8 @@ const docTemplate = `{
                 "ErrVectorStoreBindingInvalid",
                 "ErrVectorStoreUnavailable",
                 "ErrModelInUse",
-                "ErrImportPrerequisiteMissing"
+                "ErrImportPrerequisiteMissing",
+                "ErrKnowledgeEnqueueFailed"
             ]
         },
         "github_com_Tencent_WeKnora_internal_handler_dto.CredentialFieldMetadata": {
@@ -30191,25 +30285,29 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "by_id": {
-                    "description": "ByID 按条目ID更新，key为条目ID (seq_id)",
+                    "description": "ByID 按条目ID更新，key为条目ID (seq_id)\n\nCapped at 20 like every other entry-list endpoint: each key drives a chunk\nupdate plus a retriever sync, so one request's work has to stay\nproportional to a bounded list. The web UI selects across scroll-loaded\npages and submits in 20-item chunks.",
                     "type": "object",
                     "additionalProperties": {
                         "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_types.FAQEntryFieldsUpdate"
-                    }
+                    },
+                    "x-agent": "entry_ids",
+                    "x-agent-maximum": "20"
                 },
                 "by_tag": {
-                    "description": "ByTag 按Tag批量更新，key为TagID (seq_id)",
+                    "description": "ByTag 按Tag批量更新，key为TagID (seq_id)\n\nLeft unbounded on purpose: updating a tag is defined to touch every entry\ncarrying it, so a cap here would silently change what the operation means\nrather than bound it. The tag count is naturally small.",
                     "type": "object",
                     "additionalProperties": {
                         "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_types.FAQEntryFieldsUpdate"
                     }
                 },
                 "exclude_ids": {
-                    "description": "ExcludeIDs 在ByTag操作中需要排除的ID列表 (seq_id)",
+                    "description": "ExcludeIDs 在ByTag操作中需要排除的ID列表 (seq_id)\n\nThe cap is conditional, so it is checked in Validate rather than by a tag:\nwithout a by_tag nothing reads this list, and bounding it there would\nreject a request that cannot change a row. With a by_tag every row missing\nfrom it is updated, which is why it can be neither split nor shortened.",
                     "type": "array",
                     "items": {
                         "type": "integer"
-                    }
+                    },
+                    "x-agent": "entry_ids",
+                    "x-agent-maximum": "20"
                 }
             }
         },
@@ -30426,6 +30524,10 @@ const docTemplate = `{
                     "description": "导入完成时间",
                     "type": "string"
                 },
+                "instance_id": {
+                    "description": "InstanceID identifies the enqueued run that wrote this record. A task id\nmay be reused by a later submission; the record then belongs to the newer\ninstance, and a stale queued instance must not overwrite or resume it.",
+                    "type": "string"
+                },
                 "kb_id": {
                     "description": "Knowledge Base ID",
                     "type": "string"
@@ -30455,6 +30557,10 @@ const docTemplate = `{
                 "message": {
                     "description": "Status message",
                     "type": "string"
+                },
+                "next_entry_index": {
+                    "description": "NextEntryIndex 是下一次重试应从 validEntries 中继续的位置（前缀游标）。\n与 Processed（展示用计数）语义不同：Processed 会被 skip/merge 等计数污染，\n不能当作切片偏移使用。",
+                    "type": "integer"
                 },
                 "partial_failed_count": {
                     "description": "部分失败的条目数（相似问/反例被移除）",
@@ -30498,6 +30604,10 @@ const docTemplate = `{
                 "task_id": {
                     "description": "UUID for the import task",
                     "type": "string"
+                },
+                "tenant_id": {
+                    "description": "TenantID is the tenant the import belongs to, which is not always the\ncaller's tenant: a shared knowledge base's members poll a task another\ntenant started. Enrichment of a completed record reads the knowledge row\nunder this tenant.",
+                    "type": "integer"
                 },
                 "total": {
                     "description": "Total entries to import",
@@ -38324,6 +38434,34 @@ const docTemplate = `{
                     "minimum": 0,
                     "x-agent": "wiki_max_pages"
                 },
+                "schedule_mode": {
+                    "description": "ScheduleMode decides when background generation runs. Empty or \"on_change\"\nkeeps the historical behaviour (a debounced run after every document\nfinishes processing). \"daily\" and \"weekly\" hold changes until the next\nwindow, so a bulk import produces one synthesis pass instead of dozens.\n\"manual\" turns background generation off entirely.",
+                    "enum": [
+                        "on_change",
+                        "daily",
+                        "weekly",
+                        "manual"
+                    ],
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_types.WikiScheduleMode"
+                        }
+                    ],
+                    "x-agent": "wiki_schedule_mode"
+                },
+                "schedule_time": {
+                    "description": "ScheduleTime is the window's local wall-clock time, \"HH:MM\" in the tenant\nserver's time zone. A comma-separated list schedules several runs a day:\n\"12:00,18:00\" runs daily at noon and six, and a weekly mode runs them on\neach selected weekday. Only read for daily and weekly; empty means 02:00.",
+                    "type": "string",
+                    "x-agent": "wiki_schedule_time"
+                },
+                "schedule_weekdays": {
+                    "description": "ScheduleWeekdays lists 0-6 (Sunday=0) for weekly mode. Empty means every\nday, which is what daily mode already does.",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    },
+                    "x-agent": "wiki_schedule_weekdays"
+                },
                 "synthesis_model_id": {
                     "description": "SynthesisModelID is the model that writes Wiki pages. Empty uses summary_model_id.",
                     "type": "string",
@@ -39153,6 +39291,21 @@ const docTemplate = `{
                     "type": "integer"
                 }
             }
+        },
+        "github_com_Tencent_WeKnora_internal_types.WikiScheduleMode": {
+            "type": "string",
+            "enum": [
+                "on_change",
+                "daily",
+                "weekly",
+                "manual"
+            ],
+            "x-enum-varnames": [
+                "WikiScheduleOnChange",
+                "WikiScheduleDaily",
+                "WikiScheduleWeekly",
+                "WikiScheduleManual"
+            ]
         },
         "github_com_Tencent_WeKnora_internal_types.WikiStats": {
             "type": "object",
@@ -43393,6 +43546,29 @@ const docTemplate = `{
                 }
             }
         },
+        "internal_handler.UpdateProviderParameters": {
+            "type": "object",
+            "properties": {
+                "api_key": {
+                    "type": "string"
+                },
+                "base_url": {
+                    "type": "string"
+                },
+                "engine_id": {
+                    "type": "string"
+                },
+                "extra_config": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "proxy_url": {
+                    "type": "string"
+                }
+            }
+        },
         "internal_handler.UpdateProviderRequest": {
             "type": "object",
             "properties": {
@@ -43400,13 +43576,19 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "is_default": {
+                    "description": "IsDefault is nil when omitted; omitted keeps the stored default flag.",
                     "type": "boolean"
                 },
                 "name": {
                     "type": "string"
                 },
                 "parameters": {
-                    "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_types.WebSearchProviderParameters"
+                    "description": "Parameters is nil when the request omitted the whole parameters object;\na present object updates only the fields it carries (pointer fields).",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/internal_handler.UpdateProviderParameters"
+                        }
+                    ]
                 }
             }
         },
@@ -43912,8 +44094,9 @@ const docTemplate = `{
             ],
             "properties": {
                 "ids": {
-                    "description": "Entries to delete (entry_id).",
+                    "description": "Entries to delete (entry_id).\n\nThe cap is enforced here, not only advertised to agents: each ID drives a\nchunk delete and a vector delete, so one request's work has to stay\nproportional to a bounded list. The web UI scroll-loads 20 rows at a time\nand its selection accumulates across those pages, so the UI does reach\npast 20 — it submits in 20-item chunks rather than relying on the server\nto accept an unbounded list.",
                     "type": "array",
+                    "maxItems": 20,
                     "minItems": 1,
                     "items": {
                         "type": "integer"

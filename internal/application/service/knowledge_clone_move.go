@@ -1557,6 +1557,7 @@ func (s *knowledgeService) enqueueMovedKnowledge(
 			TenantID:                 tenantID,
 			KnowledgeID:              knowledge.ID,
 			KnowledgeBaseID:          targetKB.ID,
+			FileSize:                 knowledge.FileSize,
 			FilePath:                 knowledge.FilePath,
 			FileName:                 knowledge.FileName,
 			FileType:                 getFileType(knowledge.FileName),

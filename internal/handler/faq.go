@@ -1,11 +1,16 @@
 package handler
 
 import (
+	"encoding/json"
+	stderrors "errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -40,19 +45,50 @@ func NewFAQHandler(
 // faqDeleteRequest is a request for deleting FAQ entries in batch
 type faqDeleteRequest struct {
 	// Entries to delete (entry_id).
-	IDs []int64 `json:"ids" binding:"required,min=1" extensions:"x-agent=entry_ids,x-agent-maximum=20"`
+	//
+	// The cap is enforced here, not only advertised to agents: each ID drives a
+	// chunk delete and a vector delete, so one request's work has to stay
+	// proportional to a bounded list. The web UI scroll-loads 20 rows at a time
+	// and its selection accumulates across those pages, so the UI does reach
+	// past 20 — it submits in 20-item chunks rather than relying on the server
+	// to accept an unbounded list.
+	IDs []int64 `json:"ids" binding:"required,min=1,max=20" extensions:"x-agent=entry_ids,x-agent-maximum=20"`
 }
 
 // faqEntryTagBatchRequest is a request for updating tags for FAQ entries in batch
 // key: entry seq_id, value: tag seq_id (nil to remove tag)
 type faqEntryTagBatchRequest struct {
-	Updates map[int64]*int64 `json:"updates" binding:"required,min=1"`
+	// Capped like the other entry-list endpoints: each key costs a chunk update
+	// plus a retriever sync, and the UI submits selections in 20-item chunks.
+	Updates map[int64]*int64 `json:"updates" binding:"required,min=1,max=20" extensions:"x-agent=updates,x-agent-maximum=20"`
 }
 
 // addSimilarQuestionsRequest is a request for adding similar questions to a FAQ entry
 type addSimilarQuestionsRequest struct {
 	// Phrasings to add to the entry.
 	SimilarQuestions []string `json:"similar_questions" binding:"required,min=1" extensions:"x-agent"`
+}
+
+// bindFAQJSON binds a FAQ route's JSON body under the FAQ byte budget.
+//
+// Every one of these routes takes a small payload, and without the cap
+// ShouldBindJSON reads however much the client sends before validating
+// anything. A body over the budget is 413 -- shrinking it is the fix, so a
+// caller that retries the same body would fail the same way -- while a
+// malformed body stays 400.
+func bindFAQJSON(c *gin.Context, dst any) bool {
+	ctx := c.Request.Context()
+	limitJSONBody(c, faqJSONMaxBytes())
+	if err := c.ShouldBindJSON(dst); err != nil {
+		logger.Error(ctx, "Failed to bind FAQ JSON payload", err)
+		if isRequestBodyTooLarge(err) {
+			c.Error(errors.NewPayloadTooLargeError(fmt.Sprintf("请求体超过 %d 字节上限，请减少内容后重试", faqJSONMaxBytes())))
+			return false
+		}
+		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
+		return false
+	}
+	return true
 }
 
 // updateLastFAQImportResultDisplayStatusRequest is the request payload for UpdateLastImportResultDisplayStatus
@@ -158,6 +194,8 @@ func parseOptionalFAQEnabled(c *gin.Context) (*bool, error) {
 // @Param        request  body      types.FAQBatchUpsertPayload  true  "批量操作请求"
 // @Success      200      {object}  handler.DataResponse{data=handler.TaskIDData}  "任务ID"
 // @Failure      400      {object}  errors.AppError           "请求参数错误"
+// @Failure      413      {object}  errors.AppError           "请求体超过 FAQ 字节预算（code 1011）"
+// @Failure      429      {object}  errors.AppError           "FAQ 导入请求过多（带 Retry-After）"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/{id}/faq/entries [post]
@@ -167,15 +205,91 @@ func (h *FAQHandler) UpsertEntries(c *gin.Context) {
 
 	// Cap the reader before binding: the payload's entries array has no count
 	// limit, and validation only runs after the whole array is materialized.
-	limitJSONBody(c, faqJSONMaxBytes())
+	maxBytes := faqJSONMaxBytes()
+	// The per-request cap bounds one body; this bounds how many are held at
+	// once. Taken before the body is read, so a refused request never
+	// allocates anything.
+	admission, admitErr := admitFAQImport(maxBytes)
+	if admitErr != nil {
+		c.Error(admitErr)
+		return
+	}
+	defer admission.release()
+	limitJSONBody(c, maxBytes)
+
+	// Read the (bounded) body once so the entry count can be checked before the
+	// array is materialized. Binding straight into the payload would allocate
+	// one struct per entry first, and 32 MiB of `{}` is millions of structs —
+	// the byte cap bounds the request, not the decoded heap, and this endpoint
+	// runs on hosts where that difference is the whole point.
+	raw, readErr := io.ReadAll(c.Request.Body)
+	if readErr != nil {
+		logger.Error(ctx, "Failed to read FAQ upsert payload", readErr)
+		if isRequestBodyTooLarge(readErr) {
+			c.Error(errors.NewPayloadTooLargeError(faqImportTooLargeBodyMessage(maxBytes, faqUpsertMode(raw))))
+			return
+		}
+		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(readErr.Error()))
+		return
+	}
+
+	maxEntries := faqImportMaxEntries()
+	count, countErr := countJSONArrayEntries(raw, "entries", maxEntries)
+	switch {
+	case countErr == nil && count > maxEntries:
+		logger.Warnf(ctx, "FAQ import rejected: at least %d entries exceeds the limit of %d", count, maxEntries)
+		_ = c.Error(errors.NewBadRequestError(faqImportTooManyEntriesMessage(maxEntries, count, faqUpsertMode(raw))))
+		return
+	case countErr != nil && !stderrors.Is(countErr, errNoEntriesField):
+		// The scan is the only thing bounding the decode that follows. Falling
+		// through on a scan error would hand an unverified body to the decoder
+		// and reintroduce the allocation the scan exists to prevent, so a body
+		// whose entries cannot be counted is refused here. errNoEntriesField is
+		// the one benign case: nothing to count, and the payload's own
+		// required-field validation reports it.
+		logger.Warnf(ctx, "FAQ import rejected: cannot count entries: %v", countErr)
+		_ = c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(countErr.Error()))
+		return
+	}
+
 	var req types.FAQBatchUpsertPayload
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := json.Unmarshal(raw, &req); err != nil {
 		logger.Error(ctx, "Failed to bind FAQ upsert payload", err)
 		if isRequestBodyTooLarge(err) {
-			_ = c.Error(errors.NewBadRequestError("request body is too large"))
+			c.Error(errors.NewPayloadTooLargeError(faqImportTooLargeBodyMessage(maxBytes, faqUpsertMode(raw))))
 			return
 		}
 		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
+		return
+	}
+
+	// Go's decoder ignores the `binding` tags that ShouldBindJSON used to
+	// enforce, so validate explicitly: without this, `mode` would accept any
+	// string and be reported by the service as a business error rather than as
+	// a malformed request.
+	//
+	// `entries`' own `required` tag is checked here too, but on its own it only
+	// rejects a missing array: validator's `required` for a slice means
+	// non-nil, so `"entries":[]` would pass it and reach the service, which
+	// refuses empty imports anyway. Rejecting it here keeps the answer a 400
+	// about the request instead of a business error about the import.
+	if err := binding.Validator.ValidateStruct(&req); err != nil {
+		logger.Warnf(ctx, "FAQ upsert payload failed validation: %v", err)
+		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
+		return
+	}
+	if len(req.Entries) == 0 {
+		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails("entries must not be empty"))
+		return
+	}
+
+	// The byte cap bounds what this request could allocate; this bounds what
+	// the asynchronous import will do with it. Both are needed: a body well
+	// under the byte cap can still carry far more entries than a batch is
+	// meant to, and every downstream structure grows with the entry count.
+	if len(req.Entries) > maxEntries {
+		logger.Warnf(ctx, "FAQ import rejected: %d entries exceeds the limit of %d", len(req.Entries), maxEntries)
+		_ = c.Error(errors.NewBadRequestError(secutils.FAQTooManyEntriesMessage(maxEntries, len(req.Entries), req.Mode, true)))
 		return
 	}
 
@@ -204,6 +318,7 @@ func (h *FAQHandler) UpsertEntries(c *gin.Context) {
 // @Param        request  body      types.FAQEntryPayload true  "FAQ条目"
 // @Success      200      {object}  handler.DataResponse{data=types.FAQEntry}  "创建的FAQ条目"
 // @Failure      400      {object}  errors.AppError         "请求参数错误"
+// @Failure      413       {object}  errors.AppError         "请求体超过 FAQ 字节预算（code 1011）"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @x-agent      {"id":"faq.create_entry","risk":"write","target":"knowledge_base.get","label":"name"}
@@ -214,9 +329,7 @@ func (h *FAQHandler) CreateEntry(c *gin.Context) {
 	kbID := secutils.SanitizeForLog(c.Param("id"))
 
 	var req types.FAQEntryPayload
-	if err := c.ShouldBindJSON(&req); err != nil {
-		logger.Error(ctx, "Failed to bind FAQ entry payload", err)
-		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
+	if !bindFAQJSON(c, &req) {
 		return
 	}
 
@@ -244,6 +357,7 @@ func (h *FAQHandler) CreateEntry(c *gin.Context) {
 // @Param        request   body      types.FAQEntryPayload true  "FAQ条目"
 // @Success      200       {object}  handler.DataResponse{data=types.FAQEntry}  "更新成功"
 // @Failure      400       {object}  errors.AppError         "请求参数错误"
+// @Failure      413       {object}  errors.AppError         "请求体超过 FAQ 字节预算（code 1011）"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @x-agent      {"id":"faq.update_entry","risk":"write","require_complete_target":true,"target":"faq.get_entry","label":"standard_question"}
@@ -254,9 +368,7 @@ func (h *FAQHandler) UpdateEntry(c *gin.Context) {
 	kbID := secutils.SanitizeForLog(c.Param("id"))
 
 	var req types.FAQEntryPayload
-	if err := c.ShouldBindJSON(&req); err != nil {
-		logger.Error(ctx, "Failed to bind FAQ entry payload", err)
-		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
+	if !bindFAQJSON(c, &req) {
 		return
 	}
 
@@ -289,6 +401,7 @@ func (h *FAQHandler) UpdateEntry(c *gin.Context) {
 // @Param        request  body      object  true  "标签更新请求"
 // @Success      200      {object}  handler.SuccessResponse  "更新成功"
 // @Failure      400      {object}  errors.AppError         "请求参数错误"
+// @Failure      413       {object}  errors.AppError         "请求体超过 FAQ 字节预算（code 1011）"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/{id}/faq/entries/tags [put]
@@ -297,9 +410,7 @@ func (h *FAQHandler) UpdateEntryTagBatch(c *gin.Context) {
 	kbID := secutils.SanitizeForLog(c.Param("id"))
 
 	var req faqEntryTagBatchRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		logger.Error(ctx, "Failed to bind FAQ entry tag batch payload", err)
-		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
+	if !bindFAQJSON(c, &req) {
 		return
 	}
 	if err := h.knowledgeService.UpdateFAQEntryTagBatch(ctx, kbID, req.Updates); err != nil {
@@ -322,6 +433,7 @@ func (h *FAQHandler) UpdateEntryTagBatch(c *gin.Context) {
 // @Param        request  body      types.FAQEntryFieldsBatchUpdate  true  "字段更新请求"
 // @Success      200      {object}  handler.SuccessResponse        "更新成功"
 // @Failure      400      {object}  errors.AppError               "请求参数错误"
+// @Failure      413       {object}  errors.AppError         "请求体超过 FAQ 字节预算（code 1011）"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/{id}/faq/entries/fields [put]
@@ -330,8 +442,11 @@ func (h *FAQHandler) UpdateEntryFieldsBatch(c *gin.Context) {
 	kbID := secutils.SanitizeForLog(c.Param("id"))
 
 	var req types.FAQEntryFieldsBatchUpdate
-	if err := c.ShouldBindJSON(&req); err != nil {
-		logger.Error(ctx, "Failed to bind FAQ entry fields batch payload", err)
+	if !bindFAQJSON(c, &req) {
+		return
+	}
+	if err := types.ValidateFAQEntryFieldsBatch(&req); err != nil {
+		logger.Warnf(ctx, "FAQ entry fields batch rejected: %v", err)
 		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
 		return
 	}
@@ -355,6 +470,7 @@ func (h *FAQHandler) UpdateEntryFieldsBatch(c *gin.Context) {
 // @Param        request  body      faqDeleteRequest  true  "要删除的FAQ ID列表(seq_id)"
 // @Success      200      {object}  handler.SuccessResponse  "删除成功"
 // @Failure      400      {object}  errors.AppError         "请求参数错误"
+// @Failure      413       {object}  errors.AppError         "请求体超过 FAQ 字节预算（code 1011）"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @x-agent      {"id":"faq.delete_entries","risk":"destructive","target":"knowledge_base.get","label":"name","items":{"param":"entry_ids","target":"faq.get_entry","as":"entry_id","label":"standard_question"}}
@@ -365,9 +481,7 @@ func (h *FAQHandler) DeleteEntries(c *gin.Context) {
 	kbID := secutils.SanitizeForLog(c.Param("id"))
 
 	var req faqDeleteRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		logger.Errorf(ctx, "Failed to bind FAQ delete payload: %s", secutils.SanitizeForLog(err.Error()))
-		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
+	if !bindFAQJSON(c, &req) {
 		return
 	}
 
@@ -392,6 +506,7 @@ func (h *FAQHandler) DeleteEntries(c *gin.Context) {
 // @Param        request  body      types.FAQSearchRequest  true  "搜索请求"
 // @Success      200      {object}  handler.DataResponse{data=[]types.FAQEntry}  "搜索结果"
 // @Failure      400      {object}  errors.AppError         "请求参数错误"
+// @Failure      413       {object}  errors.AppError         "请求体超过 FAQ 字节预算（code 1011）"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/{id}/faq/search [post]
@@ -400,9 +515,7 @@ func (h *FAQHandler) SearchFAQ(c *gin.Context) {
 	kbID := secutils.SanitizeForLog(c.Param("id"))
 
 	var req types.FAQSearchRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		logger.Error(ctx, "Failed to bind FAQ search payload", err)
-		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
+	if !bindFAQJSON(c, &req) {
 		return
 	}
 	req.QueryText = secutils.SanitizeForLog(req.QueryText)
@@ -436,6 +549,7 @@ func (h *FAQHandler) SearchFAQ(c *gin.Context) {
 // @Param        format  query     string  false  "导出格式：csv（默认）或 json"
 // @Success      200     {file}    file    "导出文件"
 // @Failure      400     {object}  errors.AppError  "请求参数错误"
+// @Failure      429     {object}  errors.AppError  "服务器正在执行另一个导出（带 Retry-After）"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/{id}/faq/entries/export [get]
@@ -443,6 +557,15 @@ func (h *FAQHandler) ExportEntries(c *gin.Context) {
 	ctx := c.Request.Context()
 	kbID := secutils.SanitizeForLog(c.Param("id"))
 	format := strings.ToLower(strings.TrimSpace(c.Query("format")))
+
+	// Both formats build the whole knowledge base in memory; see the gate's
+	// own comment for why only one runs at a time.
+	if busy, release := admitFAQExport(); busy != nil {
+		c.Error(busy)
+		return
+	} else {
+		defer release()
+	}
 
 	if format == "json" {
 		jsonData, err := h.knowledgeService.ExportFAQEntriesJSON(ctx, kbID)
@@ -554,6 +677,7 @@ func (h *FAQHandler) GetImportProgress(c *gin.Context) {
 // @Success      200     {object}  handler.SuccessResponse                         "更新成功"
 // @Failure      400     {object}  errors.AppError                                "请求参数错误"
 // @Failure      404     {object}  errors.AppError                                "知识库不存在或无导入记录"
+// @Failure      413       {object}  errors.AppError         "请求体超过 FAQ 字节预算（code 1011）"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/{id}/faq/import/last-result/display [put]
@@ -562,9 +686,7 @@ func (h *FAQHandler) UpdateLastImportResultDisplayStatus(c *gin.Context) {
 	kbID := secutils.SanitizeForLog(c.Param("id"))
 
 	var req updateLastFAQImportResultDisplayStatusRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		logger.Error(ctx, "Failed to bind display status update payload", err)
-		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
+	if !bindFAQJSON(c, &req) {
 		return
 	}
 
@@ -591,6 +713,7 @@ func (h *FAQHandler) UpdateLastImportResultDisplayStatus(c *gin.Context) {
 // @Success      200       {object}  handler.DataResponse{data=types.FAQEntry}      "更新后的FAQ条目"
 // @Failure      400       {object}  errors.AppError             "请求参数错误"
 // @Failure      404       {object}  errors.AppError             "条目不存在"
+// @Failure      413       {object}  errors.AppError         "请求体超过 FAQ 字节预算（code 1011）"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @x-agent      {"id":"faq.add_similar_questions","risk":"write","target":"faq.get_entry","label":"standard_question"}
@@ -607,9 +730,7 @@ func (h *FAQHandler) AddSimilarQuestions(c *gin.Context) {
 	}
 
 	var req addSimilarQuestionsRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		logger.Error(ctx, "Failed to bind add similar questions payload", err)
-		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
+	if !bindFAQJSON(c, &req) {
 		return
 	}
 

@@ -1024,6 +1024,29 @@ func (r *chunkRepository) FindFAQChunkWithDuplicateQuestion(
 	return &chunk, nil
 }
 
+// SeqIDsInUse reports which of the given chunk seq ids are already taken.
+// Unscoped: a soft-deleted row still occupies its value in the unique index.
+func (r *chunkRepository) SeqIDsInUse(ctx context.Context, ids []int64) (map[int64]bool, error) {
+	inUse := make(map[int64]bool, len(ids))
+	const batchSize = 1000
+	for start := 0; start < len(ids); start += batchSize {
+		end := start + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		var found []int64
+		if err := r.db.WithContext(ctx).Unscoped().Model(&types.Chunk{}).
+			Where("seq_id IN ?", ids[start:end]).
+			Pluck("seq_id", &found).Error; err != nil {
+			return nil, err
+		}
+		for _, id := range found {
+			inUse[id] = true
+		}
+	}
+	return inUse, nil
+}
+
 // ListAllFAQChunksForExport lists all FAQ chunks for export with full metadata, tag_id, is_enabled, and flags.
 // Uses batch query to handle large datasets.
 func (r *chunkRepository) ListAllFAQChunksForExport(
@@ -1038,7 +1061,7 @@ func (r *chunkRepository) ListAllFAQChunksForExport(
 	for {
 		var batchChunks []*types.Chunk
 		if err := r.db.WithContext(ctx).
-			Select("id, metadata, tag_id, is_enabled, flags").
+			Select("id, seq_id, metadata, tag_id, is_enabled, flags").
 			Where("tenant_id = ? AND knowledge_id = ? AND chunk_type = ? AND status = ?",
 				tenantID, knowledgeID, types.ChunkTypeFAQ, types.ChunkStatusIndexed).
 			Order("created_at ASC").

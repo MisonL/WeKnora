@@ -150,6 +150,15 @@ flowchart LR
 | `WEKNORA_TRUSTED_PROXIES` | 空 | gin 信任代理 CIDR（逗号分隔） |
 | `MAX_SKILL_BUNDLE_SIZE_MB` | 256 MiB（默认不小于 MAX_FILE_SIZE_MB，上限 512 MiB） | 技能 ZIP 上传与来源下载上限；反向代理请求体限制也需足够大 |
 | `MAX_FILE_SIZE_MB` | 50 | 上传文件大小限制（app/frontend/docreader 三处共用）；Helm 部署使用 `global.maxFileSizeMB` |
+| `UPLOAD_MAX_CONCURRENCY` | 2 | 同时接受的知识库文档上传请求数；超出返回 429（带 `Retry-After`），客户端稍后重试 |
+| `UPLOAD_BIG_BYTES` | 32 MiB | 声明大小达到该值的上传算"大文件"；大文件同时只接受 1 个，小文件仍受总槽位数约束 |
+| `UPLOAD_MAX_INFLIGHT_BYTES` | 128 MiB | 在途上传的声明字节累计上限；无 `Content-Length` 的请求按 `MAX_FILE_SIZE_MB` 对应的字节数（MB × 1048576）计。该值必须不小于 `MAX_FILE_SIZE_MB × 1048576`（默认 50 MiB = 52428800），否则达到单文件上限的上传在准入时必被 429。单位是字节：填 MB 数值会让正常上传全部 429 |
+| `UPLOAD_MAX_BACKGROUND_BYTES` | 512 MiB | 已入队/解析中文档的解析任务预算累计上限，由解析任务持有到结束才释放（上传断开不释放）。计量优先取上传声明的字节数，其次取源文件大小或文本长度；两者都未知（如 `local://` 等 provider URL）时按 4 MiB 下限计。按每个运行解析任务的进程计算 |
+| `UPLOAD_MAX_BACKGROUND_JOBS` | 1000 | 同时排队或运行的解析任务数上限；字节预算挡不住大量小文档，用该值兜底。按每个运行解析任务的进程计算 |
+| `WEKNORA_FAQ_IMPORT_MAX_ENTRIES` | 1000 | FAQ 单次导入的条目上限，超限在解析前拒绝（400）；前端读同一值做预检。Helm 用 `global.faqImportMaxEntries` |
+| `WEKNORA_FAQ_IMPORT_MAX_JSON_BYTES` | 32 MiB | FAQ 单次导入的请求体字节上限，且不超过 `MAX_FILE_SIZE_MB`；超限返回 413（code 1011）。Helm 用 `global.faqImportMaxJSONBytes` |
+| `WEKNORA_FAQ_IMPORT_MAX_INFLIGHT` | 4 | 同时在途的 FAQ 导入请求数；超出返回 429 而非排队。Helm 用 `global.faqImportMaxInflight` |
+| `WEKNORA_FAQ_IMPORT_MAX_INFLIGHT_BYTES` | 96 MiB | 同时在途导入请求体的累计字节；每个请求按 `WEKNORA_FAQ_IMPORT_MAX_JSON_BYTES` 的有效值（默认 32 MiB，且不超过 `MAX_FILE_SIZE_MB`）预留，故该值必须不小于它，否则单请求自身的预留就会超预算。注意默认值之间的耦合：4 个满尺寸请求需要 128 MiB，默认 96 MiB 只放得下 3 个，第 4 个必然 429；要真正同时容纳 `FAQ_IMPORT_MAX_INFLIGHT` 个满尺寸导入，该值至少取 `MAX_INFLIGHT × MAX_JSON_BYTES`。Helm 用 `global.faqImportMaxInflightBytes` |
 | `CONCURRENCY_POOL_SIZE` | 5 | 通用并发池 |
 | `APP_EXTERNAL_URL` / `FRONTEND_BASE_URL` | 空 | IM 渠道图片/文件外链的外部可达 URL / 前端外部 origin |
 | `WEKNORA_MCP_ASK_TIMEOUT` | `4m` | MCP Server 内置 `ask` 的单次服务端时限；支持 Go duration（如 `10m`）或纯秒数（如 `600`），非法或非正值回退到 `4m`。客户端与反向代理的独立超时需另行配置 |

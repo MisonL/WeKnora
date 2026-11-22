@@ -58,6 +58,7 @@ func (req FAQBatchPatchRequest) updatePlan() (*types.FAQEntryFieldsBatchUpdate, 
 // @Param request body FAQBatchPatchRequest true "批量修改请求"
 // @Success 200 {object} handler.SuccessResponse
 // @Failure 400 {object} errors.AppError
+// @Failure 413 {object} errors.AppError "请求体超过 FAQ 字节预算（code 1011）"
 // @Security Bearer
 // @Security ApiKeyAuth
 // @x-agent {"id":"faq.batch_update","risk":"write","target":"knowledge_base.get","label":"name","items":{"param":"entry_ids","target":"faq.get_entry","as":"entry_id","label":"standard_question"}}
@@ -65,8 +66,7 @@ func (req FAQBatchPatchRequest) updatePlan() (*types.FAQEntryFieldsBatchUpdate, 
 // @Router /knowledge-bases/{id}/faq/entries [patch]
 func (h *FAQHandler) PatchEntriesBatch(c *gin.Context) {
 	var req FAQBatchPatchRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		_ = c.Error(errors.NewBadRequestError("Invalid FAQ batch patch").WithDetails(err.Error()))
+	if !bindFAQJSON(c, &req) {
 		return
 	}
 	plan, err := req.updatePlan()

@@ -67,6 +67,11 @@ type TenantRepository interface {
 	DeleteTenant(ctx context.Context, id uint64) error
 	// AdjustStorageUsed adjusts the storage used for a tenant
 	AdjustStorageUsed(ctx context.Context, tenantID uint64, delta int64) error
+	// ReserveStorageQuota adds delta under a row lock only if the result stays
+	// within the tenant's quota, and reports whether it did. Reading the quota
+	// outside the lock lets two concurrent writers both pass a check whose sum
+	// exceeds it; this makes the check and the reservation one operation.
+	ReserveStorageQuota(ctx context.Context, tenantID uint64, delta int64) (bool, error)
 	// BulkSetStorageQuota — see TenantService.BulkSetStorageQuota.
 	BulkSetStorageQuota(ctx context.Context, quotaBytes int64) (int64, error)
 }

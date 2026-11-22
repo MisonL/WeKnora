@@ -8,7 +8,9 @@ import (
 	"io"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/application/access"
@@ -19,6 +21,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/embedding"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
@@ -33,6 +36,9 @@ func (s *knowledgeService) UpsertFAQEntries(ctx context.Context,
 	if payload == nil || len(payload.Entries) == 0 {
 		return "", werrors.NewBadRequestError("FAQ 条目不能为空")
 	}
+	// The mode decides what an over-limit refusal tells the caller to do, so it
+	// is settled before the cap is applied: checking the size first would word
+	// the advice for an unknown mode even for an explicit replace request.
 	if payload.Mode == "" {
 		payload.Mode = types.FAQBatchModeAppend
 	}
@@ -40,12 +46,29 @@ func (s *knowledgeService) UpsertFAQEntries(ctx context.Context,
 		return "", werrors.NewBadRequestError("模式仅支持 append 或 replace")
 	}
 
+	// The HTTP handler already refuses an over-limit batch before decoding it;
+	// this is the same bound for every other path into the import. It has to
+	// hold here too because the work that follows scales with the entry count
+	// and not with the request's bytes.
+	if maxEntries := secutils.GetFAQImportMaxEntries(); len(payload.Entries) > maxEntries {
+		// Worded by the same helper as the handler, so the two entry points
+		// cannot disagree about what a replace caller should do: splitting
+		// deletes everything outside each batch, and switching to append leaves
+		// the old entries in place next to the new ones.
+		return "", werrors.NewBadRequestError(
+			secutils.FAQTooManyEntriesMessage(maxEntries, len(payload.Entries), payload.Mode, true))
+	}
+
+	// The caller's own tenant, taken before writableFAQKnowledgeBase switches
+	// the context to the knowledge base's owner: importing into a shared KB
+	// runs as the owner, but the task id is what the progress route checks
+	// against the caller's tenant, and minting it with the owner's would make
+	// the initiator's own poll a 404.
+	callerTenantID, _ := types.TenantIDFromContext(ctx)
+
 	// 验证知识库是否存在且有效
 	kb, ctx, err := s.writableFAQKnowledgeBase(ctx, kbID)
 	if err != nil {
-		return "", err
-	}
-	if err := s.validateFAQImportTags(ctx, kb, payload.Entries); err != nil {
 		return "", err
 	}
 
@@ -55,61 +78,74 @@ func (s *knowledgeService) UpsertFAQEntries(ctx context.Context,
 	// 客户端传入的 task_id 会进文件名和 Redis key，必须是无路径分隔符的标识符。
 	taskID := strings.TrimSpace(payload.TaskID)
 	if taskID == "" {
-		taskID = secutils.GenerateTaskID("faq_import", tenantID, kbID)
+		taskID = secutils.GenerateTaskID("faq_import", faqImportTaskTenant(callerTenantID, tenantID), kbID)
 	} else if err := secutils.ValidateTaskID(taskID); err != nil {
 		return "", werrors.NewBadRequestError("task_id 格式不合法")
 	}
 
-	var knowledgeID string
+	// 记录任务入队时间
+	// The millisecond value breaks ties inside one second: two imports can
+	// legitimately finish and be replaced within a second, and a second-
+	// resolution comparison cannot tell that apart from a same-second
+	// completion of the task being retried.
+	enqueuedAtTime := time.Now()
+	enqueuedAt := enqueuedAtTime.Unix()
+	enqueuedAtMillis := enqueuedAtTime.UnixMilli()
+	instanceID := uuid.NewString()
+	runningInfoSet := false
+	enqueueSucceeded := false
 
-	// 检查是否有正在进行的导入任务（通过Redis）
-	runningTaskID, err := s.getRunningFAQImportTaskID(ctx, kbID)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to check running import task: %v", err)
-		// 检查失败不影响导入，继续执行
-	} else if runningTaskID != "" {
-		logger.Warnf(ctx, "Import task already running for KB %s: %s", kbID, runningTaskID)
-		return "", werrors.NewBadRequestError(fmt.Sprintf("该知识库已有导入任务正在进行中（任务ID: %s），请等待完成后再试", runningTaskID))
+	// Claim the per-KB lease before anything is queued or created. This is one
+	// atomic operation, so two concurrent submissions cannot both be admitted
+	// the way the previous GET-then-SET check allowed. It also runs before the
+	// FAQ container row is ensured: that step is a find-then-create with no
+	// unique constraint, so two concurrent submissions could both insert one.
+	// A Redis failure refuses the submission instead of proceeding: admitting
+	// an import while the guard is unreachable is exactly the case the guard
+	// exists for.
+	if err := s.claimFAQImportLease(ctx, kbID, &runningFAQImportInfo{
+		TaskID:     taskID,
+		EnqueuedAt: enqueuedAt,
+		InstanceID: instanceID,
+	}); err != nil {
+		var held *faqImportLeaseHeldError
+		if errors.As(err, &held) {
+			logger.Warnf(ctx, "Import task already running for KB %s: %s", kbID, held.TaskID)
+			return "", werrors.NewBadRequestError(fmt.Sprintf("该知识库已有导入任务正在进行中（任务ID: %s），请等待完成后再试", held.TaskID))
+		}
+		logger.Errorf(ctx, "Failed to claim FAQ import lease for KB %s: %v", kbID, err)
+		return "", werrors.NewInternalServerError("暂时无法确认该知识库的导入状态，请稍后重试")
+	}
+	runningInfoSet = true
+	defer func() {
+		if !runningInfoSet || enqueueSucceeded {
+			return
+		}
+		if clearErr := s.clearRunningFAQImportInfoIfMatches(context.WithoutCancel(ctx), kbID, taskID, instanceID, enqueuedAt); clearErr != nil {
+			logger.Warnf(ctx, "Failed to clear FAQ import running info after setup failure: %v", clearErr)
+		}
+	}()
+
+	if err := s.validateFAQImportTags(ctx, kb, payload.Entries); err != nil {
+		return "", err
 	}
 
-	// 确保 FAQ knowledge 存在
+	var knowledgeID string
+
+	// 确保 FAQ knowledge 存在（持有租约后执行，同一 KB 只会有一个提交在建容器）
 	faqKnowledge, err := s.ensureFAQKnowledge(ctx, tenantID, kb)
 	if err != nil {
 		return "", fmt.Errorf("failed to ensure FAQ knowledge: %w", err)
 	}
 	knowledgeID = faqKnowledge.ID
 
-	// 记录任务入队时间
-	enqueuedAt := time.Now().Unix()
-	instanceID := uuid.NewString()
-	runningInfoSet := false
-	enqueueSucceeded := false
-
-	// 设置 KB 的运行中任务信息
-	if err := s.setRunningFAQImportInfo(ctx, kbID, &runningFAQImportInfo{
-		TaskID:     taskID,
-		EnqueuedAt: enqueuedAt,
-		InstanceID: instanceID,
-	}); err != nil {
-		logger.Errorf(ctx, "Failed to set running FAQ import task info: %v", err)
-		// 不影响任务执行，继续
-	} else {
-		runningInfoSet = true
-	}
-	defer func() {
-		if !runningInfoSet || enqueueSucceeded {
-			return
-		}
-		if clearErr := s.clearRunningFAQImportInfoIfMatches(ctx, kbID, taskID, instanceID, enqueuedAt); clearErr != nil {
-			logger.Warnf(ctx, "Failed to clear FAQ import running info after setup failure: %v", clearErr)
-		}
-	}()
-
 	// 初始化导入任务状态到Redis
 	progress := &types.FAQImportProgress{
 		TaskID:        taskID,
 		KBID:          kbID,
 		KnowledgeID:   knowledgeID,
+		TenantID:      tenantID,
+		InstanceID:    instanceID,
 		Status:        types.FAQImportStatusPending,
 		Progress:      0,
 		Total:         len(payload.Entries),
@@ -135,15 +171,16 @@ func (s *knowledgeService) UpsertFAQEntries(ctx context.Context,
 
 	// 构建任务 payload
 	taskPayload := types.FAQImportPayload{
-		TenantID:    tenantID,
-		TaskID:      taskID,
-		KBID:        kbID,
-		KnowledgeID: knowledgeID,
-		Mode:        payload.Mode,
-		DryRun:      payload.DryRun,
-		EnqueuedAt:  enqueuedAt,
-		InstanceID:  instanceID,
-		Initiator:   types.TaskInitiatorFromContext(ctx),
+		TenantID:         tenantID,
+		TaskID:           taskID,
+		KBID:             kbID,
+		KnowledgeID:      knowledgeID,
+		Mode:             payload.Mode,
+		DryRun:           payload.DryRun,
+		EnqueuedAt:       enqueuedAt,
+		EnqueuedAtMillis: enqueuedAtMillis,
+		InstanceID:       instanceID,
+		Initiator:        types.TaskInitiatorFromContext(ctx),
 	}
 
 	// 阈值：超过 200 条或序列化后超过 50KB 时使用对象存储
@@ -164,7 +201,7 @@ func (s *knowledgeService) UpsertFAQEntries(ctx context.Context,
 		logger.Infof(ctx, "FAQ entries size: %d bytes, uploading to object storage", len(entriesData))
 
 		// 上传到私有桶（主桶），任务处理完成后清理
-		fileName, err := faqImportEntriesFileName(taskID, enqueuedAt)
+		fileName, err := faqImportEntriesFileName(taskID, enqueuedAt, instanceID)
 		if err != nil {
 			return "", fmt.Errorf("invalid task id for object name: %w", err)
 		}
@@ -193,7 +230,7 @@ func (s *knowledgeService) UpsertFAQEntries(ctx context.Context,
 	if len(payloadBytes) > payloadSizeThreshold && taskPayload.EntriesURL == "" {
 		// payload 太大但还没上传，现在上传
 		entriesData, _ := json.Marshal(payload.Entries)
-		fileName, nameErr := faqImportEntriesFileName(taskID, enqueuedAt)
+		fileName, nameErr := faqImportEntriesFileName(taskID, enqueuedAt, instanceID)
 		if nameErr != nil {
 			return "", fmt.Errorf("invalid task id for object name: %w", nameErr)
 		}
@@ -249,8 +286,13 @@ func (s *knowledgeService) UpsertFAQEntries(ctx context.Context,
 	return taskID, nil
 }
 
-func faqImportEntriesFileName(taskID string, enqueuedAt int64) (string, error) {
-	return secutils.SafeFileName(fmt.Sprintf("faq_import_entries_%s_%d.json", taskID, enqueuedAt))
+// faqImportEntriesFileName names the object that carries a large import's
+// entries. The instance id is part of the name: two submissions may reuse a
+// task id within the same second (for example when a lost marker lets both
+// through), and a shared object name would let one refusal delete the file the
+// other is about to read.
+func faqImportEntriesFileName(taskID string, enqueuedAt int64, instanceID string) (string, error) {
+	return secutils.SafeFileName(fmt.Sprintf("faq_import_entries_%s_%d_%s.json", taskID, enqueuedAt, instanceID))
 }
 
 // generateFailedEntriesCSV 生成失败条目的 CSV 文件并上传
@@ -268,21 +310,24 @@ func (s *knowledgeService) generateFailedEntriesCSV(ctx context.Context,
 
 	// 写入数据行
 	for _, entry := range failedEntries {
-		// CSV 转义：如果内容包含逗号、引号或换行，需要用引号包裹并转义内部引号
-		reason := csvEscape(entry.Reason)
-		tagName := csvEscape(entry.TagName)
-		standardQ := csvEscape(entry.StandardQuestion)
+		// The same escaping as the export endpoint: a failing entry's question is
+		// user text, so a leading '=' would make this download a formula in Excel
+		// (CWE-1236). The web importer strips the marker again, so a fixed file
+		// re-uploaded there restores the original text.
+		reason := escapeCSVField(entry.Reason)
+		tagName := escapeCSVField(entry.TagName)
+		standardQ := escapeCSVField(entry.StandardQuestion)
 		similarQs := ""
 		if len(entry.SimilarQuestions) > 0 {
-			similarQs = csvEscape(strings.Join(entry.SimilarQuestions, "##"))
+			similarQs = escapeCSVField(strings.Join(entry.SimilarQuestions, "##"))
 		}
 		negativeQs := ""
 		if len(entry.NegativeQuestions) > 0 {
-			negativeQs = csvEscape(strings.Join(entry.NegativeQuestions, "##"))
+			negativeQs = escapeCSVField(strings.Join(entry.NegativeQuestions, "##"))
 		}
 		answers := ""
 		if len(entry.Answers) > 0 {
-			answers = csvEscape(strings.Join(entry.Answers, "##"))
+			answers = escapeCSVField(strings.Join(entry.Answers, "##"))
 		}
 		answerAll := "false"
 		if entry.AnswerAll {
@@ -316,15 +361,6 @@ func (s *knowledgeService) generateFailedEntriesCSV(ctx context.Context,
 	return filePath, nil
 }
 
-// csvEscape 转义 CSV 字段
-func csvEscape(s string) string {
-	if strings.ContainsAny(s, ",\"\n\r") {
-		// 将内部引号替换为两个引号，并用引号包裹整个字段
-		return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
-	}
-	return s
-}
-
 // saveFAQImportResultToDatabase 保存FAQ导入结果统计到数据库
 func (s *knowledgeService) saveFAQImportResultToDatabase(ctx context.Context,
 	payload *types.FAQImportPayload, progress *types.FAQImportProgress, originalTotalEntries int,
@@ -343,6 +379,7 @@ func (s *knowledgeService) saveFAQImportResultToDatabase(ctx context.Context,
 	}
 
 	// 创建导入结果统计
+	importedAt := time.Now()
 	importResult := &types.FAQImportResult{
 		TotalEntries:       originalTotalEntries,
 		SuccessCount:       progress.SuccessCount,
@@ -352,7 +389,8 @@ func (s *knowledgeService) saveFAQImportResultToDatabase(ctx context.Context,
 		MergedCount:        progress.MergedCount,
 		AddedCount:         progress.AddedCount,
 		ImportMode:         payload.Mode,
-		ImportedAt:         time.Now(),
+		ImportedAt:         importedAt,
+		ImportedAtMillis:   importedAt.UnixMilli(),
 		TaskID:             payload.TaskID,
 		ProcessingTime:     time.Now().Unix() - progress.CreatedAt, // 处理耗时（秒）
 		DisplayStatus:      "open",                                 // 新导入的结果默认显示
@@ -741,6 +779,18 @@ func (s *knowledgeService) validateEntriesForAppendModeWithProgress(ctx context.
 			fe.FailureType = "post_validation"
 			progress.FailedEntries = append(progress.FailedEntries, fe)
 			logger.Infof(ctx, "FAQ entry %d: post-validation failed, conflicting negatives after merge: %v", i, conflictingNegatives)
+		} else if shapeErr := secutils.CheckFAQEntryShape(
+			existingMeta.StandardQuestion, mergedSimilar, mergedNegative, entry.Answers,
+		); shapeErr != nil {
+			// 并集本身可能把两边各自合规的条目顶出上限：相似问数量翻倍、
+			// 文本合计超字节数，都会在下游按相似问倍数膨胀索引文本。
+			postValidationFailed[i] = true
+			delete(mergeChunkMap, i)
+			progress.FailedCount++
+			fe := buildFAQFailedEntry(i, "后校验失败：合并后超出单条上限："+shapeErr.Error(), entry)
+			fe.FailureType = "post_validation"
+			progress.FailedEntries = append(progress.FailedEntries, fe)
+			logger.Infof(ctx, "FAQ entry %d: post-validation failed, merged entry too large: %v", i, shapeErr)
 		} else {
 			mergeCount++
 		}
@@ -955,6 +1005,71 @@ func (s *knowledgeService) validateEntriesForReplaceModeWithProgress(ctx context
 	return validIndicesAfterStdQ
 }
 
+// dropUnusableExternalSeqIDs clears the client-supplied seq ids that cannot be
+// written as chunk seq ids: values at or above the sequence start, values a row
+// already holds (soft-deleted rows included, because the unique index covers
+// them), and values repeated within the same payload. Clearing one is not an
+// error -- the row is created with the next id the database assigns, which is
+// what an import without ids gets anyway.
+//
+// Replace mode clears them all: it creates the new rows before deleting the old
+// ones, so every preserved id would collide with the row it came from and fail
+// the whole insert batch.
+func (s *knowledgeService) dropUnusableExternalSeqIDs(
+	ctx context.Context,
+	entries []*types.FAQEntryPayload,
+	replaceMode bool,
+) {
+	if replaceMode || s.chunkRepo == nil {
+		for _, e := range entries {
+			if e != nil {
+				e.ID = nil
+			}
+		}
+		return
+	}
+	requested := make([]int64, 0, len(entries))
+	for _, e := range entries {
+		if e == nil || e.ID == nil {
+			continue
+		}
+		if *e.ID <= 0 || *e.ID >= types.FAQExternalSeqIDLimit {
+			e.ID = nil
+			continue
+		}
+		requested = append(requested, *e.ID)
+	}
+	if len(requested) == 0 {
+		return
+	}
+	inUse, err := s.chunkRepo.SeqIDsInUse(ctx, requested)
+	if err != nil {
+		logger.Warnf(ctx, "Could not check client-supplied seq ids, letting the database assign them: %v", err)
+		for _, e := range entries {
+			if e != nil {
+				e.ID = nil
+			}
+		}
+		return
+	}
+	seen := make(map[int64]bool, len(requested))
+	cleared := 0
+	for _, e := range entries {
+		if e == nil || e.ID == nil {
+			continue
+		}
+		if inUse[*e.ID] || seen[*e.ID] {
+			e.ID = nil
+			cleared++
+			continue
+		}
+		seen[*e.ID] = true
+	}
+	if cleared > 0 {
+		logger.Infof(ctx, "Dropped %d client-supplied seq ids that were taken or duplicated", cleared)
+	}
+}
+
 // unionStrings 合并两个字符串切片并去重（完全匹配）
 func unionStrings(a, b []string) []string {
 	seen := make(map[string]bool, len(a)+len(b))
@@ -998,6 +1113,14 @@ func validateFAQEntryPayloadBasic(entry *types.FAQEntryPayload) error {
 	if !hasValidAnswer {
 		return fmt.Errorf("答案不能全为空")
 	}
+	// The per-entry shape bounds belong here, not only in the sanitiser that
+	// runs later while planning: an entry rejected there is dropped as
+	// "skipped" after the validation count has already been fixed, so an
+	// oversized entry used to be reported as imported. Rejecting it at
+	// validation puts it in the failure record where the caller can see it.
+	if err := secutils.CheckFAQEntryShape(standardQ, entry.SimilarQuestions, entry.NegativeQuestions, entry.Answers); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1011,7 +1134,8 @@ type faqMergeOperation struct {
 
 // calculateAppendOperations 计算 Append 模式下的操作（支持智能合并）。
 // 如果 entry 的标准问在 KB 中已存在，则视为合并操作（相似问 / 反例并集，
-// 答案 / 策略以新条目为准）；否则视为新建。无变化（hash 一致且操作位
+// 答案以新条目为准；策略仅在条目显式给出时以新条目为准，省略则沿用库内
+// 已存策略）；否则视为新建。无变化（hash 一致且操作位
 // 也未变）的合并目标会被 skip 掉，避免无效写库 / 重建索引。
 //
 // 内部 master 行为，对应开源版仅 "重复 = 失败" 的简化逻辑。FAQ 导入的
@@ -1053,6 +1177,12 @@ func (s *knowledgeService) calculateAppendOperations(ctx context.Context,
 	mergeOps = make([]faqMergeOperation, 0)
 
 	for entryIdx, entry := range entries {
+		// A payload that omits the strategy -- an exported spreadsheet without
+		// that column, or an API client that never sent it -- means "leave the
+		// stored strategy alone", not "reset to all". sanitizeFAQEntryPayload
+		// defaults a nil strategy to all, so the original has to be captured
+		// before the merge below decides whether anything changed.
+		strategySpecified := entry.AnswerStrategy != nil && *entry.AnswerStrategy != ""
 		meta, sErr := sanitizeFAQEntryPayload(&entry)
 		if sErr != nil {
 			skippedCount++
@@ -1070,21 +1200,46 @@ func (s *knowledgeService) calculateAppendOperations(ctx context.Context,
 				mergedSimilar := unionStrings(existingMeta.SimilarQuestions, meta.SimilarQuestions)
 				mergedNegative := unionStrings(existingMeta.NegativeQuestions, meta.NegativeQuestions)
 
+				// Rows written before the strategy was stored carry an empty
+				// value; the runtime treats that as all, so compare against the
+				// effective value or an unchanged row would look changed and be
+				// rewritten and re-indexed on every import.
+				storedStrategy := existingMeta.AnswerStrategy
+				if storedStrategy == "" {
+					storedStrategy = types.AnswerStrategyAll
+				}
+				answerStrategy := meta.AnswerStrategy
+				if !strategySpecified {
+					answerStrategy = storedStrategy
+				}
+
 				mergedMeta := &types.FAQChunkMetadata{
 					StandardQuestion:  existingMeta.StandardQuestion,
 					SimilarQuestions:  mergedSimilar,
 					NegativeQuestions: mergedNegative,
 					Answers:           meta.Answers,
-					AnswerStrategy:    meta.AnswerStrategy,
+					AnswerStrategy:    answerStrategy,
 					Version:           existingMeta.Version + 1,
 					Source:            existingMeta.Source,
+				}
+
+				// The union can push two individually valid entries past the
+				// per-entry limits. Validation records that as a failure; this
+				// is the defensive copy for a plan that skipped validation.
+				if shapeErr := secutils.CheckFAQEntryShape(
+					mergedMeta.StandardQuestion, mergedMeta.SimilarQuestions, mergedMeta.NegativeQuestions, mergedMeta.Answers,
+				); shapeErr != nil {
+					skippedCount++
+					logger.Warnf(ctx, "Skipping merge for FAQ entry %q: merged entry exceeds the per-entry limits: %v",
+						meta.StandardQuestion, shapeErr)
+					continue
 				}
 
 				newHash := types.CalculateFAQContentHash(mergedMeta)
 				enabledChanged := entry.IsEnabled != nil && *entry.IsEnabled != existingChunk.IsEnabled
 				recommendedChanged := entry.IsRecommended != nil &&
 					*entry.IsRecommended != existingChunk.Flags.HasFlag(types.ChunkFlagRecommended)
-				answerStrategyChanged := meta.AnswerStrategy != existingMeta.AnswerStrategy
+				answerStrategyChanged := answerStrategy != storedStrategy
 				if existingChunk.ContentHash == newHash && !enabledChanged && !recommendedChanged && !answerStrategyChanged {
 					skippedCount++
 					logger.Infof(ctx, "Skipping merge for unchanged FAQ entry: %s", meta.StandardQuestion)
@@ -1357,7 +1512,16 @@ func (s *knowledgeService) calculateReplaceOperations(ctx context.Context,
 				*ewh.entry.IsRecommended != existingChunk.Flags.HasFlag(types.ChunkFlagRecommended)
 			answerStrategyChanged := false
 			if existingMeta, metaErr := existingChunk.FAQMetadata(); metaErr == nil && existingMeta != nil {
-				answerStrategyChanged = ewh.meta.AnswerStrategy != existingMeta.AnswerStrategy
+				if ewh.entry.AnswerStrategy != nil && *ewh.entry.AnswerStrategy != "" {
+					answerStrategyChanged = ewh.meta.AnswerStrategy != existingMeta.AnswerStrategy
+				} else if existingMeta.AnswerStrategy != "" {
+					// An omitted strategy is "leave it as stored". The entry
+					// below is re-created when its tag or operational flags
+					// changed, and that rebuild sanitizes the payload -- which
+					// would otherwise default the rebuilt row to all and reset
+					// a stored random strategy as a side effect.
+					ewh.entry.AnswerStrategy = &existingMeta.AnswerStrategy
+				}
 			}
 
 			if existingChunk.TagID != newTagID || enabledChanged || recommendedChanged || answerStrategyChanged {
@@ -1503,6 +1667,17 @@ func (s *knowledgeService) executeFAQImport(ctx context.Context, taskID string, 
 		}
 	}
 
+	// A client-supplied seq id is written into a globally unique column, so it
+	// can only be honoured where it cannot collide. Clear the rest before the
+	// batches run; see dropUnusableExternalSeqIDs.
+	plannedEntries := make([]*types.FAQEntryPayload, 0, len(plan))
+	for i := range plan {
+		if plan[i].entry != nil {
+			plannedEntries = append(plannedEntries, plan[i].entry)
+		}
+	}
+	s.dropUnusableExternalSeqIDs(ctx, plannedEntries, payload.Mode == types.FAQBatchModeReplace)
+
 	createPlanned := 0
 	for i := startIndex; i < len(plan); i++ {
 		if plan[i].entry != nil {
@@ -1524,6 +1699,9 @@ func (s *knowledgeService) executeFAQImport(ctx context.Context, taskID string, 
 	if startIndex >= len(plan) {
 		logger.Infof(ctx, "FAQ import task %s: nothing left to create from index %d", taskID, startIndex)
 		if payload.Mode == types.FAQBatchModeReplace && len(chunksToDelete) > 0 {
+			if err := s.ensureFAQImportLeaseForWriteStrict(ctx, kbID, taskID, progress.InstanceID); err != nil {
+				return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
+			}
 			return s.deleteReplacedFAQChunks(ctx, taskID, tenantID, kb, faqKnowledge, chunksToDelete)
 		}
 		return nil
@@ -1547,6 +1725,14 @@ func (s *knowledgeService) executeFAQImport(ctx context.Context, taskID string, 
 		end := i + faqImportBatchSize
 		if end > len(plan) {
 			end = len(plan)
+		}
+
+		// One batch can outlive the ten-minute lease (a slow embedding backend,
+		// a large merge), and the progress save at its end is the next lease
+		// check -- too late to stop before this batch's writes. Check ownership
+		// at the batch start, before anything in it is persisted.
+		if err := s.ensureFAQImportLeaseForWrite(ctx, kbID, taskID, progress.InstanceID); err != nil {
+			return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
 		}
 
 		// 1. 本批内的合并操作（Append 模式的智能合并）
@@ -1713,8 +1899,8 @@ func (s *knowledgeService) executeFAQImport(ctx context.Context, taskID string, 
 		if totalEntries > 0 {
 			displayPercent = int(float64(processedDisplay) / float64(totalEntries) * 100)
 		}
-		if saveErr := s.saveFAQImportProgress(ctx, progress); saveErr != nil {
-			logger.Errorf(ctx, "Failed to save FAQ import progress: %v", saveErr)
+		if saveErr := s.saveFAQImportProgressOrStop(ctx, progress); saveErr != nil {
+			return saveErr
 		}
 		if err := s.updateFAQImportProgressStatus(ctx, taskID, "", 0, types.FAQImportStatusProcessing, displayPercent, totalEntries, processedDisplay, fmt.Sprintf("正在处理第 %d/%d 条", processedDisplay, totalEntries), ""); err != nil {
 			logger.Errorf(ctx, "Failed to update task progress: %v", err)
@@ -1735,7 +1921,12 @@ func (s *knowledgeService) executeFAQImport(ctx context.Context, taskID string, 
 	}
 
 	// Replace 模式：新块全部创建并索引成功后才删除被替换的旧块。
+	// Deletion is the one irreversible step of a replace import, so ownership
+	// is re-checked immediately before it.
 	if payload.Mode == types.FAQBatchModeReplace && len(chunksToDelete) > 0 {
+		if err := s.ensureFAQImportLeaseForWriteStrict(ctx, kbID, taskID, progress.InstanceID); err != nil {
+			return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
+		}
 		if err := s.deleteReplacedFAQChunks(ctx, taskID, tenantID, kb, faqKnowledge, chunksToDelete); err != nil {
 			return err
 		}
@@ -1799,8 +1990,10 @@ func (s *knowledgeService) updateFAQImportProgressStatus(
 	if err != nil {
 		// If not found, create a new progress entry
 		existingProgress = &types.FAQImportProgress{
-			TaskID:    taskID,
-			CreatedAt: time.Now().Unix(),
+			TaskID:     taskID,
+			InstanceID: instanceID,
+			CreatedAt:  time.Now().Unix(),
+			TenantID:   tenantIDFromContext(ctx),
 		}
 	}
 
@@ -1817,16 +2010,31 @@ func (s *knowledgeService) updateFAQImportProgressStatus(
 		existingProgress.Error = ""
 	}
 
-	// 任务完成或失败时，清除 running key
-	if status == types.FAQImportStatusCompleted || status == types.FAQImportStatusFailed {
-		if existingProgress.KBID != "" {
-			if clearErr := s.clearRunningFAQImportInfoIfMatches(ctx, existingProgress.KBID, taskID, instanceID, enqueuedAt); clearErr != nil {
-				logger.Errorf(ctx, "Failed to clear running FAQ import task ID: %v", clearErr)
+	// 任务完成或失败时，清除 running key。必须在最后一次进度保存之后再清：
+	// 保存会续约（租约已过期时还会被本任务收回重建），先清后存会把刚删掉的
+	// 标记又写回来，知识库看起来仍有一个正在运行的导入。
+	clearing := status == types.FAQImportStatusCompleted || status == types.FAQImportStatusFailed
+	if err := s.saveFAQImportProgress(ctx, existingProgress); err != nil {
+		// A failed run whose lease was taken by another task still owns its own
+		// progress key (the taker uses a different task id). Writing it blind is
+		// safe and is the only way the initiator sees the run end instead of
+		// polling "processing" until the record expires. A newer instance of the
+		// same task id owns this record instead, so it is left alone.
+		if status == types.FAQImportStatusFailed && errors.Is(err, errFAQImportLeaseTaken) &&
+			!s.faqImportLeaseHeldByAnotherInstanceOfSameTask(ctx, existingProgress.KBID, taskID, instanceID) {
+			if writeErr := s.writeFAQImportProgress(context.WithoutCancel(ctx), existingProgress); writeErr != nil {
+				logger.Warnf(ctx, "Failed to record the end of taken-over FAQ import task %s: %v", taskID, writeErr)
 			}
+		} else {
+			return err
 		}
 	}
-
-	return s.saveFAQImportProgress(ctx, existingProgress)
+	if clearing && existingProgress.KBID != "" {
+		if clearErr := s.clearRunningFAQImportInfoIfMatches(context.WithoutCancel(ctx), existingProgress.KBID, taskID, instanceID, enqueuedAt); clearErr != nil {
+			logger.Errorf(ctx, "Failed to clear running FAQ import task ID: %v", clearErr)
+		}
+	}
+	return nil
 }
 
 // cleanupFAQEntriesFileOnFinalFailure 在任务最终失败时清理对象存储中的 entries 文件
@@ -1847,16 +2055,51 @@ type runningFAQImportInfo struct {
 	TaskID     string `json:"task_id"`
 	EnqueuedAt int64  `json:"enqueued_at"`
 	InstanceID string `json:"instance_id,omitempty"`
+	// ExpiresAt is the lease deadline in unix nanoseconds, used only by the
+	// in-memory path (Lite, no Redis). Redis expires the key itself; the map
+	// has no TTL, and without a deadline a worker that died without clearing
+	// its marker blocked the knowledge base forever.
+	ExpiresAt int64 `json:"expires_at,omitempty"`
+}
+
+// memRunningImportInfo returns the in-memory marker for kbID, dropping it when
+// its lease has lapsed.
+func (s *knowledgeService) memRunningImportInfo(kbID string) *runningFAQImportInfo {
+	v, ok := s.memFAQRunningImport.Load(kbID)
+	if !ok {
+		return nil
+	}
+	info, _ := v.(*runningFAQImportInfo)
+	if info == nil {
+		return nil
+	}
+	if info.ExpiresAt > 0 && time.Now().UnixNano() >= info.ExpiresAt {
+		s.memFAQRunningImport.CompareAndDelete(kbID, info)
+		return nil
+	}
+	return info
+}
+
+// sweepMemRunningImports drops markers whose lease has expired. Lazy expiry in
+// memRunningImportInfo only runs when the same knowledge base is touched again,
+// so markers of knowledge bases that are never imported again would otherwise
+// stay in the map for the life of the process.
+func (s *knowledgeService) sweepMemRunningImports() {
+	now := time.Now().UnixNano()
+	s.memFAQRunningImport.Range(func(key, value any) bool {
+		info, _ := value.(*runningFAQImportInfo)
+		if info == nil || (info.ExpiresAt > 0 && now >= info.ExpiresAt) {
+			s.memFAQRunningImport.CompareAndDelete(key, value)
+		}
+		return true
+	})
 }
 
 // getRunningFAQImportInfo checks if there's a running FAQ import task for the given KB
 // Returns the task info if found, nil otherwise
 func (s *knowledgeService) getRunningFAQImportInfo(ctx context.Context, kbID string) (*runningFAQImportInfo, error) {
 	if s.redisClient == nil {
-		if v, ok := s.memFAQRunningImport.Load(kbID); ok {
-			return v.(*runningFAQImportInfo), nil
-		}
-		return nil, nil
+		return s.memRunningImportInfo(kbID), nil
 	}
 	key := getFAQImportRunningKey(kbID)
 	data, err := s.redisClient.Get(ctx, key).Result()
@@ -1889,9 +2132,354 @@ func (s *knowledgeService) getRunningFAQImportTaskID(ctx context.Context, kbID s
 	return info.TaskID, nil
 }
 
+// claimFAQImportLease takes the per-KB import lease atomically.
+//
+// The previous check was GET-then-SET: two requests could both read "free" and
+// both write, so two imports ran against the same knowledge base and the
+// replace path could delete rows the other had just created. SET NX is one
+// round trip and only one caller can win it.
+//
+// A Redis error is reported as an error rather than treated as "free". Failing
+// open would let the very concurrency this lock exists to prevent through at
+// exactly the moment the lock cannot be trusted; the caller turns it into a
+// refusal the operator can retry.
+//
+// The lease is finite so a worker that dies without clearing it does not block
+// the knowledge base forever. Every progress save refreshes it, which is what
+// makes the lease a liveness signal rather than a deadline on the import.
+func (s *knowledgeService) claimFAQImportLease(ctx context.Context, kbID string, info *runningFAQImportInfo) error {
+	if s.redisClient == nil {
+		// Single process: LoadOrStore is the same atomicity as SET NX. An
+		// expired marker is dropped first -- the map has no TTL, and the lease
+		// must be reclaimable after a crash just as Redis makes it expire.
+		// Claims are rare, so this is also where expired markers of knowledge
+		// bases that are never imported again get swept.
+		s.sweepMemRunningImports()
+		info.ExpiresAt = time.Now().Add(faqImportLeaseTTL).UnixNano()
+		for {
+			existing, loaded := s.memFAQRunningImport.LoadOrStore(kbID, info)
+			if !loaded {
+				return nil
+			}
+			prev, _ := existing.(*runningFAQImportInfo)
+			if prev == nil {
+				if s.memFAQRunningImport.CompareAndDelete(kbID, existing) {
+					continue
+				}
+				return &faqImportLeaseHeldError{}
+			}
+			if prev.ExpiresAt > 0 && time.Now().UnixNano() >= prev.ExpiresAt {
+				if s.memFAQRunningImport.CompareAndDelete(kbID, prev) {
+					continue
+				}
+			}
+			taskID := prev.TaskID
+			return &faqImportLeaseHeldError{TaskID: taskID}
+		}
+	}
+	key := getFAQImportRunningKey(kbID)
+	data, err := json.Marshal(info)
+	if err != nil {
+		return fmt.Errorf("failed to marshal running info: %w", err)
+	}
+	ok, err := s.redisClient.SetNX(ctx, key, data, faqImportLeaseTTL).Result()
+	if err != nil {
+		return fmt.Errorf("failed to claim FAQ import lease: %w", err)
+	}
+	if !ok {
+		held, _ := s.getRunningFAQImportInfo(ctx, kbID)
+		taskID := ""
+		if held != nil {
+			taskID = held.TaskID
+		}
+		return &faqImportLeaseHeldError{TaskID: taskID}
+	}
+	return nil
+}
+
+// faqImportLeaseHeldError reports that another import already holds the lease.
+// It is a refusal, not a failure: the caller returns a 400 that names the task.
+type faqImportLeaseHeldError struct{ TaskID string }
+
+func (e *faqImportLeaseHeldError) Error() string {
+	return "FAQ import lease already held"
+}
+
+// faqImportTaskTenant is the tenant stamped into an FAQ import's task id: the
+// caller's, so the caller can poll the progress their own submission returned.
+// The KB's effective tenant is the fallback for call paths without a caller
+// tenant, and is what the task itself runs as either way.
+func faqImportTaskTenant(callerTenantID, kbTenantID uint64) uint64 {
+	if callerTenantID != 0 {
+		return callerTenantID
+	}
+	return kbTenantID
+}
+
+// errFAQImportLeaseTaken reports that another import took the KB's lease, so
+// this one is no longer the single writer it was admitted as.
+var errFAQImportLeaseTaken = errors.New("another FAQ import holds the knowledge base lease")
+
+// renewFAQImportLeaseScript extends the lease only when it still belongs to
+// this run, atomically. The previous GET-then-Expire left a window: the key
+// could lapse after the GET and be claimed by a new task, and the Expire then
+// refreshed the new task's marker -- two imports writing the same knowledge
+// base. the instance id (when both sides have one) is part of identity, so a
+// new instance that reused the task id is not mistaken for this one.
+const renewFAQImportLeaseScript = `
+local v = redis.call('GET', KEYS[1])
+if not v then return 'missing' end
+local ok, info = pcall(cjson.decode, v)
+if ok and type(info) == 'table' then
+  if tostring(info['task_id'] or '') ~= ARGV[1] then return 'taken' end
+  local iid = tostring(info['instance_id'] or '')
+  -- A modern marker belongs to exactly one instance; a legacy run cannot renew
+  -- it merely because the task id matches.
+  if iid ~= '' and (ARGV[2] == '' or iid ~= ARGV[2]) then return 'taken' end
+else
+  -- Legacy marker: the raw value was the task id.
+  if v ~= ARGV[1] then return 'taken' end
+end
+redis.call('PEXPIRE', KEYS[1], ARGV[3])
+return 'renewed'
+`
+
+// errFAQImportLeaseMissing reports that there was no lease to renew and the
+// caller asked not to reclaim one. The heartbeat uses it: a marker that is gone
+// was either cleared because the run finished or expired and belongs to nobody,
+// and the heartbeat must not resurrect it -- doing so after finalization would
+// leave an orphan lease blocking the knowledge base for a whole TTL.
+var errFAQImportLeaseMissing = errors.New("FAQ import lease is gone")
+
+// errFAQImportLeaseUnverifiable reports that the lease store could not be
+// reached. Ordinary renewals log and continue -- a transient error should not
+// fail an import -- but the gates in front of an irreversible write refuse to
+// act on a lease they could not verify.
+var errFAQImportLeaseUnverifiable = errors.New("FAQ import lease could not be verified")
+
+// renewFAQImportLease extends the lease while the import makes progress, so a
+// long import is not mistaken for an abandoned one.
+//
+// It only extends a lease this run owns: an unconditional Expire would refresh
+// whatever task holds the key, and a renewal after the key lapsed would be a
+// silent no-op, letting a second import be admitted while this one keeps
+// writing. When the key is gone, nobody holds it and it is taken back for this
+// run; when it names another task (or another instance of the same task id),
+// errFAQImportLeaseTaken stops this import. A Redis error is only logged: the
+// lease guards admission, and failing an import over a transient renewal error
+// would be worse than a late renewal (the ownership check at ProcessFAQImport
+// still runs on every attempt).
+func (s *knowledgeService) renewFAQImportLease(ctx context.Context, kbID, taskID, instanceID string) error {
+	err := s.renewFAQImportLeaseAllow(ctx, kbID, taskID, instanceID, true)
+	if errors.Is(err, errFAQImportLeaseUnverifiable) {
+		return nil
+	}
+	return err
+}
+
+// renewFAQImportLeaseAllow is renewFAQImportLease with control over reclaiming
+// a missing key. allowReclaim=false is for periodic renewals (the heartbeat):
+// those must never recreate a marker that was cleared, or a run that has just
+// finished would leave the knowledge base blocked until the lease expires.
+func (s *knowledgeService) renewFAQImportLeaseAllow(
+	ctx context.Context, kbID, taskID, instanceID string, allowReclaim bool,
+) error {
+	if kbID == "" || taskID == "" {
+		return nil
+	}
+	if s.redisClient == nil {
+		deadline := time.Now().Add(faqImportLeaseTTL).UnixNano()
+		for {
+			info := s.memRunningImportInfo(kbID)
+			if info == nil {
+				if !allowReclaim {
+					return errFAQImportLeaseMissing
+				}
+				// Mirror the Redis reclaim: the map entry has expired, so this
+				// run takes the lease back rather than renewing nothing.
+				reclaim := &runningFAQImportInfo{TaskID: taskID, InstanceID: instanceID, ExpiresAt: deadline}
+				existing, loaded := s.memFAQRunningImport.LoadOrStore(kbID, reclaim)
+				if !loaded {
+					return nil
+				}
+				info, _ = existing.(*runningFAQImportInfo)
+				if info == nil {
+					return nil
+				}
+			}
+			if info.TaskID != "" && info.TaskID != taskID {
+				return errFAQImportLeaseTaken
+			}
+			if info.InstanceID != "" && info.InstanceID != instanceID {
+				return errFAQImportLeaseTaken
+			}
+			// Publish a fresh copy instead of mutating the stored one: readers
+			// hold the same pointer, so an in-place deadline update would race
+			// with them. CompareAndSwap keeps a takeover that happened between
+			// the load and here from being overwritten by this stale renewal.
+			refreshed := &runningFAQImportInfo{
+				TaskID: info.TaskID, EnqueuedAt: info.EnqueuedAt,
+				InstanceID: info.InstanceID, ExpiresAt: deadline,
+			}
+			if s.memFAQRunningImport.CompareAndSwap(kbID, info, refreshed) {
+				return nil
+			}
+		}
+	}
+	key := getFAQImportRunningKey(kbID)
+	state, err := s.redisClient.Eval(ctx, renewFAQImportLeaseScript, []string{key},
+		taskID, instanceID, faqImportLeaseTTL.Milliseconds()).Text()
+	if err != nil {
+		logger.Warnf(ctx, "Failed to renew FAQ import lease for KB %s: %v", kbID, err)
+		return errFAQImportLeaseUnverifiable
+	}
+	if state == "taken" {
+		return errFAQImportLeaseTaken
+	}
+	if state != "missing" {
+		return nil
+	}
+	if !allowReclaim {
+		return errFAQImportLeaseMissing
+	}
+	// The key lapsed between two renewals (a queue wait or a long batch). Take
+	// it back with a SetNX so a simultaneous re-claim still has one winner.
+	reclaim := &runningFAQImportInfo{TaskID: taskID, InstanceID: instanceID}
+	reclaimData, _ := json.Marshal(reclaim)
+	claimed, setErr := s.redisClient.SetNX(ctx, key, reclaimData, faqImportLeaseTTL).Result()
+	if setErr != nil {
+		logger.Warnf(ctx, "Failed to reclaim FAQ import lease for KB %s: %v", kbID, setErr)
+		return nil
+	}
+	if !claimed {
+		return errFAQImportLeaseTaken
+	}
+	return nil
+}
+
+// ensureFAQImportLeaseForWrite renews the lease before a run writes anything.
+// On a takeover it closes out this run's record (unless the taker is a newer
+// instance of the same task id) and reports the takeover, so the caller stops
+// with asynq.SkipRetry instead of writing beside the new owner.
+func (s *knowledgeService) ensureFAQImportLeaseForWrite(ctx context.Context, kbID, taskID, instanceID string) error {
+	if err := s.renewFAQImportLease(ctx, kbID, taskID, instanceID); err != nil {
+		if errors.Is(err, errFAQImportLeaseTaken) &&
+			!s.faqImportLeaseHeldByAnotherInstanceOfSameTask(ctx, kbID, taskID, instanceID) {
+			s.markFAQImportStopped(ctx, taskID, instanceID, errFAQImportStoppedMessage)
+		}
+		return err
+	}
+	return nil
+}
+
+// ensureFAQImportLeaseForWriteStrict is the gate for an irreversible write (the
+// replace-mode deletion, the result write at finalization). Unlike the ordinary
+// gate it also stops the run when the lease store cannot be reached: acting on
+// an unverified lease is exactly how a partitioned process writes beside a new
+// owner.
+func (s *knowledgeService) ensureFAQImportLeaseForWriteStrict(ctx context.Context, kbID, taskID, instanceID string) error {
+	err := s.renewFAQImportLeaseAllow(ctx, kbID, taskID, instanceID, true)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, errFAQImportLeaseUnverifiable) {
+		return err
+	}
+	if errors.Is(err, errFAQImportLeaseTaken) &&
+		!s.faqImportLeaseHeldByAnotherInstanceOfSameTask(ctx, kbID, taskID, instanceID) {
+		s.markFAQImportStopped(ctx, taskID, instanceID, errFAQImportStoppedMessage)
+	}
+	return err
+}
+
+// startFAQImportLeaseHeartbeat keeps the lease fresh while this run works.
+// Progress saves renew too, but only once per batch: a batch that embeds and
+// indexes slowly could outlive the lease, and a new submission would then be
+// admitted beside the running import. The heartbeat ties the lease to the
+// process's liveness instead of the batch cadence. On a takeover it calls
+// onLost so the caller can cancel the run; a missing lease only stops the
+// heartbeat, because cancelling then would abort a run that is finishing and
+// has just cleared its own marker. The returned stop function is safe to call
+// more than once.
+func (s *knowledgeService) startFAQImportLeaseHeartbeat(
+	ctx context.Context, kbID, taskID, instanceID string, onLost func(),
+) func() {
+	if kbID == "" || taskID == "" || faqImportLeaseHeartbeatInterval <= 0 {
+		return func() {}
+	}
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	var once sync.Once
+	go func() {
+		defer close(exited)
+		ticker := time.NewTicker(faqImportLeaseHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// WithoutCancel: a request-scoped cancellation must not abort
+				// the renewal of a lease the work may still be using. Reclaim is
+				// off: a marker that is gone was cleared or expired, and the
+				// heartbeat must not recreate it -- that would leave an orphan
+				// lease blocking the KB after this import has finished.
+				err := s.renewFAQImportLeaseAllow(
+					context.WithoutCancel(ctx), kbID, taskID, instanceID, false)
+				if err == nil {
+					continue
+				}
+				if errors.Is(err, errFAQImportLeaseMissing) {
+					logger.Infof(ctx, "FAQ import %s lease is gone; heartbeat stops", taskID)
+				} else if errors.Is(err, errFAQImportLeaseUnverifiable) {
+					// The store is unreachable, not the lease lost; keep trying.
+					logger.Warnf(ctx, "FAQ import %s lease could not be verified: %v", taskID, err)
+					continue
+				} else {
+					logger.Warnf(ctx, "FAQ import %s lost its lease while running: %v", taskID, err)
+					if onLost != nil {
+						onLost()
+					}
+				}
+				return
+			}
+		}
+	}()
+	// Waiting for the goroutine keeps a renewal that is already in flight from
+	// landing after the caller has cleared the marker.
+	return func() {
+		once.Do(func() { close(done) })
+		<-exited
+	}
+}
+
+// faqImportLeaseHeldByAnotherInstanceOfSameTask reports whether the KB lease
+// now names a different instance of this same task id. That newer instance
+// owns the progress record for the id, so a superseded instance must not
+// finish it with a failure of its own. Another *task* holding the lease does
+// not block that: the record under this task id is this run's to close out.
+// A read failure returns false ("not proven").
+func (s *knowledgeService) faqImportLeaseHeldByAnotherInstanceOfSameTask(
+	ctx context.Context, kbID, taskID, instanceID string,
+) bool {
+	if kbID == "" || taskID == "" {
+		return false
+	}
+	info, err := s.getRunningFAQImportInfo(ctx, kbID)
+	if err != nil || info == nil || info.TaskID != taskID {
+		return false
+	}
+	return info.InstanceID != "" && instanceID != "" && info.InstanceID != instanceID
+}
+
 // setRunningFAQImportInfo sets the running task info for a KB
 func (s *knowledgeService) setRunningFAQImportInfo(ctx context.Context, kbID string, info *runningFAQImportInfo) error {
 	if s.redisClient == nil {
+		if info.ExpiresAt == 0 {
+			info.ExpiresAt = time.Now().Add(faqImportLeaseTTL).UnixNano()
+		}
 		s.memFAQRunningImport.Store(kbID, info)
 		return nil
 	}
@@ -1913,37 +2501,112 @@ func (s *knowledgeService) clearRunningFAQImportTaskID(ctx context.Context, kbID
 	return s.redisClient.Del(ctx, key).Err()
 }
 
+// clearRunningFAQImportInfoIfMatchesScript deletes the marker only if it still
+// names this run. The previous GET-then-DEL let the key lapse in between and be
+// re-claimed by a new instance, which the DEL then removed: the new import ran
+// without a lease and a third submission could be admitted beside it.
+const clearRunningFAQImportInfoIfMatchesScript = `
+local v = redis.call('GET', KEYS[1])
+if not v then return 0 end
+local ok, info = pcall(cjson.decode, v)
+if ok and type(info) == 'table' then
+  if tostring(info['task_id'] or '') ~= ARGV[1] then return 0 end
+  local iid = tostring(info['instance_id'] or '')
+  local want_iid = ARGV[2]
+  if iid ~= '' then
+    -- A modern marker names one instance; a legacy run (no instance id) must
+    -- not clear a lease it cannot prove it owns. Legacy markers fall back to
+    -- the raw task id / timestamp below.
+    if want_iid == '' or iid ~= want_iid then return 0 end
+  else
+    local want = tonumber(ARGV[3]) or 0
+    if want ~= 0 then
+      local t = tonumber(info['enqueued_at']) or 0
+      if t ~= 0 and t ~= want then return 0 end
+    end
+  end
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+if v == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0
+`
+
 func (s *knowledgeService) clearRunningFAQImportInfoIfMatches(ctx context.Context, kbID, taskID, instanceID string, enqueuedAt int64) error {
 	if s.redisClient == nil {
 		if v, ok := s.memFAQRunningImport.Load(kbID); ok {
 			info, _ := v.(*runningFAQImportInfo)
 			if runningFAQImportInfoMatches(info, taskID, instanceID, enqueuedAt) {
-				s.memFAQRunningImport.Delete(kbID)
+				// CompareAndDelete: a claim that landed after the load above
+				// stored a different marker, and deleting by key would drop it.
+				s.memFAQRunningImport.CompareAndDelete(kbID, info)
 			}
 		}
 		return nil
 	}
 
-	info, err := s.getRunningFAQImportInfo(ctx, kbID)
-	if err != nil {
-		return err
-	}
-	if !runningFAQImportInfoMatches(info, taskID, instanceID, enqueuedAt) {
-		return nil
-	}
-
 	key := getFAQImportRunningKey(kbID)
-	return s.redisClient.Del(ctx, key).Err()
+	if err := s.redisClient.Eval(ctx, clearRunningFAQImportInfoIfMatchesScript, []string{key},
+		taskID, instanceID, strconv.FormatInt(enqueuedAt, 10)).Err(); err != nil {
+		return fmt.Errorf("failed to clear running FAQ import info: %w", err)
+	}
+	return nil
 }
 
 func runningFAQImportInfoMatches(info *runningFAQImportInfo, taskID, instanceID string, enqueuedAt int64) bool {
 	if info == nil || info.TaskID != taskID {
 		return false
 	}
-	if info.InstanceID != "" && instanceID != "" {
+	// A modern marker names one instance, and only that instance matches. A
+	// legacy marker (no instance id) is identified by task id and timestamp,
+	// as it always was.
+	if info.InstanceID != "" {
 		return info.InstanceID == instanceID
 	}
 	return enqueuedAt == 0 || info.EnqueuedAt == 0 || info.EnqueuedAt == enqueuedAt
+}
+
+// faqEntryIndicesInRange reports whether every cached entry index addresses a
+// position in a payload of the given length, and that the indices are strictly
+// increasing as verification produced them.
+func faqEntryIndicesInRange(indices []int, entries int) bool {
+	prev := -1
+	for _, idx := range indices {
+		if idx < 0 || idx >= entries || idx <= prev {
+			return false
+		}
+		prev = idx
+	}
+	return true
+}
+
+// readFAQEntriesPayload reads an import file from object storage under the
+// same byte budget the HTTP handler applies to inline payloads.
+//
+// This is the one path a payload enters memory without that budget: tasks
+// queued before the budget existed, and retries of them, carry an object URL
+// instead of inline entries. Reading them whole would restore the unbounded
+// allocation the budget removed, so an oversized object is refused rather
+// than retried -- it will be oversized on every attempt.
+func readFAQEntriesPayload(ctx context.Context, files interfaces.FileService, path string) ([]byte, error) {
+	reader, err := files.GetFile(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download entries: %w", err)
+	}
+	defer reader.Close()
+
+	budget := secutils.GetFAQImportMaxJSONBytes()
+	data, err := io.ReadAll(io.LimitReader(reader, budget+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read entries data: %w", err)
+	}
+	if int64(len(data)) > budget {
+		return nil, fmt.Errorf("%w: FAQ entries file exceeds the %d byte budget", asynq.SkipRetry, budget)
+	}
+	return data, nil
 }
 
 // faqIndexOperationalState 是索引记录里随条目一起落库的运营字段快照。
@@ -2209,13 +2872,40 @@ func (s *knowledgeService) indexFAQChunks(ctx context.Context,
 	)
 
 	var size int64
+	var reserved int64
 	if adjustStorage {
 		estimateStartTime := time.Now()
 		size = retrieveEngine.EstimateStorageSize(ctx, embeddingModel, indexInfo)
 		estimateDuration := time.Since(estimateStartTime)
 		logger.Debugf(ctx, "indexFAQChunks: estimated storage size %d bytes in %v", size, estimateDuration)
-		if tenantInfo.StorageQuota > 0 && tenantInfo.StorageUsed+size > tenantInfo.StorageQuota {
-			return types.NewStorageQuotaExceededError()
+		// Reserve before writing rather than checking now and adjusting after:
+		// between the two, another import reads the same StorageUsed and both
+		// pass a check whose sum exceeds the quota. The reservation is taken
+		// under the row lock and released again if indexing fails below.
+		if size > 0 {
+			ok, err := s.tenantRepo.ReserveStorageQuota(ctx, tenantInfo.ID, size)
+			if err != nil {
+				return fmt.Errorf("failed to reserve storage quota: %w", err)
+			}
+			if !ok {
+				return types.NewStorageQuotaExceededError()
+			}
+			reserved = size
+			defer func() {
+				if reserved == 0 {
+					return
+				}
+				// Indexing failed (or was refused later): give the reservation
+				// back so a failed import does not consume the tenant's quota.
+				// The refund must not inherit the request's cancellation -- a
+				// cancelled context is exactly when the caller went away, and
+				// skipping the refund there would leak the reservation until
+				// the tenant's quota is reset.
+				refundCtx := context.WithoutCancel(ctx)
+				if err := s.tenantRepo.AdjustStorageUsed(refundCtx, tenantInfo.ID, -reserved); err != nil {
+					logger.Errorf(ctx, "Failed to release FAQ storage reservation of %d bytes: %v", reserved, err)
+				}
+			}()
 		}
 	}
 
@@ -2247,9 +2937,12 @@ func (s *knowledgeService) indexFAQChunks(ctx context.Context,
 
 	if adjustStorage && size > 0 {
 		adjustStartTime := time.Now()
-		if err := s.tenantRepo.AdjustStorageUsed(ctx, tenantInfo.ID, size); err == nil {
-			tenantInfo.StorageUsed += size
-		}
+		// The bytes were already reserved before indexing; the write above
+		// completes that reservation, so it must not be adjusted again. The
+		// reservation is only marked complete once the knowledge row that
+		// carries the new StorageSize is persisted: until then a failure has
+		// to refund it, or the retry would reserve the same bytes again.
+		tenantInfo.StorageUsed += size
 		knowledge.StorageSize += size
 		adjustDuration := time.Since(adjustStartTime)
 		if adjustDuration > 50*time.Millisecond {
@@ -2265,6 +2958,10 @@ func (s *knowledgeService) indexFAQChunks(ctx context.Context,
 	updateDuration := time.Since(updateStartTime)
 	if updateDuration > 50*time.Millisecond {
 		logger.Debugf(ctx, "indexFAQChunks: updated knowledge in %v", updateDuration)
+	}
+	if err == nil && adjustStorage && size > 0 {
+		// Persisted: the reservation is the tenant's real usage now.
+		reserved = 0
 	}
 
 	totalDuration := time.Since(indexStartTime)
@@ -2315,7 +3012,9 @@ func (s *knowledgeService) deleteFAQChunkVectors(ctx context.Context,
 		return err
 	}
 	if size > 0 {
-		if err := s.tenantRepo.AdjustStorageUsed(ctx, tenantInfo.ID, -size); err == nil {
+		// Refunding a deletion must not be skipped because the caller went
+		// away: the vectors are gone either way.
+		if err := s.tenantRepo.AdjustStorageUsed(context.WithoutCancel(ctx), tenantInfo.ID, -size); err == nil {
 			tenantInfo.StorageUsed -= size
 			if tenantInfo.StorageUsed < 0 {
 				tenantInfo.StorageUsed = 0
@@ -2331,12 +3030,21 @@ func (s *knowledgeService) deleteFAQChunkVectors(ctx context.Context,
 	return s.repo.UpdateKnowledge(ctx, knowledge)
 }
 
-func faqImportCompletedOutcome(successCount, failedCount, skippedCount int) types.AuditOutcome {
-	if successCount > 0 && (failedCount > 0 || skippedCount > 0) {
+// faqImportCompletedOutcome classifies a finished import for the activity log.
+//
+// A partially failed entry still wrote content, so it makes the outcome
+// "partial" rather than "failed" even when nothing landed intact; leaving it
+// out of the arguments made a batch that lost every entry's questions read as
+// a clean success.
+func faqImportCompletedOutcome(successCount, partialFailedCount, failedCount, skippedCount int) types.AuditOutcome {
+	if successCount > 0 && (partialFailedCount > 0 || failedCount > 0 || skippedCount > 0) {
 		return types.AuditOutcomePartial
 	}
 	if successCount > 0 {
 		return types.AuditOutcomeSuccess
+	}
+	if partialFailedCount > 0 {
+		return types.AuditOutcomePartial
 	}
 	if failedCount > 0 && skippedCount > 0 {
 		return types.AuditOutcomePartial
@@ -2360,12 +3068,17 @@ func faqImportActivityDetails(payload *types.FAQImportPayload, progress *types.F
 		details["total"] = total
 	}
 	details["count"] = progress.SuccessCount
+	if progress.PartialFailedCount > 0 {
+		details["partial_failed"] = progress.PartialFailedCount
+	}
 	if progress.FailedCount > 0 {
 		details["failed"] = progress.FailedCount
 	}
 	skipped := progress.SkippedCount
 	if skipped <= 0 && total > 0 {
-		skipped = total - progress.SuccessCount - progress.FailedCount
+		// The remainder has to subtract partial failures too: they are not
+		// successes, so leaving them out would report each one as skipped.
+		skipped = total - progress.SuccessCount - progress.PartialFailedCount - progress.FailedCount
 		if skipped < 0 {
 			skipped = 0
 		}
@@ -2427,6 +3140,21 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 		return fmt.Errorf("%w: FAQ task document does not belong to its KB", asynq.SkipRetry)
 	}
 
+	// A replace retry can arrive after the lease lapsed, a newer import was
+	// admitted, ran and finished. Its result is persisted on this knowledge
+	// row, and the marker it used is gone, so the running-instance check below
+	// sees nothing. Without this, a stale replace retry would compute its
+	// deletion set from its own old payload and delete everything the newer
+	// import added. Append-only retries are not fenced here: they never delete,
+	// and refusing them would also reject safe recovery of the same import.
+	// The comparison is against the enqueue time, which a retry preserves:
+	// an import that completed at or after this task was accepted makes it
+	// stale. The stored result's task id is deliberately not required nor
+	// compared, because results written by older builds may lack it.
+	if result := faqImportStaleResult(knowledge, &payload); result != nil {
+		return s.refuseStaleFAQImport(ctx, &payload, result)
+	}
+
 	// A replay must not start writing progress for another accepted import.
 	// Missing markers can expire before a manual retry; retain that recovery
 	// path and the existing timestamp fallback for legacy task instances.
@@ -2439,9 +3167,41 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 			return fmt.Errorf("invalid running FAQ import task ID: %w", err)
 		}
 		if !runningFAQImportInfoMatches(running, payload.TaskID, payload.InstanceID, payload.EnqueuedAt) {
+			// Only a different task's record is ours to finish. A reused task id
+			// (this task id, another instance) means the progress record belongs
+			// to the newer instance, and marking it failed would report that
+			// instance as stopped while it is about to run.
+			if running.TaskID != payload.TaskID {
+				s.markFAQImportStopped(ctx, payload.TaskID, payload.InstanceID, errFAQImportStoppedMessage)
+			}
 			return fmt.Errorf("%w: another FAQ import instance owns this KB", asynq.SkipRetry)
 		}
 	}
+	// The lease can lapse while the task waits for a worker slot. Re-assert it
+	// now that this attempt has passed the ownership check: with the key gone
+	// this takes it back, so the rest of the run is not unleased.
+	if err := s.ensureFAQImportLeaseForWrite(ctx, payload.KBID, payload.TaskID, payload.InstanceID); err != nil {
+		return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
+	}
+
+	// The check above ran before this attempt held the lease; an import that
+	// finished in between is invisible to it. Re-read the row under the lease so
+	// a replace retry cannot delete entries the newer import just added.
+	if fresh, freshErr := s.repo.GetKnowledgeByID(ctx, payload.TenantID, payload.KnowledgeID); freshErr == nil && fresh != nil {
+		if result := faqImportStaleResult(fresh, &payload); result != nil {
+			return s.refuseStaleFAQImport(ctx, &payload, result)
+		}
+	}
+	// This attempt may now run for longer than the lease TTL between two
+	// progress saves (a slow batch); the heartbeat keeps the lease alive for as
+	// long as this process is actually working. If the lease moves to another
+	// import, it cancels this run so the rest of the batch stops writing.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	ctx = runCtx
+	stopHeartbeat := s.startFAQImportLeaseHeartbeat(
+		ctx, payload.KBID, payload.TaskID, payload.InstanceID, cancelRun)
+	defer stopHeartbeat()
 
 	// 获取任务重试信息，用于判断是否是最后一次重试
 	retryCount, _ := asynq.GetRetryCount(ctx)
@@ -2461,23 +3221,31 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 	// 如果 entries 存储在对象存储中，先下载
 	if payload.EntriesURL != "" && len(payload.Entries) == 0 {
 		logger.Infof(ctx, "Downloading FAQ entries from object storage: %s", payload.EntriesURL)
-		reader, err := s.fileSvc.GetFile(ctx, payload.EntriesURL)
+		entriesData, err := readFAQEntriesPayload(ctx, s.fileSvc, payload.EntriesURL)
 		if err != nil {
-			logger.Errorf(ctx, "Failed to download FAQ entries from object storage: %v", err)
-			return fmt.Errorf("failed to download entries: %w", err)
-		}
-		defer reader.Close()
-
-		entriesData, err := io.ReadAll(reader)
-		if err != nil {
-			logger.Errorf(ctx, "Failed to read FAQ entries data: %v", err)
-			return fmt.Errorf("failed to read entries data: %w", err)
+			logger.Errorf(ctx, "Failed to read FAQ entries file: %v", err)
+			if errors.Is(err, asynq.SkipRetry) {
+				// Deterministic: the file stays over budget on every attempt.
+				// Close the record, release the lease and drop the file, as the
+				// entry-cap refusal does, instead of leaving the KB blocked for
+				// a task that will never run.
+				message := fmt.Sprintf("导入文件超过服务端单次上限（%d 字节），请拆分后重新导入",
+					secutils.GetFAQImportMaxJSONBytes())
+				s.refuseFAQImportTask(ctx, &payload, message, payload.EntriesURL)
+				return fmt.Errorf("%w: %s", asynq.SkipRetry, message)
+			}
+			// A transient download failure is worth retrying with the lease kept.
+			return err
 		}
 
 		var entries []types.FAQEntryPayload
 		if err := json.Unmarshal(entriesData, &entries); err != nil {
 			logger.Errorf(ctx, "Failed to unmarshal FAQ entries: %v", err)
-			return fmt.Errorf("failed to unmarshal entries: %w", err)
+			// The file was written before its task was enqueued, so it is
+			// corrupt rather than half-written; retrying cannot repair it.
+			const message = "导入文件无法解析，请检查文件后重新导入"
+			s.refuseFAQImportTask(ctx, &payload, message, payload.EntriesURL)
+			return fmt.Errorf("%w: %s", asynq.SkipRetry, message)
 		}
 
 		payload.Entries = entries
@@ -2498,10 +3266,58 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 	// 注意：必须在保存新 progress 之前查询，否则会被覆盖
 	existingProgress, _ := s.GetFAQImportProgress(ctx, payload.TaskID)
 
+	// A task id may be reused by a later submission. The record then belongs to
+	// the newer instance, and this stale run must neither resume its cursor nor
+	// overwrite it: its ValidEntryIndices index a different payload, and its
+	// counts describe different entries. A payload without an instance id is a
+	// legacy enqueue that predates the field; it is matched on the task id alone,
+	// as it was before.
+	if existingProgress != nil && existingProgress.InstanceID != "" && payload.InstanceID != "" &&
+		existingProgress.InstanceID != payload.InstanceID {
+		// The lease may have lapsed while this stale task waited, and the
+		// re-assert above has just taken it back in this instance's name.
+		// Hand it back before leaving: compare-and-delete only removes a marker
+		// that names this very instance, so the newer instance's own lease is
+		// never touched. Without this the knowledge base stays blocked for a
+		// task that is about to stop.
+		if clearErr := s.clearRunningFAQImportInfoIfMatches(
+			context.WithoutCancel(ctx), payload.KBID, payload.TaskID, payload.InstanceID, payload.EnqueuedAt); clearErr != nil {
+			logger.Warnf(ctx, "Failed to release FAQ import lease held by a superseded instance: %v", clearErr)
+		}
+		switch existingProgress.Status {
+		case types.FAQImportStatusCompleted, types.FAQImportStatusFailed:
+			logger.Infof(ctx,
+				"FAQ import: task %s was superseded by instance %s (%s); stale instance %s exits",
+				payload.TaskID, existingProgress.InstanceID, existingProgress.Status, payload.InstanceID)
+			return nil
+		default:
+			logger.Warnf(ctx,
+				"FAQ import: task %s is owned by instance %s; stale instance %s stops without writing",
+				payload.TaskID, existingProgress.InstanceID, payload.InstanceID)
+			return fmt.Errorf("%w: another instance of this task id is running", asynq.SkipRetry)
+		}
+	}
+
+	// The submission endpoint already caps the entry count, but a task can
+	// reach the worker with more: its file was written before the cap was
+	// lowered, or the payload carries only EntriesURL. Downstream validation,
+	// merging and indexing all scale with this array, so the cap is enforced
+	// here as well rather than trusted from the entry point.
+	if maxEntries := secutils.GetFAQImportMaxEntries(); len(payload.Entries) > maxEntries {
+		// Worded by the same helper as the submission entry points: the advice
+		// differs by mode, and telling a replace caller to split the file would
+		// delete every entry outside each batch.
+		message := secutils.FAQTooManyEntriesMessage(maxEntries, len(payload.Entries), payload.Mode, true)
+		s.refuseFAQImportTask(ctx, &payload, message, payload.EntriesURL)
+		return fmt.Errorf("%w: %s", asynq.SkipRetry, message)
+	}
+
 	progress := &types.FAQImportProgress{
 		TaskID:         payload.TaskID,
 		KBID:           payload.KBID,
 		KnowledgeID:    payload.KnowledgeID,
+		TenantID:       payload.TenantID,
+		InstanceID:     payload.InstanceID,
 		Status:         types.FAQImportStatusProcessing,
 		Progress:       0,
 		Total:          originalTotalEntries,
@@ -2515,12 +3331,22 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 		UpdatedAt:      time.Now().Unix(),
 		DryRun:         payload.DryRun,
 	}
-	if err := s.saveFAQImportProgress(ctx, progress); err != nil {
-		logger.Warnf(ctx, "Failed to save initial FAQ import progress: %v", err)
+	if err := s.saveFAQImportProgressOrStop(ctx, progress); err != nil {
+		return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
 	}
 
+	// 缓存的索引只对同一份 payload 有效：同一 task id 的旧记录可能带着超出
+	// 当前条目数的索引，直接拿来遍历 payload.Entries 会越界。
+	reusableValidation := existingProgress != nil &&
+		len(existingProgress.ValidEntryIndices) > 0 &&
+		faqEntryIndicesInRange(existingProgress.ValidEntryIndices, len(payload.Entries))
+	if existingProgress != nil && len(existingProgress.ValidEntryIndices) > 0 && !reusableValidation {
+		logger.Warnf(ctx,
+			"FAQ import: cached validation indices for task %s do not fit %d entries; re-validating",
+			payload.TaskID, len(payload.Entries))
+	}
 	var validEntryIndices []int
-	if existingProgress != nil && len(existingProgress.ValidEntryIndices) > 0 {
+	if reusableValidation {
 		// 重试时直接使用之前的验证结果
 		validEntryIndices = existingProgress.ValidEntryIndices
 		// 必须写回新 progress 并落库：NextEntryIndex 是相对 validEntries 的
@@ -2529,15 +3355,24 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 		progress.ValidEntryIndices = validEntryIndices
 		progress.FailedCount = existingProgress.FailedCount
 		progress.FailedEntries = existingProgress.FailedEntries
-		logger.Infof(ctx, "Reusing previous validation result: valid=%d, failed=%d",
-			len(validEntryIndices), progress.FailedCount)
+		// 部分失败与已合并的计数也属于“已经发生的验证结果”：丢掉它们，
+		// 完成时的 SuccessCount = 有效数 - PartialFailedCount 会把部分失败
+		// 算成完全成功，AddedCount = SuccessCount - MergedCount 也会把重试
+		// 前已合并的条目算成新增。
+		progress.PartialFailedCount = existingProgress.PartialFailedCount
+		progress.MergedCount = existingProgress.MergedCount
+		if len(existingProgress.MergeDetails) > 0 {
+			progress.MergeDetails = existingProgress.MergeDetails
+		}
+		logger.Infof(ctx, "Reusing previous validation result: valid=%d, failed=%d, partial_failed=%d, merged=%d",
+			len(validEntryIndices), progress.FailedCount, progress.PartialFailedCount, progress.MergedCount)
 	} else {
 		// 第一步：执行验证（无论是 dry run 还是 import 模式都需要验证）
 		validEntryIndices = s.executeFAQDryRunValidation(ctx, &payload, progress)
 		// 保存验证通过的索引，用于重试时跳过验证
 		progress.ValidEntryIndices = validEntryIndices
-		if err := s.saveFAQImportProgress(ctx, progress); err != nil {
-			logger.Warnf(ctx, "Failed to save validation result: %v", err)
+		if err := s.saveFAQImportProgressOrStop(ctx, progress); err != nil {
+			return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
 		}
 		logger.Infof(ctx, "FAQ validation completed: total=%d, valid=%d, failed=%d",
 			originalTotalEntries, len(validEntryIndices), progress.FailedCount)
@@ -2563,8 +3398,8 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 	// 更新进度消息
 	progress.Message = fmt.Sprintf("验证完成，开始导入 %d 条有效数据...", len(validEntries))
 	progress.UpdatedAt = time.Now().Unix()
-	if err := s.saveFAQImportProgress(ctx, progress); err != nil {
-		logger.Warnf(ctx, "Failed to update FAQ import progress: %v", err)
+	if err := s.saveFAQImportProgressOrStop(ctx, progress); err != nil {
+		return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
 	}
 
 	// 检查任务状态 - 幂等性处理（复用之前获取的 existingProgress）
@@ -2572,7 +3407,7 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 	if existingProgress != nil {
 		if existingProgress.Status == types.FAQImportStatusCompleted {
 			logger.Infof(ctx, "FAQ import already completed, skipping: %s", payload.TaskID)
-			if clearErr := s.clearRunningFAQImportInfoIfMatches(ctx, payload.KBID, payload.TaskID, payload.InstanceID, payload.EnqueuedAt); clearErr != nil {
+			if clearErr := s.clearRunningFAQImportInfoIfMatches(context.WithoutCancel(ctx), payload.KBID, payload.TaskID, payload.InstanceID, payload.EnqueuedAt); clearErr != nil {
 				logger.Warnf(ctx, "Failed to clear running FAQ import info for completed task: %v", clearErr)
 			}
 			return nil // 幂等：已完成的任务直接返回
@@ -2644,6 +3479,13 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 	// 执行FAQ导入（传入已处理的偏移量，用于进度计算）
 	if err := s.executeFAQImport(ctx, payload.TaskID, payload.KBID, faqPayload, payload.TenantID, startIndex, progress); err != nil {
 		logger.Errorf(ctx, "FAQ import task failed: %s, error: %v", payload.TaskID, err)
+		if errors.Is(err, errFAQImportLeaseTaken) {
+			// Another import took the knowledge base mid-run. Retrying would only
+			// be refused again; stop now and let the entries file go, since no
+			// later attempt of this task will read it.
+			s.cleanupFAQEntriesFileOnFinalFailure(ctx, payload.EntriesURL, maxRetry, maxRetry)
+			return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
+		}
 		// 如果是最后一次重试，更新状态为失败
 		if isLastRetry {
 			if updateErr := s.updateFAQImportProgressStatus(ctx, payload.TaskID, payload.InstanceID, payload.EnqueuedAt, types.FAQImportStatusFailed, 0, originalTotalEntries, len(validEntries), "导入失败", err.Error()); updateErr != nil {
@@ -2728,8 +3570,18 @@ func (s *knowledgeService) finalizeFAQValidation(ctx context.Context, payload *t
 
 	// 如果不是 dry run 模式，保存导入结果统计到数据库
 	if !payload.DryRun {
+		// 写库之前再确认一次租约仍属于本实例：租约在导入末期被另一个导入
+		// 接管时，旧任务的结果不能落到库里，把新导入的统计覆盖掉。
+		if err := s.ensureFAQImportLeaseForWriteStrict(ctx, payload.KBID, payload.TaskID, payload.InstanceID); err != nil {
+			return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
+		}
 		if err := s.saveFAQImportResultToDatabase(ctx, payload, progress, originalTotalEntries); err != nil {
-			logger.Warnf(ctx, "Failed to save FAQ import result to database: %v", err)
+			// The chunks are already written, so a retry resumes here and
+			// rewrites the same result. Failing instead of logging matters
+			// because this row is also what a stale replace retry is compared
+			// against: a silently missing result would let that retry delete
+			// what this import added.
+			return fmt.Errorf("failed to save FAQ import result: %w", err)
 		}
 
 		// 只有 replace 模式才清理未使用的 Tag
@@ -2746,8 +3598,9 @@ func (s *knowledgeService) finalizeFAQValidation(ctx context.Context, payload *t
 
 	// 使用 updateFAQImportProgressStatus 来确保正确清理 running key
 	// 但是需要先保存其他字段，因为 updateFAQImportProgressStatus 不会保存所有字段
-	if err := s.saveFAQImportProgress(ctx, progress); err != nil {
-		logger.Warnf(ctx, "Failed to save final FAQ import progress: %v", err)
+	// 租约接管同样要终止这一步：否则本任务会被确认完成，而记录留给新导入。
+	if err := s.saveFAQImportProgressOrStop(ctx, progress); err != nil {
+		return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
 	}
 
 	// 然后调用状态更新来清理 running key
@@ -2760,7 +3613,8 @@ func (s *knowledgeService) finalizeFAQValidation(ctx context.Context, payload *t
 		payload.TaskID, payload.DryRun, progress.SuccessCount, progress.AddedCount, progress.MergedCount, progress.FailedCount, progress.PartialFailedCount)
 
 	if !payload.DryRun {
-		outcome := faqImportCompletedOutcome(progress.SuccessCount, progress.FailedCount, progress.SkippedCount)
+		outcome := faqImportCompletedOutcome(
+			progress.SuccessCount, progress.PartialFailedCount, progress.FailedCount, progress.SkippedCount)
 		s.recordFAQImportKBActivity(ctx, payload, progress, originalTotalEntries,
 			types.AuditActionFAQImportCompleted, outcome)
 	}
@@ -2962,7 +3816,23 @@ const (
 	faqImportProgressKeyPrefix = "faq_import_progress:"
 	faqImportRunningKeyPrefix  = "faq_import_running:"
 	faqImportProgressTTL       = 3 * time.Hour
+	// faqImportLeaseTTL is how long the knowledge base stays reserved without a
+	// renewal: long enough that a crash is not mistaken for a slow import, and
+	// short enough that a crashed worker frees the knowledge base without an
+	// operator. A running import heartbeats at a third of this
+	// (faqImportLeaseHeartbeatInterval), so an import that is alive keeps the
+	// lease through a slow batch; renewals are ownership-checked, so a stale
+	// lease cannot be silently extended by a different import.
+	faqImportLeaseTTL = 10 * time.Minute
 )
+
+// faqImportLeaseHeartbeatInterval is how often a running import refreshes its
+// lease while it works. Progress saves also renew, but they happen once per
+// batch: a batch that embeds and indexes slowly could outlive the lease, and
+// another submission would then be admitted beside it. The heartbeat makes the
+// lease follow the process's liveness instead of the batch cadence. A variable
+// so tests can shorten it.
+var faqImportLeaseHeartbeatInterval = faqImportLeaseTTL / 3
 
 // getFAQImportProgressKey returns the Redis key for storing FAQ import progress
 func getFAQImportProgressKey(taskID string) string {
@@ -2974,27 +3844,233 @@ func getFAQImportRunningKey(kbID string) string {
 	return faqImportRunningKeyPrefix + kbID
 }
 
-// saveFAQImportProgress saves the FAQ import progress to Redis
-func (s *knowledgeService) saveFAQImportProgress(ctx context.Context, progress *types.FAQImportProgress) error {
-	if s.redisClient == nil {
-		progress.UpdatedAt = time.Now().Unix()
-		s.memFAQProgress.Store(progress.TaskID, progress)
+// saveFAQImportProgressOrStop saves progress, treating a lost lease as a reason
+// to stop the import: once another task owns the knowledge base, continuing to
+// write beside it is exactly what the lease exists to prevent. Other save
+// failures stay non-fatal, as before -- progress is a liveness signal, and a
+// transient Redis error should not fail an import that is otherwise fine.
+func (s *knowledgeService) saveFAQImportProgressOrStop(
+	ctx context.Context, progress *types.FAQImportProgress,
+) error {
+	if err := s.saveFAQImportProgress(ctx, progress); err != nil {
+		if errors.Is(err, errFAQImportLeaseTaken) {
+			// This attempt is over; asynq will archive it without retrying, so
+			// finish the record here or the initiator keeps polling "processing".
+			// Not when the taker is a newer instance of this same task id: that
+			// record now belongs to it, and marking it would stop the run that
+			// is actually still importing.
+			if !s.faqImportLeaseHeldByAnotherInstanceOfSameTask(
+				ctx, progress.KBID, progress.TaskID, progress.InstanceID) {
+				s.markFAQImportStopped(ctx, progress.TaskID, progress.InstanceID, errFAQImportStoppedMessage)
+			}
+			return err
+		}
+		logger.Warnf(ctx, "Failed to save FAQ import progress: %v", err)
+	}
+	return nil
+}
+
+// faqImportStaleResult returns the completed-import result that makes this
+// retry stale, or nil when the run may proceed.
+func faqImportStaleResult(knowledge *types.Knowledge, payload *types.FAQImportPayload) *types.FAQImportResult {
+	if knowledge == nil {
 		return nil
 	}
-	key := getFAQImportProgressKey(progress.TaskID)
+	result, err := knowledge.GetLastFAQImportResult()
+	if err != nil || !faqImportRetryIsStale(payload, result) {
+		return nil
+	}
+	return result
+}
+
+// refuseStaleFAQImport ends a replace retry that a newer import has outdated:
+// it records a terminal state for the initiator and gives back its lease.
+func (s *knowledgeService) refuseStaleFAQImport(
+	ctx context.Context, payload *types.FAQImportPayload, result *types.FAQImportResult,
+) error {
+	const message = "该知识库在本任务入队后已完成另一次导入，本次重试已过期，请重新发起导入"
+	logger.Warnf(ctx,
+		"FAQ import task %s enqueued at %d is stale: import %s completed at %s",
+		payload.TaskID, payload.EnqueuedAt, result.TaskID, result.ImportedAt)
+	s.markFAQImportStopped(ctx, payload.TaskID, payload.InstanceID, message)
+	if clearErr := s.clearRunningFAQImportInfoIfMatches(
+		context.WithoutCancel(ctx), payload.KBID, payload.TaskID, payload.InstanceID, payload.EnqueuedAt); clearErr != nil {
+		logger.Warnf(ctx, "Failed to clear stale FAQ import running info: %v", clearErr)
+	}
+	// The task will never run, so its entries file is unreachable. The object
+	// name carries the instance id, so this cannot be another submission's file.
+	if payload.EntriesURL != "" && s.fileSvc != nil {
+		if err := s.fileSvc.DeleteFile(context.WithoutCancel(ctx), payload.EntriesURL); err != nil {
+			logger.Warnf(ctx, "Failed to delete stale FAQ entries file %s: %v", payload.EntriesURL, err)
+		}
+	}
+	return fmt.Errorf("%w: %s", asynq.SkipRetry, message)
+}
+
+// faqImportRetryIsStale reports whether a queued replace retry predates the
+// last completed import. A retry preserves its enqueue time, so a completion at
+// or after that second means the knowledge base has since been replaced by
+// another import and this attempt must not delete anything. Append retries are
+// never stale: they do not delete, and a completed import does not make their
+// additions unsafe. A nil result or a zero timestamp says nothing.
+func faqImportRetryIsStale(payload *types.FAQImportPayload, result *types.FAQImportResult) bool {
+	if payload == nil || payload.DryRun || payload.Mode != types.FAQBatchModeReplace {
+		return false
+	}
+	if result == nil {
+		return false
+	}
+	// Prefer milliseconds, which separate imports accepted and completed inside
+	// one second. Results and payloads written by older builds only have
+	// seconds, and a second-resolution comparison treats a completion in the
+	// same second as stale -- the safe direction for a replace.
+	enqueued := payload.EnqueuedAtMillis
+	if enqueued <= 0 && payload.EnqueuedAt > 0 {
+		enqueued = payload.EnqueuedAt * 1000
+	}
+	if enqueued <= 0 {
+		return false
+	}
+	completed := result.ImportedAtMillis
+	if completed <= 0 {
+		if result.ImportedAt.IsZero() {
+			return false
+		}
+		completed = result.ImportedAt.UnixMilli()
+	}
+	return completed >= enqueued
+}
+
+// errFAQImportStoppedMessage is shown to the initiator when another import
+// took the knowledge base and this task stopped without finishing.
+const errFAQImportStoppedMessage = "该知识库已由另一个导入任务接管，本任务已停止；请在当前导入结束后重新发起"
+
+// saveFAQImportProgress saves the FAQ import progress to Redis.
+//
+// The lease is renewed *before* the record is written. The reverse order let a
+// run that had already lost the knowledge base overwrite the record of the run
+// that now owns it, and then discover the takeover: the new run would read its
+// own task id paired with the stale instance, stop on the instance gate, and
+// the initiator would watch a record that never moves. Ordering it this way, a
+// losing run writes nothing.
+func (s *knowledgeService) saveFAQImportProgress(ctx context.Context, progress *types.FAQImportProgress) error {
+	// Every progress save is evidence the import is alive, which is what the
+	// admission lease needs to distinguish a slow import from an abandoned one.
+	// It is also the point where a takeover is noticed: continuing to write
+	// after another import was admitted would defeat the lease entirely.
+	if err := s.renewFAQImportLease(ctx, progress.KBID, progress.TaskID, progress.InstanceID); err != nil {
+		return err
+	}
+	return s.writeFAQImportProgress(ctx, progress)
+}
+
+// writeFAQImportProgress stores the record without renewing the lease. Kept
+// separate so a run that has already lost the lease can still finish its own
+// record: the initiator polls that record, and leaving it in "processing" is
+// what makes a superseded task wait forever.
+func (s *knowledgeService) writeFAQImportProgress(ctx context.Context, progress *types.FAQImportProgress) error {
 	progress.UpdatedAt = time.Now().Unix()
+	if s.redisClient == nil {
+		s.memFAQProgress.Store(progress.TaskID, progress)
+		s.sweepMemFAQProgress()
+		return nil
+	}
 	data, err := json.Marshal(progress)
 	if err != nil {
 		return fmt.Errorf("failed to marshal FAQ import progress: %w", err)
 	}
-	return s.redisClient.Set(ctx, key, data, faqImportProgressTTL).Err()
+	return s.redisClient.Set(ctx, getFAQImportProgressKey(progress.TaskID), data, faqImportProgressTTL).Err()
+}
+
+// faqImportProgressExpired mirrors the TTL the Redis key gets. UpdatedAt is set
+// on every write, so a record that is being polled or updated never expires.
+func faqImportProgressExpired(progress *types.FAQImportProgress, now time.Time) bool {
+	if progress.UpdatedAt <= 0 {
+		return false
+	}
+	return now.Sub(time.Unix(progress.UpdatedAt, 0)) > faqImportProgressTTL
+}
+
+// sweepMemFAQProgress drops records that expired without being read. Lazy
+// expiry in GetFAQImportProgress is not enough: an initiator that stops
+// polling would otherwise leave its record for the life of the process.
+func (s *knowledgeService) sweepMemFAQProgress() {
+	now := time.Now()
+	s.memFAQProgress.Range(func(key, value any) bool {
+		progress, _ := value.(*types.FAQImportProgress)
+		if progress == nil || faqImportProgressExpired(progress, now) {
+			s.memFAQProgress.CompareAndDelete(key, value)
+		}
+		return true
+	})
+}
+
+// tenantIDFromContext reads the tenant a task runs under. Both the worker
+// context and an HTTP request carry it in the same key.
+func tenantIDFromContext(ctx context.Context) uint64 {
+	id, _ := ctx.Value(types.TenantIDContextKey).(uint64)
+	return id
+}
+
+// markFAQImportStopped ends this task's record with a failure. Used once the
+// KB belongs to another import: this task will not run again, so its initiator
+// has to see a terminal state rather than a progress record that never moves.
+// The running marker is deliberately left alone -- it names the other task.
+// instanceID identifies the caller's import instance. A task id is reusable
+// across submissions, and the record of another instance of the same task id
+// belongs to the run that is actually importing: it is left untouched.
+func (s *knowledgeService) markFAQImportStopped(ctx context.Context, taskID, instanceID, message string) {
+	// The initiator needs this record more than the caller needs to stay
+	// cancelled: asynq cancels the task context on shutdown, and a shutdown is
+	// exactly when a superseded run is most likely to be discovered.
+	ctx = context.WithoutCancel(ctx)
+	progress := &types.FAQImportProgress{
+		TaskID: taskID, CreatedAt: time.Now().Unix(), TenantID: tenantIDFromContext(ctx),
+	}
+	if existing, err := s.GetFAQImportProgress(ctx, taskID); err == nil && existing != nil {
+		if instanceID != "" && existing.InstanceID != "" && existing.InstanceID != instanceID {
+			return
+		}
+		progress = existing
+	}
+	progress.Status = types.FAQImportStatusFailed
+	progress.Message = message
+	progress.Error = message
+	if err := s.writeFAQImportProgress(ctx, progress); err != nil {
+		logger.Warnf(ctx, "Failed to record stopped FAQ import task %s: %v", taskID, err)
+	}
+}
+
+// refuseFAQImportTask ends a task that cannot succeed on a retry: it closes the
+// record, gives the lease back (compare-and-delete only removes this instance's
+// own marker) and drops the object-storage payload that can never be accepted.
+func (s *knowledgeService) refuseFAQImportTask(
+	ctx context.Context, payload *types.FAQImportPayload, message, entriesURL string,
+) {
+	s.markFAQImportStopped(ctx, payload.TaskID, payload.InstanceID, message)
+	if clearErr := s.clearRunningFAQImportInfoIfMatches(
+		context.WithoutCancel(ctx), payload.KBID, payload.TaskID, payload.InstanceID, payload.EnqueuedAt); clearErr != nil {
+		logger.Warnf(ctx, "Failed to clear FAQ import running info after refusing task %s: %v", payload.TaskID, clearErr)
+	}
+	if entriesURL != "" && s.fileSvc != nil {
+		if err := s.fileSvc.DeleteFile(context.WithoutCancel(ctx), entriesURL); err != nil {
+			logger.Warnf(ctx, "Failed to delete refused FAQ entries file %s: %v", entriesURL, err)
+		}
+	}
 }
 
 // GetFAQImportProgress retrieves the progress of an FAQ import task
 func (s *knowledgeService) GetFAQImportProgress(ctx context.Context, taskID string) (*types.FAQImportProgress, error) {
 	if s.redisClient == nil {
 		if v, ok := s.memFAQProgress.Load(taskID); ok {
-			return v.(*types.FAQImportProgress), nil
+			progress, _ := v.(*types.FAQImportProgress)
+			// Mirror the Redis key's TTL: the in-memory map has none of its own,
+			// and a record nobody asks for again would live for the process.
+			if progress == nil || faqImportProgressExpired(progress, time.Now()) {
+				s.memFAQProgress.CompareAndDelete(taskID, v)
+			} else {
+				return progress, nil
+			}
 		}
 		return nil, werrors.NewNotFoundError("FAQ import task not found")
 	}
@@ -3012,12 +4088,33 @@ func (s *knowledgeService) GetFAQImportProgress(ctx context.Context, taskID stri
 		return nil, fmt.Errorf("failed to unmarshal FAQ import progress: %w", err)
 	}
 
-	// If task is completed, enrich with persisted result fields from database
-	if progress.Status == types.FAQImportStatusCompleted && progress.KnowledgeID != "" {
-		tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
+	// If task is completed, enrich with persisted result fields from database.
+	//
+	// Only the record of the import that wrote that result may be enriched.
+	// Two kinds of record must not be:
+	//
+	//   - a dry run, which never persists a result; copying the last real
+	//     import's counts over it answers "is this file sound?" with numbers
+	//     that describe something else entirely;
+	//   - a completed record for any other task. The persisted result names
+	//     its TaskID, and an older task's Redis record still reads "completed"
+	//     for its whole TTL, so without the check a query about last week's
+	//     task would return this afternoon's import.
+	//
+	// A result written before the TaskID field existed has no identity to
+	// compare, and is still applied: its record is the only source of the
+	// display fields, and refusing it would leave old imports without them.
+	if progress.Status == types.FAQImportStatusCompleted && progress.KnowledgeID != "" && !progress.DryRun {
+		tenantID := progress.TenantID
+		if tenantID == 0 {
+			// Records written before the field existed, and in-process records
+			// from the same tenant, fall back to the caller's own tenant.
+			tenantID, _ = ctx.Value(types.TenantIDContextKey).(uint64)
+		}
 		knowledge, err := s.repo.GetKnowledgeByID(ctx, tenantID, progress.KnowledgeID)
 		if err == nil && knowledge != nil {
-			if result, err := knowledge.GetLastFAQImportResult(); err == nil && result != nil {
+			if result, err := knowledge.GetLastFAQImportResult(); err == nil && result != nil &&
+				(result.TaskID == "" || result.TaskID == progress.TaskID) {
 				progress.SuccessCount = result.SuccessCount
 				progress.FailedCount = result.FailedCount
 				progress.PartialFailedCount = result.PartialFailedCount

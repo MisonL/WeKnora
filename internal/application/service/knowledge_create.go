@@ -246,6 +246,7 @@ func (s *knowledgeService) createKnowledgeFromFile(ctx context.Context,
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
 		KnowledgeBaseID:          kbID,
+		FileSize:                 knowledge.FileSize,
 		FilePath:                 filePath,
 		FileName:                 safeFilename,
 		FileType:                 getFileType(safeFilename),
@@ -265,8 +266,7 @@ func (s *knowledgeService) createKnowledgeFromFile(ctx context.Context,
 				"title": knowledge.Title, "source_type": "file", "file_type": knowledge.FileType,
 				"processing_status": "failed", "failure_stage": "enqueue",
 			})
-		// 即使入队失败，也返回knowledge，因为文件已保存
-		return knowledge, nil
+		return knowledge, enqueueFailedError(knowledge)
 	}
 
 	task := asynq.NewTask(
@@ -274,8 +274,36 @@ func (s *knowledgeService) createKnowledgeFromFile(ctx context.Context,
 		payloadBytes,
 		documentProcessTaskOptions(s.config, asynq.MaxRetry(3))...,
 	)
+	releaseWork, err := ReserveUploadWork(knowledge.ID, ParseJobWorkingBytes(declaredUploadFileBytes(ctx, knowledge.FileSize), []string{knowledge.FilePath}, nil), requestUploadWork)
+	if err != nil {
+		// The document is already stored; failing here leaves an unparsed row
+		// the user can reparse later, which is cheaper than accepting work the
+		// host cannot carry alongside what it is already parsing.
+		logger.Errorf(ctx, "Refused parse work for %s: %v", knowledge.ID, err)
+		s.markKnowledgeEnqueueFailed(ctx, knowledge)
+		// The row exists and the budget is full; say both. The request itself
+		// is well-formed, so this is not a 400.
+		//
+		// The admission's own error is not returned as-is because its message
+		// does not say the file was stored, and that half is what tells the
+		// caller not to re-upload. Everything else it carries is kept: without
+		// the hint a client waits the wrong amount, and without the row
+		// identity it cannot tell this refusal (file stored, parse missing)
+		// from an admission refusal that stored nothing and is safe to retry.
+		refusal := werrors.NewTooManyRequestsError(
+			"文件已保存，但服务器正在处理的文档较多，暂未开始解析，请稍后在文档列表中重新解析")
+		if appErr, ok := werrors.IsAppError(err); ok && appErr.RetryAfterSeconds > 0 {
+			refusal.WithRetryAfter(appErr.RetryAfterSeconds)
+		}
+		return knowledge, refusal.WithDetails(map[string]any{
+			"knowledge_id": knowledge.ID,
+			"title":        knowledge.Title,
+			"parse_status": knowledge.ParseStatus,
+		})
+	}
 	info, err := s.task.Enqueue(task)
 	if err != nil {
+		releaseWork()
 		logger.Errorf(ctx, "Failed to enqueue document process task: %v", err)
 		s.markKnowledgeEnqueueFailed(ctx, knowledge)
 		recordKBActivity(ctx, s.audit, knowledge.TenantID, kbID, types.AuditActionKnowledgeCreated,
@@ -283,8 +311,7 @@ func (s *knowledgeService) createKnowledgeFromFile(ctx context.Context,
 				"title": knowledge.Title, "source_type": "file", "file_type": knowledge.FileType,
 				"processing_status": "failed", "failure_stage": "enqueue",
 			})
-		// 即使入队失败，也返回knowledge，因为文件已保存
-		return knowledge, nil
+		return knowledge, enqueueFailedError(knowledge)
 	}
 	recordKBActivity(ctx, s.audit, knowledge.TenantID, kbID, types.AuditActionKnowledgeCreated,
 		"knowledge", knowledge.ID, types.AuditOutcomeAccepted, map[string]any{
@@ -457,6 +484,7 @@ func (s *knowledgeService) createKnowledgeFromURL(ctx context.Context,
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
 		KnowledgeBaseID:          kbID,
+		FileSize:                 knowledge.FileSize,
 		URL:                      url,
 		EnableMultimodel:         enableMultimodelValue,
 		EnableQuestionGeneration: enableQuestionGeneration,
@@ -474,7 +502,7 @@ func (s *knowledgeService) createKnowledgeFromURL(ctx context.Context,
 				"title": knowledge.Title, "source_type": "url", "file_type": knowledge.FileType,
 				"processing_status": "failed", "failure_stage": "enqueue",
 			})
-		return knowledge, nil
+		return knowledge, enqueueFailedError(knowledge)
 	}
 
 	task := asynq.NewTask(
@@ -491,7 +519,7 @@ func (s *knowledgeService) createKnowledgeFromURL(ctx context.Context,
 				"title": knowledge.Title, "source_type": "url", "file_type": knowledge.FileType,
 				"processing_status": "failed", "failure_stage": "enqueue",
 			})
-		return knowledge, nil
+		return knowledge, enqueueFailedError(knowledge)
 	}
 	recordKBActivity(ctx, s.audit, tenantID, kbID, types.AuditActionKnowledgeCreated,
 		"knowledge", knowledge.ID, types.AuditOutcomeAccepted, map[string]any{
@@ -702,6 +730,7 @@ func (s *knowledgeService) createKnowledgeFromFileURLWithReplacement(
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
 		KnowledgeBaseID:          kbID,
+		FileSize:                 knowledge.FileSize,
 		FileURL:                  fileURL,
 		FileName:                 fileName,
 		FileType:                 fileType,
@@ -721,7 +750,7 @@ func (s *knowledgeService) createKnowledgeFromFileURLWithReplacement(
 				"title": knowledge.Title, "source_type": "file_url", "file_type": knowledge.FileType,
 				"processing_status": "failed", "failure_stage": "enqueue",
 			})
-		return knowledge, nil
+		return knowledge, enqueueFailedError(knowledge)
 	}
 
 	task := asynq.NewTask(
@@ -738,7 +767,7 @@ func (s *knowledgeService) createKnowledgeFromFileURLWithReplacement(
 				"title": knowledge.Title, "source_type": "file_url", "file_type": knowledge.FileType,
 				"processing_status": "failed", "failure_stage": "enqueue",
 			})
-		return knowledge, nil
+		return knowledge, enqueueFailedError(knowledge)
 	}
 	recordKBActivity(ctx, s.audit, tenantID, kbID, types.AuditActionKnowledgeCreated,
 		"knowledge", knowledge.ID, types.AuditOutcomeAccepted, map[string]any{
@@ -981,6 +1010,7 @@ func (s *knowledgeService) createKnowledgeFromPassageInternal(ctx context.Contex
 			TenantID:                 tenantID,
 			KnowledgeID:              knowledge.ID,
 			KnowledgeBaseID:          kbID,
+			FileSize:                 knowledge.FileSize,
 			Passages:                 safePassages,
 			EnableMultimodel:         false, // 文本段落不支持多模态
 			EnableQuestionGeneration: enableQuestionGeneration,
@@ -998,8 +1028,7 @@ func (s *knowledgeService) createKnowledgeFromPassageInternal(ctx context.Contex
 					"title": knowledge.Title, "source_type": "passage",
 					"processing_status": "failed", "failure_stage": "enqueue",
 				})
-			// 即使入队失败，也返回knowledge
-			return knowledge, nil
+			return knowledge, enqueueFailedError(knowledge)
 		}
 
 		task := asynq.NewTask(
@@ -1016,7 +1045,7 @@ func (s *knowledgeService) createKnowledgeFromPassageInternal(ctx context.Contex
 					"title": knowledge.Title, "source_type": "passage",
 					"processing_status": "failed", "failure_stage": "enqueue",
 				})
-			return knowledge, nil
+			return knowledge, enqueueFailedError(knowledge)
 		}
 		recordKBActivity(ctx, s.audit, knowledge.TenantID, kbID, types.AuditActionKnowledgeCreated,
 			"knowledge", knowledge.ID, types.AuditOutcomeAccepted, map[string]any{
@@ -1185,16 +1214,43 @@ func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
 
 // markKnowledgeEnqueueFailed prevents a durable knowledge row from remaining
 // indefinitely "pending" when its background processing task was never
-// created. The API may still return the row so callers can retry it.
+// created. The row is returned to the caller together with the error, so it
+// can be reparsed instead of re-uploaded.
 func (s *knowledgeService) markKnowledgeEnqueueFailed(ctx context.Context, knowledge *types.Knowledge) {
 	if knowledge == nil {
 		return
 	}
 	knowledge.ParseStatus = "failed"
 	knowledge.ErrorMessage = "Failed to enqueue processing task"
+	// No task will run for this row, so nothing will ever release the budget
+	// the enqueue site claimed for it.
+	EndUploadWork(knowledge.ID)
 	if err := s.repo.UpdateKnowledge(ctx, knowledge); err != nil {
 		logger.Errorf(ctx, "Failed to mark knowledge as failed after enqueue error: %v", err)
 	}
+}
+
+// enqueueFailedError is the error an upload returns when the row was stored but
+// no parse job could be queued for it.
+//
+// The previous behaviour returned (row, nil): the handler answered 200, and a
+// client had no way to tell a queued document from one that will never be
+// parsed. The row is still returned -- the file is safely stored and a reparse
+// can pick it up -- but the status is now a 503 so nobody waits on a job that
+// does not exist.
+func enqueueFailedError(knowledge *types.Knowledge) error {
+	// The row's own message names the failure; the HTTP message names the
+	// caller's next step. Both are needed: one for the document list, one for
+	// whoever is reading the response.
+	appErr := werrors.NewKnowledgeEnqueueFailedError("")
+	if knowledge != nil {
+		appErr = appErr.WithDetails(map[string]any{
+			"knowledge_id": knowledge.ID,
+			"title":        knowledge.Title,
+			"parse_status": knowledge.ParseStatus,
+		})
+	}
+	return appErr
 }
 
 func usesSourceIdentityDuplicateCheck(channel string) bool {

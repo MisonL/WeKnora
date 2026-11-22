@@ -273,6 +273,15 @@ pre-existing Service name does not automatically transfer its ownership to Helm.
 | `global.storageClass` | Storage class for PVCs | `""` |
 | `global.imagePullSecrets` | Image pull secrets | `[]` |
 | `global.maxFileSizeMB` | Maximum upload size in MB (frontend, app, docreader) | `50` |
+| `global.faqImportMaxEntries` | FAQ entries per import (frontend pre-check and server cap); 0 leaves the server default (1000) | `0` |
+| `global.faqImportMaxJSONBytes` | FAQ import body byte cap; 0 leaves the server default (32 MiB, capped by `maxFileSizeMB`) | `0` |
+| `global.faqImportMaxInflight` | Concurrent FAQ import requests; 0 leaves the server default (4); beyond it requests get 429 | `0` |
+| `global.faqImportMaxInflightBytes` | Total in-flight FAQ import body bytes; 0 leaves the server default (96 MiB); must be at least the JSON byte cap. Note the defaults' coupling: four full-size (32 MiB) imports need 128 MiB, so 96 MiB admits only three before the fourth gets 429 — raise this to `faqImportMaxInflight × faqImportMaxJSONBytes` to truly allow that many | `0` |
+| `global.uploadMaxConcurrency` | Concurrent document uploads; 0 leaves the server default (2) | `0` |
+| `global.uploadBigBytes` | Declared size that counts as a "big" upload (one at a time); 0 leaves the server default (32 MiB) | `0` |
+| `global.uploadMaxInflightBytes` | Total in-flight upload body bytes; 0 leaves the server default (128 MiB). Must be at least `global.maxFileSizeMB × 1048576` (bytes vs MB: 50 MB is 52428800 bytes), or an upload at the file-size cap is refused by admission with 429 | `0` |
+| `global.uploadMaxBackgroundBytes` | Parse-work budget held by queued/running parse jobs; 0 leaves the server default (512 MiB) | `0` |
+| `global.uploadMaxBackgroundJobs` | Queued/running parse job cap; 0 leaves the server default (1000) | `0` |
 | `global.podSecurityContext` | Pod security context | See values.yaml |
 | `global.containerSecurityContext` | Container security context | See values.yaml |
 

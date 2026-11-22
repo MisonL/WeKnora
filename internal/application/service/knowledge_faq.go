@@ -111,6 +111,27 @@ func (s *knowledgeService) ListFAQEntries(ctx context.Context,
 // Background and bulk indexing keep the full retry budget.
 const faqCreateIndexBudget = 5 * time.Second
 
+// externalFAQSeqID honours a client-supplied seq id only where it cannot
+// collide: below the sequence start and not held by any row, soft-deleted ones
+// included (the unique index covers them). An unusable id returns 0, which
+// means "let the database assign one" — the same outcome an import without ids
+// gets, rather than a failed insert.
+func (s *knowledgeService) externalFAQSeqID(ctx context.Context, id *int64) int64 {
+	if id == nil || *id <= 0 || *id >= types.FAQExternalSeqIDLimit || s.chunkRepo == nil {
+		return 0
+	}
+	inUse, err := s.chunkRepo.SeqIDsInUse(ctx, []int64{*id})
+	if err != nil {
+		logger.Warnf(ctx, "Could not check client-supplied seq id %d, letting the database assign one: %v", *id, err)
+		return 0
+	}
+	if inUse[*id] {
+		logger.Infof(ctx, "Client-supplied seq id %d is already taken, letting the database assign one", *id)
+		return 0
+	}
+	return *id
+}
+
 // CreateFAQEntry creates a single FAQ entry synchronously.
 func (s *knowledgeService) CreateFAQEntry(ctx context.Context,
 	kbID string, payload *types.FAQEntryPayload,
@@ -193,10 +214,9 @@ func (s *knowledgeService) CreateFAQEntry(ctx context.Context,
 		TagID:           tagID, // 使用解析后的 TagID
 		Status:          int(types.ChunkStatusStored),
 	}
-	// 如果指定了 ID（用于数据迁移），设置 SeqID
-	if payload.ID != nil && *payload.ID > 0 {
-		chunk.SeqID = *payload.ID
-	}
+	// 如果指定了 ID（用于数据迁移），设置 SeqID —— 仅在该 id 不会与既有
+	// 行（含软删除行，唯一索引同样覆盖）或自增序列冲突时保留。
+	chunk.SeqID = s.externalFAQSeqID(ctx, payload.ID)
 
 	if err := chunk.SetFAQMetadata(meta); err != nil {
 		return nil, fmt.Errorf("failed to set FAQ metadata: %w", err)
@@ -535,9 +555,18 @@ func (s *knowledgeService) AddSimilarQuestions(ctx context.Context,
 	}
 
 	// Check for duplicates with other entries
+	mergedSimilar := make([]string, 0, len(meta.SimilarQuestions)+len(newQuestions))
+	mergedSimilar = append(mergedSimilar, meta.SimilarQuestions...)
+	mergedSimilar = append(mergedSimilar, newQuestions...)
+	// The result has to stay within the per-entry limits every other write path
+	// enforces: each similar question multiplies the index text under
+	// question_index_mode=separate, and this path had no cap of its own.
+	if shapeErr := secutils.CheckFAQEntryShape(meta.StandardQuestion, mergedSimilar, meta.NegativeQuestions, meta.Answers); shapeErr != nil {
+		return nil, werrors.NewPayloadTooLargeError("相似问添加后超出单条上限：" + shapeErr.Error())
+	}
 	tempMeta := &types.FAQChunkMetadata{
 		StandardQuestion: meta.StandardQuestion,
-		SimilarQuestions: append(meta.SimilarQuestions, newQuestions...),
+		SimilarQuestions: mergedSimilar,
 	}
 	if err := s.checkFAQQuestionDuplicate(ctx, tenantID, kb.ID, chunk.ID, tempMeta); err != nil {
 		return nil, err
@@ -545,7 +574,7 @@ func (s *knowledgeService) AddSimilarQuestions(ctx context.Context,
 
 	// Update metadata
 	oldSimilarQuestions := meta.SimilarQuestions
-	meta.SimilarQuestions = append(meta.SimilarQuestions, newQuestions...)
+	meta.SimilarQuestions = mergedSimilar
 	meta.Version++
 
 	if err := chunk.SetFAQMetadata(meta); err != nil {
@@ -671,6 +700,30 @@ func (s *knowledgeService) UpdateFAQEntryFieldsBatch(ctx context.Context,
 ) error {
 	if req == nil || (len(req.ByID) == 0 && len(req.ByTag) == 0) {
 		return nil
+	}
+	// The handler caps both maps through their binding tags; this is the same
+	// bound for every other path in. ByTag is deliberately unbounded: updating
+	// a tag is defined to touch every entry carrying it.
+	if len(req.ByID) > types.FAQBatchMaxEntriesPerRequest {
+		return werrors.NewBadRequestError(fmt.Sprintf(
+			"单次最多更新 %d 条 FAQ，当前 %d 条，请分批提交",
+			types.FAQBatchMaxEntriesPerRequest, len(req.ByID)))
+	}
+	// Only a by_tag update consumes exclusions: planFAQFields hands them to the
+	// repository call the tag path makes, and nothing else reads them. Without a
+	// by_tag they are meaningless, so refusing there would reject a request that
+	// cannot change a row -- and would leave the caller no way out of the
+	// refusal, since by_id batches have to carry them too.
+	if len(req.ByTag) > 0 && len(req.ExcludeIDs) > types.FAQBatchMaxEntriesPerRequest {
+		// Every row missing from the list this call carries is a row the tag
+		// update touches, so the list can be neither split nor shortened: two
+		// batches each cover the other's exclusions, and dropping the extras
+		// updates exactly the rows the caller asked to leave alone. Sending
+		// by_id afterwards cannot undo that, and keeping by_tag on those batches
+		// would repeat the mistake. The only safe route is to name the rows that
+		// should change and leave the tag path out of it.
+		return werrors.NewBadRequestError(
+			secutils.FAQTooManyExclusionsMessage(types.FAQBatchMaxEntriesPerRequest, len(req.ExcludeIDs)))
 	}
 	kb, ctx, err := s.writableFAQKnowledgeBase(ctx, kbID)
 	if err != nil {
@@ -897,6 +950,13 @@ func (s *knowledgeService) UpdateFAQEntryTag(ctx context.Context, kbID string, e
 // UpdateFAQEntryTagBatch updates tags for FAQ entries in batch.
 // Key: entry seq_id, Value: tag seq_id (nil to remove tag)
 func (s *knowledgeService) UpdateFAQEntryTagBatch(ctx context.Context, kbID string, updates map[int64]*int64) error {
+	// Checked before the map is copied: an over-limit request should not cost a
+	// second allocation of what it is about to be refused for.
+	if len(updates) > types.FAQBatchMaxEntriesPerRequest {
+		return werrors.NewBadRequestError(fmt.Sprintf(
+			"单次最多更新 %d 条 FAQ 的标签，当前 %d 条，请分批提交",
+			types.FAQBatchMaxEntriesPerRequest, len(updates)))
+	}
 	req := &types.FAQEntryFieldsBatchUpdate{ByID: make(map[int64]types.FAQEntryFieldsUpdate, len(updates))}
 	for id, tag := range updates {
 		value := int64(0) // nil in the tag API means remove the tag.
@@ -1249,6 +1309,14 @@ func (s *knowledgeService) DeleteFAQEntries(ctx context.Context,
 	if len(entrySeqIDs) == 0 {
 		return werrors.NewBadRequestError("请选择需要删除的 FAQ 条目")
 	}
+	// Same bound as the handler's binding tag: each id drives a chunk delete
+	// and a vector delete, so this is the only thing bounding the work for a
+	// caller that does not come through the HTTP layer.
+	if len(entrySeqIDs) > types.FAQBatchMaxEntriesPerRequest {
+		return werrors.NewBadRequestError(fmt.Sprintf(
+			"单次最多删除 %d 条 FAQ，当前 %d 条，请分批提交",
+			types.FAQBatchMaxEntriesPerRequest, len(entrySeqIDs)))
+	}
 	kb, ctx, err := s.writableFAQKnowledgeBase(ctx, kbID)
 	if err != nil {
 		return err
@@ -1472,12 +1540,36 @@ func (s *knowledgeService) buildFAQCSV(chunks []*types.Chunk, tagMap map[string]
 }
 
 // escapeCSVField escapes a field for CSV format.
+//
+// A leading =, +, -, @, tab or CR makes spreadsheet software treat the cell as
+// a formula (CWE-1236): an entry someone exports and opens in Excel could then
+// evaluate a HYPERLINK or DDE payload written into its question or answer. Such
+// a field gets a leading apostrophe, which spreadsheets read as "this is text".
+// The importers strip it again, so the export/edit/import round trip is intact.
 func escapeCSVField(field string) string {
+	if csvFormulaLead(field) {
+		field = "'" + field
+	}
 	// If field contains comma, newline, or quote, wrap in quotes and escape internal quotes
 	if strings.ContainsAny(field, ",\"\n\r") {
 		return "\"" + strings.ReplaceAll(field, "\"", "\"\"") + "\""
 	}
 	return field
+}
+
+// csvFormulaLead reports whether a cell would be read as a formula, directly
+// or once an existing leading apostrophe is treated as text. The second form
+// gets marked too, so stripping one apostrophe on import always restores the
+// original text of a file this exporter wrote.
+func csvFormulaLead(field string) bool {
+	const formula = "=+-@\t\r"
+	if field == "" {
+		return false
+	}
+	if strings.ContainsRune(formula, rune(field[0])) {
+		return true
+	}
+	return field[0] == '\'' && len(field) > 1 && strings.ContainsRune(formula, rune(field[1]))
 }
 
 // boolToCSV converts a boolean to CSV TRUE/FALSE string.
@@ -1818,16 +1910,28 @@ func hashQuestion(question string) string {
 func (s *knowledgeService) resolveTagID(ctx context.Context, kbID string, payload *types.FAQEntryPayload) (string, error) {
 	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
 
-	// 如果提供了 tag_id (seq_id)，优先使用 tag_id
+	// 如果提供了 tag_id (seq_id)，优先使用 tag_id。
+	//
+	// tag_id 只在它所属的知识库里有效：跨知识库迁移（A 导出、B 导入）时它
+	// 指向源库的标签，在这里要么查不到、要么不属于目标库。条目同时带了
+	// tag_name 时按名称兜底 —— 名称才是迁移中稳定的标识；两者都没有才报错。
 	if payload.TagID != 0 {
 		tag, err := s.tagRepo.GetBySeqID(ctx, tenantID, payload.TagID)
-		if err != nil {
+		if err == nil {
+			if scopeErr := validateFAQTagScope(tag, tenantID, kbID); scopeErr == nil {
+				return tag.ID, nil
+			} else if payload.TagName == "" {
+				return "", scopeErr
+			} else {
+				logger.Warnf(ctx, "FAQ tag id %d is not usable in KB %s (%v); falling back to tag name %q",
+					payload.TagID, kbID, scopeErr, payload.TagName)
+			}
+		} else if payload.TagName == "" {
 			return "", fmt.Errorf("failed to find tag by seq_id %d: %w", payload.TagID, err)
+		} else {
+			logger.Warnf(ctx, "FAQ tag id %d not found (%v); falling back to tag name %q",
+				payload.TagID, err, payload.TagName)
 		}
-		if err := validateFAQTagScope(tag, tenantID, kbID); err != nil {
-			return "", err
-		}
-		return tag.ID, nil
 	}
 
 	// 如果提供了 tag_name，查找或创建标签
@@ -1873,6 +1977,15 @@ func sanitizeFAQEntryPayload(payload *types.FAQEntryPayload) (*types.FAQChunkMet
 	}
 	if len(meta.Answers) == 0 {
 		return nil, werrors.NewBadRequestError("至少提供一个答案")
+	}
+	// The batch caps bound how many entries a request carries, not what one
+	// entry carries. Under question_index_mode=separate with
+	// index_mode=question_answer the indexer copies every answer into an index
+	// item per similar question, so a single oversized entry expands by that
+	// factor before the storage check runs. Bounding it here covers every path
+	// into FAQ indexing, because every one of them sanitizes through here.
+	if err := secutils.CheckFAQEntryShape(meta.StandardQuestion, meta.SimilarQuestions, meta.NegativeQuestions, meta.Answers); err != nil {
+		return nil, werrors.NewBadRequestError(err.Error())
 	}
 	return meta, nil
 }

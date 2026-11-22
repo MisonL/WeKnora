@@ -3132,6 +3132,7 @@ func (s *knowledgeService) reparseKnowledge(
 			TenantID:                 tenantID,
 			KnowledgeID:              existing.ID,
 			KnowledgeBaseID:          existing.KnowledgeBaseID,
+			FileSize:                 existing.FileSize,
 			FilePath:                 existing.FilePath,
 			FileName:                 existing.FileName,
 			FileType:                 getFileType(existing.FileName),
@@ -3186,6 +3187,7 @@ func (s *knowledgeService) reparseKnowledge(
 			TenantID:                 tenantID,
 			KnowledgeID:              existing.ID,
 			KnowledgeBaseID:          existing.KnowledgeBaseID,
+			FileSize:                 existing.FileSize,
 			FileURL:                  existing.Source,
 			FileName:                 existing.FileName,
 			FileType:                 existing.FileType,
@@ -3239,6 +3241,7 @@ func (s *knowledgeService) reparseKnowledge(
 			TenantID:                 tenantID,
 			KnowledgeID:              existing.ID,
 			KnowledgeBaseID:          existing.KnowledgeBaseID,
+			FileSize:                 existing.FileSize,
 			URL:                      existing.Source,
 			EnableMultimodel:         enableMultimodel,
 			EnableQuestionGeneration: enableQuestionGeneration,
@@ -3388,7 +3391,8 @@ func (s *knowledgeService) CancelKnowledgeParse(
 	}
 
 	// Best-effort dequeue. Failures here don't block the cancel — the
-	// downstream tasks will still self-abort at their entry guards.
+	// downstream tasks will still self-abort at their entry guards. The dequeue
+	// ends any budget the queued task was holding.
 	s.dequeueKnowledgeTasks(ctx, knowledgeID)
 	// Wiki ingest lives in its own per-KB pending queue (task_pending_ops)
 	// rather than asynq, so dequeueKnowledgeTasks above can't see it.
@@ -3408,12 +3412,21 @@ func (s *knowledgeService) CancelKnowledgeParse(
 // tasks for this knowledge and signal active workers to stop. Safe to
 // call when the inspector is a no-op (Lite mode).
 func (s *knowledgeService) dequeueKnowledgeTasks(ctx context.Context, knowledgeID string) {
-	if s.taskInspector == nil {
-		return
+	if s.taskInspector != nil {
+		if _, _, err := s.taskInspector.CancelTasksForKnowledge(ctx, knowledgeID); err != nil {
+			// Not knowing whether the queued task is gone, the budget stays:
+			// a leak costs headroom until restart, while freeing a task that
+			// still runs lets the next uploads over-commit the host.
+			logger.Warnf(ctx, "CancelKnowledgeParse: dequeue best-effort failed for %s: %v", knowledgeID, err)
+			return
+		}
 	}
-	if _, _, err := s.taskInspector.CancelTasksForKnowledge(ctx, knowledgeID); err != nil {
-		logger.Warnf(ctx, "CancelKnowledgeParse: dequeue best-effort failed for %s: %v", knowledgeID, err)
-	}
+	// A task that was cancelled while queued never runs ProcessDocument, so
+	// nothing else will end the row's parse budget. A task that was already
+	// running keeps it: its own run ends the reservation, and only the last
+	// claim frees the bytes. The no-inspector branch is Lite mode, whose worker
+	// is in this process and sees the cancelled status at its entry guard.
+	EndUploadWork(knowledgeID)
 }
 
 func (s *knowledgeService) updateChunkVector(ctx context.Context, kbID string, chunks []*types.Chunk) error {
@@ -3705,6 +3718,16 @@ func (s *knowledgeService) ProcessManualUpdate(ctx context.Context, t *asynq.Tas
 		return nil
 	}
 
+	// Manual (re)indexing runs the same chunking and embedding work as a
+	// document parse, and nothing charges it at enqueue: without this claim a
+	// manual publish or reparse would run entirely outside the parse budget.
+	releaseWork, err := ReserveUploadWork(parseWorkKeyForTask(t),
+		ParseJobWorkingBytes(0, nil, []string{payload.Content}), requestWorkerWork)
+	if err != nil {
+		return err
+	}
+	defer releaseWork()
+
 	ctx = logger.WithRequestID(ctx, payload.RequestId)
 	ctx = logger.WithField(ctx, "manual_process", payload.KnowledgeID)
 	ctx = types.WithExecutionTenant(ctx, payload.TenantID)
@@ -3819,6 +3842,19 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		logger.Errorf(ctx, "failed to unmarshal document process task payload: %v", err)
 		return nil
 	}
+
+	// The parse-job budget is claimed here, before any work. An upload's row is
+	// already charged by the enqueue site; a reparse or a row created by URL
+	// import, IM or a datasource has no such charge, and claiming bytes=0 for
+	// those would leave every one of them unbudgeted. The bytes below only
+	// count when this claim starts the reservation, or raises one that was
+	// ended; joining a live uploader's reservation keeps its figure.
+	releaseWork, err := ReserveUploadWork(parseWorkKeyForTask(t),
+		ParseJobWorkingBytes(payload.FileSize, []string{payload.FilePath}, payload.Passages), requestWorkerWork)
+	if err != nil {
+		return err
+	}
+	defer releaseWork()
 
 	ctx = logger.WithRequestID(ctx, payload.RequestId)
 	ctx = logger.WithField(ctx, "document_process", payload.KnowledgeID)

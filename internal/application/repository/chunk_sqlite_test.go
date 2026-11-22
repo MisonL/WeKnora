@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -300,6 +301,62 @@ func TestCreateChunks_SQLite_SeqIDAfterSoftDelete(t *testing.T) {
 	assert.Len(t, saved, 2)
 	assert.Equal(t, int64(4), saved[0].SeqID)
 	assert.Equal(t, int64(5), saved[1].SeqID)
+}
+
+// An imported chunk may carry an explicit SeqID (the CLI export writes one and
+// import preserves it). The SQLite allocator must not hand out an id that is
+// inserted in the same batch: the column is uniquely indexed, so the duplicate
+// fails the whole insert rather than the one row.
+func TestCreateChunks_SQLite_AllocatorSkipsExplicitSeqIDsInBatch(t *testing.T) {
+	db := setupChunkTestDB(t)
+	repo := NewChunkRepository(db)
+	ctx := context.Background()
+
+	first := makeChunk("kb-1", "k-1", types.ChunkTypeFAQ)
+	first.SeqID = 1
+	second := makeChunk("kb-1", "k-1", types.ChunkTypeFAQ)
+	second.SeqID = 2
+	third := makeChunk("kb-1", "k-1", types.ChunkTypeFAQ)
+	fourth := makeChunk("kb-1", "k-1", types.ChunkTypeFAQ)
+
+	require.NoError(t, repo.CreateChunks(ctx, []*types.Chunk{first, second, third, fourth}))
+
+	assert.Equal(t, int64(1), first.SeqID)
+	assert.Equal(t, int64(2), second.SeqID)
+	assert.Equal(t, int64(3), third.SeqID, "allocation has to start above the batch's explicit ids")
+	assert.Equal(t, int64(4), fourth.SeqID)
+
+	var saved []types.Chunk
+	require.NoError(t, db.Order("seq_id").Find(&saved).Error)
+	require.Len(t, saved, 4)
+	for i, c := range saved {
+		assert.Equal(t, int64(i+1), c.SeqID)
+	}
+}
+
+// The JSON and CSV exports read this listing, and the entry id they write is
+// the chunk's seq_id; a projection that omits it exports every entry as id 0.
+func TestListAllFAQChunksForExportCarriesSeqID(t *testing.T) {
+	db := setupChunkTestDB(t)
+	repo := NewChunkRepository(db)
+	ctx := context.Background()
+
+	chunks := []*types.Chunk{
+		makeChunk("kb-export", "faq-export", types.ChunkTypeFAQ),
+		makeChunk("kb-export", "faq-export", types.ChunkTypeFAQ),
+	}
+	require.NoError(t, repo.CreateChunks(ctx, chunks))
+	for _, c := range chunks {
+		require.NoError(t, db.Model(c).Update("status", int(types.ChunkStatusIndexed)).Error)
+	}
+	require.NotZero(t, chunks[0].SeqID)
+
+	got, err := repo.ListAllFAQChunksForExport(ctx, 1, "faq-export")
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	byID := map[string]*types.Chunk{got[0].ID: got[0], got[1].ID: got[1]}
+	assert.Equal(t, chunks[0].SeqID, byID[chunks[0].ID].SeqID)
+	assert.Equal(t, chunks[1].SeqID, byID[chunks[1].ID].SeqID)
 }
 
 func TestUpdateChunk_SQLite_NoNOWError(t *testing.T) {
@@ -624,4 +681,35 @@ func TestCreateChunks_PreservesExplicitEnabledState(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A batch at the top of the range used to wrap `MAX + 1` into a negative
+// number and write it into the allocated rows: seq_id is the API's entry
+// number and the ordering key, so a negative value breaks both.
+func TestAssignChunkSeqIDs_SQLite_RefusesToWrapPastTheRange(t *testing.T) {
+	db := setupChunkTestDB(t)
+
+	explicitTop := makeChunk("kb-top", "k-top", types.ChunkTypeFAQ)
+	explicitTop.SeqID = math.MaxInt64
+	allocated := makeChunk("kb-top", "k-top", types.ChunkTypeFAQ)
+	err := types.AssignChunkSeqIDs(db, []*types.Chunk{explicitTop, allocated})
+	require.Error(t, err, "an explicit seq_id at MaxInt64 leaves no room to allocate")
+	assert.Zero(t, allocated.SeqID, "a refused batch must not be handed an invalid id")
+
+	// The same overflow from the table's side: the maximum allocatable id is
+	// MaxInt64-1, so two rows to allocate no longer fit.
+	nearTop := makeChunk("kb-near", "k-near", types.ChunkTypeFAQ)
+	nearTop.SeqID = math.MaxInt64 - 1
+	require.NoError(t, db.Create(nearTop).Error)
+	a := makeChunk("kb-near", "k-near", types.ChunkTypeFAQ)
+	b := makeChunk("kb-near", "k-near", types.ChunkTypeFAQ)
+	err = types.AssignChunkSeqIDs(db, []*types.Chunk{a, b})
+	require.Error(t, err, "allocating past MaxInt64 has to fail instead of wrapping")
+	assert.Zero(t, a.SeqID)
+	assert.Zero(t, b.SeqID)
+
+	// One row still fits exactly at MaxInt64.
+	single := makeChunk("kb-near", "k-near", types.ChunkTypeFAQ)
+	require.NoError(t, types.AssignChunkSeqIDs(db, []*types.Chunk{single}))
+	assert.Equal(t, int64(math.MaxInt64), single.SeqID)
 }

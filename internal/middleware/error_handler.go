@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -21,6 +22,9 @@ func ErrorHandler() gin.HandlerFunc {
 
 			// 检查是否为应用错误
 			if appErr, ok := errors.IsAppError(err); ok {
+				if appErr.RetryAfterSeconds > 0 {
+					c.Header("Retry-After", strconv.Itoa(appErr.RetryAfterSeconds))
+				}
 				// 返回应用错误
 				c.JSON(appErr.HTTPCode, gin.H{
 					"success": false,

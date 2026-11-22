@@ -17,6 +17,8 @@ services:
     environment:
       - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-50}
       - MAX_SKILL_BUNDLE_SIZE_MB=${MAX_SKILL_BUNDLE_SIZE_MB:-256}
+      # FAQ 单次导入条数上限；前端用它在提交前做预检，后端仍以 app 侧为准
+      - WEKNORA_FAQ_IMPORT_MAX_ENTRIES=${WEKNORA_FAQ_IMPORT_MAX_ENTRIES:-1000}
       - DEFAULT_LOCALE=${DEFAULT_LOCALE:-}
       - APP_HOST=${APP_HOST:-app}
       # APP_BACKEND_PORT: the port NGINX proxies to (default 8080).
@@ -341,6 +343,13 @@ services:
       - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-50}
       # Skill zip / GitHub source download cap (in MB); the GitHub zipball is the whole repo, not the skill subtree
       - MAX_SKILL_BUNDLE_SIZE_MB=${MAX_SKILL_BUNDLE_SIZE_MB:-256}
+      # FAQ 批量导入预算：单次条目数（默认 1000）与请求体字节数（默认 32MiB，
+      # 且不超过 MAX_FILE_SIZE_MB）。条目数超限在解析前以 400 拒绝，请求体
+      # 超限以 413（error.code 1011）拒绝。
+      - WEKNORA_FAQ_IMPORT_MAX_ENTRIES=${WEKNORA_FAQ_IMPORT_MAX_ENTRIES:-1000}
+      - WEKNORA_FAQ_IMPORT_MAX_JSON_BYTES=${WEKNORA_FAQ_IMPORT_MAX_JSON_BYTES:-}
+      - WEKNORA_FAQ_IMPORT_MAX_INFLIGHT=${WEKNORA_FAQ_IMPORT_MAX_INFLIGHT:-}
+      - WEKNORA_FAQ_IMPORT_MAX_INFLIGHT_BYTES=${WEKNORA_FAQ_IMPORT_MAX_INFLIGHT_BYTES:-}
       # 文档处理任务总超时（Go duration，默认 2h）
       - WEKNORA_DOCUMENT_PROCESS_TIMEOUT=${WEKNORA_DOCUMENT_PROCESS_TIMEOUT:-}
       # 单次 DocReader RPC 超时（默认 30m，须小于上一项）

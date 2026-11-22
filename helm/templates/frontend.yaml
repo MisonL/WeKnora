@@ -48,6 +48,10 @@ spec:
               value: {{ .Values.frontend.appPort | default .Values.app.service.port | quote }}
             - name: MAX_FILE_SIZE_MB
               value: {{ .Values.global.maxFileSizeMB | quote }}
+            {{- if gt (int .Values.global.faqImportMaxEntries) 0 }}
+            - name: WEKNORA_FAQ_IMPORT_MAX_ENTRIES
+              value: {{ .Values.global.faqImportMaxEntries | quote }}
+            {{- end }}
           ports:
             - containerPort: 80
               name: http

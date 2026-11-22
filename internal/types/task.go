@@ -299,16 +299,19 @@ type ExtractChunkPayload struct {
 // DocumentProcessPayload represents the document process task payload
 type DocumentProcessPayload struct {
 	TracingContext
-	RequestId                string   `json:"request_id"`
-	TenantID                 uint64   `json:"tenant_id"`
-	KnowledgeID              string   `json:"knowledge_id"`
-	KnowledgeBaseID          string   `json:"knowledge_base_id"`
-	FilePath                 string   `json:"file_path,omitempty"` // 文件路径（文件导入时使用）
-	FileName                 string   `json:"file_name,omitempty"` // 文件名（文件导入时使用）
-	FileType                 string   `json:"file_type,omitempty"` // 文件类型（文件导入时使用）
-	URL                      string   `json:"url,omitempty"`       // URL（URL导入时使用）
-	FileURL                  string   `json:"file_url,omitempty"`  // 文件资源链接（file_url导入时使用）
-	Passages                 []string `json:"passages,omitempty"`  // 文本段落（文本导入时使用）
+	RequestId       string `json:"request_id"`
+	TenantID        uint64 `json:"tenant_id"`
+	KnowledgeID     string `json:"knowledge_id"`
+	KnowledgeBaseID string `json:"knowledge_base_id"`
+	FilePath        string `json:"file_path,omitempty"` // 文件路径（文件导入时使用）
+	FileName        string `json:"file_name,omitempty"` // 文件名（文件导入时使用）
+	FileType        string `json:"file_type,omitempty"` // 文件类型（文件导入时使用）
+	URL             string `json:"url,omitempty"`       // URL（URL导入时使用）
+	FileURL         string `json:"file_url,omitempty"`  // 文件资源链接（file_url导入时使用）
+	// FileSize is the source size in bytes recorded on the knowledge row. A
+	// reparse has no uploader to declare its size, so the worker budgets this.
+	FileSize                 int64    `json:"file_size,omitempty"`
+	Passages                 []string `json:"passages,omitempty"` // 文本段落（文本导入时使用）
 	EnableMultimodel         bool     `json:"enable_multimodel"`
 	EnableQuestionGeneration bool     `json:"enable_question_generation"` // 是否启用问题生成
 	QuestionCount            int      `json:"question_count,omitempty"`   // 每个chunk生成的问题数量
@@ -335,8 +338,11 @@ type FAQImportPayload struct {
 	Mode        string            `json:"mode"`
 	DryRun      bool              `json:"dry_run"`     // dry run 模式只验证不导入
 	EnqueuedAt  int64             `json:"enqueued_at"` // 任务入队时间戳，用于区分同一 TaskID 的不同次提交
-	InstanceID  string            `json:"instance_id,omitempty"`
-	Initiator   TaskInitiator     `json:"initiator,omitempty"`
+	// EnqueuedAtMillis is the enqueue instant at millisecond resolution; empty
+	// in payloads written by older builds.
+	EnqueuedAtMillis int64         `json:"enqueued_at_ms,omitempty"`
+	InstanceID       string        `json:"instance_id,omitempty"`
+	Initiator        TaskInitiator `json:"initiator,omitempty"`
 }
 
 // QuestionGenerationPayload represents the question generation task payload

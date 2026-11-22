@@ -3,6 +3,8 @@
 package types
 
 import (
+	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -252,8 +254,38 @@ func AssignChunkSeqIDs(tx *gorm.DB, chunks []*Chunk) error {
 		return err
 	}
 	next := int64(1)
+	// Rows of the same batch that carry an explicit SeqID (an import that
+	// supplies one, or a retry that preserves it) are inserted alongside the
+	// allocated ones and must not be handed out again: on SQLite the column is
+	// uniquely indexed, so an allocation that ignores them fails the whole
+	// insert instead of just the duplicate.
+	for _, c := range chunks {
+		if c.SeqID == math.MaxInt64 {
+			// +1 would wrap to a negative next and write negative ids, which
+			// the positive-number contract of seq_id and the ordering it backs
+			// both break on.
+			return fmt.Errorf("cannot assign chunk seq_id: the batch already holds seq_id %d", int64(math.MaxInt64))
+		}
+		if c.SeqID >= next {
+			next = c.SeqID + 1
+		}
+	}
 	if maxSeqID != nil {
-		next = *maxSeqID + 1
+		if *maxSeqID == math.MaxInt64 {
+			return fmt.Errorf("cannot assign chunk seq_id: the table already holds seq_id %d", int64(math.MaxInt64))
+		}
+		if *maxSeqID >= next {
+			next = *maxSeqID + 1
+		}
+	}
+	zeroCount := 0
+	for _, c := range chunks {
+		if c.SeqID == 0 {
+			zeroCount++
+		}
+	}
+	if zeroCount > 0 && int64(zeroCount)-1 > math.MaxInt64-next {
+		return fmt.Errorf("cannot assign %d chunk seq_ids from %d: the range is exhausted", zeroCount, next)
 	}
 	for _, c := range chunks {
 		if c.SeqID == 0 {

@@ -1024,7 +1024,7 @@ func (s *knowledgeBaseService) DeleteKnowledgeBase(ctx context.Context, id strin
 	kbCleanupCtx, cancelKBCleanup := context.WithTimeout(
 		context.WithoutCancel(ctx), kbTaskCleanupTimeout,
 	)
-	s.cleanupTasksForKnowledgeBase(kbCleanupCtx, id, nil, nil)
+	s.onKnowledgeBaseDeleted(kbCleanupCtx, tenantID, id)
 	cancelKBCleanup()
 
 	// Step 1b: Remove all organization shares for this KB so org settings no longer show them
@@ -1132,6 +1132,15 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kbTaskCleanupTimeout)
 		defer cancel()
 		s.cleanupTasksForKnowledgeBase(cleanupCtx, kbID, knowledgeIDs, payload.DataSourceIDs)
+		// A queued parse job of a deleted row never runs, so nothing else frees
+		// the budget its enqueue charged; the request-side pass can also be cut
+		// short by its own timeout, and this task is the durable backstop. The
+		// listed ids survive soft deletion in-process; the repo pass covers rows
+		// this payload did not name.
+		for _, knowledgeID := range knowledgeIDs {
+			EndUploadWork(knowledgeID)
+		}
+		s.releaseUploadWorkForKnowledgeBase(cleanupCtx, tenantID, kbID)
 	}()
 
 	logger.Infof(ctx, "Processing KB delete task for knowledge base: %s", kbID)
@@ -1353,6 +1362,47 @@ func (s *knowledgeBaseService) cleanupTasksForKnowledgeBase(
 		}
 	}
 	s.cancelTasksForKnowledgeBase(ctx, kbID, knowledgeIDs, dataSourceIDs)
+}
+
+// onKnowledgeBaseDeleted does the in-request cleanup a deleted KB needs: stop
+// the queue work and release the parse-work budget its queued rows still hold.
+//
+// The release is here, next to the queue cancel, because the two are the same
+// action's two halves: cancelling stops the jobs, but the budget an upload
+// charged at enqueue time is only freed when the job runs or is explicitly
+// ended. A KB delete ends neither, so without this its queued rows' bytes stay
+// reserved for the life of the process and later uploads are refused once
+// enough have accumulated.
+func (s *knowledgeBaseService) onKnowledgeBaseDeleted(ctx context.Context, tenantID uint64, kbID string) {
+	s.cleanupTasksForKnowledgeBase(ctx, kbID, nil, nil)
+	s.releaseUploadWorkForKnowledgeBase(ctx, tenantID, kbID)
+}
+
+// releaseUploadWorkForKnowledgeBase frees the parse-work budget every queued
+// row of a deleted KB still holds.
+//
+// The budget is charged at upload enqueue time and handed to the parse job;
+// cancelling the queue (delete / cancel) means that job never runs and never
+// releases. Every other cancel path ends a single row through
+// dequeueKnowledgeTasks -> EndUploadWork; a whole-KB delete has no such pass, so
+// without this its queued rows' bytes stay reserved for the life of the
+// process and later uploads are refused once enough have piled up.
+func (s *knowledgeBaseService) releaseUploadWorkForKnowledgeBase(
+	ctx context.Context, tenantID uint64, kbID string,
+) {
+	if s.kgRepo == nil || kbID == "" {
+		return
+	}
+	rows, err := s.kgRepo.ListKnowledgeByKnowledgeBaseID(ctx, tenantID, kbID)
+	if err != nil {
+		logger.Warnf(ctx, "Failed to list knowledge of deleted KB %s to release parse budget: %v", kbID, err)
+		return
+	}
+	for _, k := range rows {
+		if k != nil && k.ID != "" {
+			EndUploadWork(k.ID)
+		}
+	}
 }
 
 // deleteDataSourcesForKnowledgeBase mirrors DataSourceService.DeleteDataSource for

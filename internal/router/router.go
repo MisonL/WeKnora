@@ -107,6 +107,9 @@ func NewRouter(params RouterParams) *gin.Engine {
 	r.ContextWithFallback = true
 	// 清理 FormFile/MultipartForm 解析产生的 multipart 临时文件，避免容器 /tmp 持续增长。
 	r.Use(middleware.MultipartFormCleanup())
+	// 限制请求体的读取时长（按 Content-Length 折算、读到 EOF 即解除），
+	// 避免慢速/停滞的请求体长期占住 handler 与上传准入名额。
+	r.Use(middleware.RequestBodyDeadline())
 
 	// Trusted proxies: gin defaults to trusting ALL proxies, which makes
 	// c.ClientIP() honor a client-supplied X-Forwarded-For. Public, unauthed
@@ -134,7 +137,10 @@ func NewRouter(params RouterParams) *gin.Engine {
 			// the /mcp/:endpoint_id surface.
 			"MCP-Protocol-Version", "Mcp-Method", "Mcp-Name", "Mcp-Session-Id", "Last-Event-ID",
 		},
-		ExposeHeaders:    []string{"Content-Length", "Access-Control-Allow-Origin", "Mcp-Session-Id"},
+		// Retry-After lets a browser client (the FAQ JSON path in particular)
+		// read the back-off the server sent with a 429; without it the header is
+		// invisible to cross-origin JavaScript and the front end has to guess.
+		ExposeHeaders:    []string{"Content-Length", "Access-Control-Allow-Origin", "Mcp-Session-Id", "Retry-After"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}))

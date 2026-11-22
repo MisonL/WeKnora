@@ -54,21 +54,25 @@ func TestRecordKBActivityCarriesInitiatorAndTaskMetadata(t *testing.T) {
 
 func TestFAQImportCompletedOutcome(t *testing.T) {
 	cases := []struct {
-		success, failed, skipped int
-		outcome                  types.AuditOutcome
+		success, partial, failed, skipped int
+		outcome                           types.AuditOutcome
 	}{
-		{10, 0, 0, types.AuditOutcomeSuccess},
-		{8, 2, 0, types.AuditOutcomePartial},
-		{5, 1, 2, types.AuditOutcomePartial},
-		{0, 1, 1, types.AuditOutcomePartial},
-		{0, 2, 0, types.AuditOutcomeFailed},
-		{0, 0, 2, types.AuditOutcomeFailed},
+		{10, 0, 0, 0, types.AuditOutcomeSuccess},
+		{8, 2, 0, 0, types.AuditOutcomePartial},
+		{8, 0, 2, 0, types.AuditOutcomePartial},
+		{5, 1, 1, 3, types.AuditOutcomePartial},
+		{0, 1, 1, 0, types.AuditOutcomePartial},
+		// Every entry imported, but none intact: the import did produce
+		// content, so it is not a failure, and it is certainly not a success.
+		{0, 4, 0, 0, types.AuditOutcomePartial},
+		{0, 0, 2, 0, types.AuditOutcomeFailed},
+		{0, 0, 0, 2, types.AuditOutcomeFailed},
 	}
 	for _, tc := range cases {
-		outcome := faqImportCompletedOutcome(tc.success, tc.failed, tc.skipped)
+		outcome := faqImportCompletedOutcome(tc.success, tc.partial, tc.failed, tc.skipped)
 		if outcome != tc.outcome {
-			t.Fatalf("faqImportCompletedOutcome(%d,%d,%d) = %s, want %s",
-				tc.success, tc.failed, tc.skipped, outcome, tc.outcome)
+			t.Fatalf("faqImportCompletedOutcome(%d,%d,%d,%d) = %s, want %s",
+				tc.success, tc.partial, tc.failed, tc.skipped, outcome, tc.outcome)
 		}
 	}
 }
@@ -82,6 +86,27 @@ func TestFAQImportActivityDetails(t *testing.T) {
 	}
 	if details["total"] != 2 || details["failed"] != 1 || details["skipped"] != 1 {
 		t.Fatalf("details = %#v", details)
+	}
+}
+
+// A partial failure is reported on its own, and must not be re-counted as a
+// skip: skipped is derived as the remainder, so subtracting only success and
+// failed would attribute every partially imported entry to "skipped".
+func TestFAQImportActivityDetailsSeparatesPartialFailures(t *testing.T) {
+	payload := &types.FAQImportPayload{Mode: types.FAQBatchModeAppend}
+	progress := &types.FAQImportProgress{
+		SuccessCount: 6, PartialFailedCount: 3, FailedCount: 0,
+		SkippedCount: 0, Total: 9,
+	}
+	details := faqImportActivityDetails(payload, progress, 9)
+	if details["partial_failed"] != 3 {
+		t.Fatalf("partial_failed = %#v, want 3", details["partial_failed"])
+	}
+	if _, exists := details["skipped"]; exists {
+		t.Fatalf("partial failures were counted as skipped: %#v", details)
+	}
+	if details["count"] != 6 {
+		t.Fatalf("count = %#v, want 6", details["count"])
 	}
 }
 

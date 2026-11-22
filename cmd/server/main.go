@@ -91,9 +91,7 @@ func main() {
 		modelCatalogSvc *service.ModelCatalogService,
 	) error {
 		// Create HTTP server
-		server := &http.Server{
-			Handler: router,
-		}
+		server := newHTTPServer(router)
 
 		addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 		listener, err := listenWithRetry(addr, 10, 300*time.Millisecond)

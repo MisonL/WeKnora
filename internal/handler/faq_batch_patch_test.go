@@ -11,6 +11,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -96,4 +97,20 @@ func TestFAQBatchPatchPropagatesAccessFailure(t *testing.T) {
 	require.NotEmpty(t, c.Errors)
 	assert.NotContains(t, w.Body.String(), `"success":true`)
 	assert.Contains(t, c.Errors.Last().Error(), "another knowledge base")
+}
+
+// The PATCH route binds through the same capped reader as the other FAQ JSON
+// routes, so an oversized body is a 413 it can act on rather than a 400 that
+// says nothing about size -- and the service never sees it.
+func TestFAQBatchPatchRejectsAnOversizedBody(t *testing.T) {
+	t.Setenv(utils.EnvFAQImportMaxJSONBytes, "16")
+
+	s := &faqBatchService{}
+	c, _ := runFAQBatchPatch(`{"entry_ids":[1],"is_enabled":false}`, s)
+
+	require.NotEmpty(t, c.Errors)
+	appErr, ok := c.Errors[0].Err.(*errors.AppError)
+	require.True(t, ok)
+	require.Equal(t, errors.ErrPayloadTooLarge, appErr.Code)
+	require.Nil(t, s.plan, "the body is refused before anything is planned")
 }

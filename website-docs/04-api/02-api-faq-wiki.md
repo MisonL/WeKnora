@@ -52,13 +52,36 @@ curl $BASE/api/v1/knowledge-bases/kb-1/faq/entries/12 -H "Authorization: Bearer 
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `entries` | []FAQEntryPayload | 是（`binding:"required"`） | 批量条目 |
-| `mode` | string | 是（`binding:"oneof=append replace"`） | 追加或替换 |
+| `entries` | []FAQEntryPayload | 是，且**不能是空数组** | 批量条目 |
+| `mode` | string | 是，只能是 `append` 或 `replace` | 追加或替换 |
 | `knowledge_id` | string | 否 | FAQ 知识实体 ID |
 | `task_id` | string | 否 | 自定义任务 ID，仅允许字母、数字、`_`、`-`，最长 128 字符，否则返回 400 |
 | `dry_run` | bool | 否 | 仅校验不落库 |
 
+请求体必须是**单个完整的 JSON 对象**：读完整个值之后若还有多余内容（例如 `{"mode":"append","entries":[...]}xyz`），会被拒绝。这是为了在做条数预算前先把整个请求体读进内存——解码器不接受尾随内容。
+
 响应：200 `{"success":true,"data":{"task_id"}}`
+
+**导入上限**（超限在解析前直接拒绝，不会创建任务）：
+
+| 预算 | 默认 | 配置 | 超限响应 |
+| --- | --- | --- | --- |
+| 单次条目数 | 1000 | `WEKNORA_FAQ_IMPORT_MAX_ENTRIES` | 400 |
+| 请求体字节数 | 32 MiB，且不超过 `MAX_FILE_SIZE_MB` | `WEKNORA_FAQ_IMPORT_MAX_JSON_BYTES` | 413（`error.code` 1011） |
+
+同时刻的在途导入请求数也有预算（`WEKNORA_FAQ_IMPORT_MAX_INFLIGHT`/`WEKNORA_FAQ_IMPORT_MAX_INFLIGHT_BYTES`），超限返回 429 并带 `Retry-After`；请求在读取请求体之前就被拒绝，队列稍后按该头重试即可。
+
+`append` 超限时按上限分批提交即可。**`replace` 不能用分批绕过**：它按完整新集合计算删除差集，
+连续提交多批 replace 会把每批以外的条目当作待删除项。也不能直接换用 append 顶替：append 只追加、
+不删除，旧条目会和新的并存。需要整库替换时的正路是调高导入上限、一次提交完整集合——**两个预算都可能要先调**：条目数不够就调
+`WEKNORA_FAQ_IMPORT_MAX_ENTRIES`；字节数先触顶就调 `WEKNORA_FAQ_IMPORT_MAX_JSON_BYTES`，而它又被
+`MAX_FILE_SIZE_MB` 封顶，所以那次要一并调高 `MAX_FILE_SIZE_MB`。只调条目数而请求体仍超字节预算，一样是 413。「先清空再 append 分批」不是等价替代：清空会立即且不可逆地删除全部旧条目，
+之后任何一批 append 失败都不会把它恢复，所以只有在**已导出备份**的前提下才这么做。
+
+两个预算都生效，哪个先到就用哪个拒绝。默认值下条目数通常先到：常见的一条 FAQ（一个标准问加几句
+答案）只有几百字节，1000 条的请求体通常在几百 KB 量级，离 32 MiB 很远。但如果单条携带大量相似问和长答案，
+字节数会先触顶。字节超限在 `replace` 模式下同样不能靠拆分解决——拆批会让批外条目被删；只有
+`append` 才可以把请求体按字节拆成几批提交。
 
 ```bash
 curl -X POST $BASE/api/v1/knowledge-bases/kb-1/faq/entries -H "X-API-Key: $API_KEY" \
@@ -117,9 +140,11 @@ curl -X POST $BASE/api/v1/knowledge-bases/kb-1/faq/entries/12/similar-questions 
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `by_id` | map[int64]object | 否 | 按条目 seq_id 更新 |
-| `by_tag` | map[int64]object | 否 | 按标签批量更新 |
-| `exclude_ids` | []int64 | 否 | `by_tag` 时排除的条目 |
+| `by_id` | map[int64]object | 否 | 按条目 seq_id 更新，**最多 20 个** |
+| `by_tag` | map[int64]object | 否 | 按标签批量更新，不设条数上限（会触达该标签下全部条目） |
+| `exclude_ids` | []int64 | 否 | `by_tag` 时排除的条目，**最多 20 个**；不带 `by_tag` 时它不参与任何更新（因此不受上限约束） |
+
+**排除列表不能拆批、不能截短。** 每次 `by_tag` 更新都会改动它没有排除的所有条目，所以分两次提交时，各自会把对方排除的条目改掉；把列表删到 20 条再提交，被删掉的那些条目就会被更新。要处理「除这 30 条以外全部改」这类请求，先按完整排除集合算出真正要改的条目，再用 `by_id` 分批提交这些条目，并且**不要同时带 `by_tag` 或 `exclude_ids`**——`by_id` 会精确更新你列出的条目，不需要排除。
 
 响应：200 `{"success":true}`
 
@@ -130,7 +155,7 @@ curl -X PUT $BASE/api/v1/knowledge-bases/kb-1/faq/entries/fields -H "Authorizati
 
 ### PUT /api/v1/knowledge-bases/:id/faq/entries/tags
 
-用途：批量改条目标签。请求体：`{"updates":{"<entry_id>":<tag_id|null>}}`（`binding:"required,min=1"`；null 移除标签）。
+用途：批量改条目标签。请求体：`{"updates":{"<entry_id>":<tag_id|null>}}`（`binding:"required,min=1,max=20"`；null 移除标签）。
 
 响应：200 `{"success":true}`
 
@@ -141,7 +166,9 @@ curl -X PUT $BASE/api/v1/knowledge-bases/kb-1/faq/entries/tags -H "Authorization
 
 ### DELETE /api/v1/knowledge-bases/:id/faq/entries
 
-用途：批量删除条目。请求体：`{"ids":[int64]}`（`binding:"required,min=1"`）。
+用途：批量删除条目。请求体：`{"ids":[int64]}`（`binding:"required,min=1,max=20"`）。
+
+一次最多 20 个 ID，与 Web UI 每页 20 行一致。需要删除更多时按 20 个一组分批提交。
 
 响应：200 `{"success":true}`
 
@@ -185,6 +212,21 @@ curl -X PUT $BASE/api/v1/knowledge-bases/kb-1/faq/import/last-result/display \
 用途：查询 FAQ 导入/dry-run 进度（任务按空间隔离）。权限：Viewer+；API key `retrieve`/`ingest`/full。
 
 响应：200 `{"success":true,"data":{status,progress,failed_entries,...}}`
+
+任务完成时 `data` 带四类计数：
+
+| 字段 | 含义 |
+|---|---|
+| `success_count` | 完全按提交内容导入的条目数 |
+| `partial_failed_count` | 已导入、但冲突的相似问/反例被移除的条目数（`failed_entries` 中 `is_partial_failure` 为真） |
+| `failed_count` | 未能导入的条目数 |
+| `skipped_count` | 跳过的条目数，按 `total - 前三项` 推出，下限为 0 |
+
+正常情况下四项相加等于 `total`；`skipped_count` 是推出来的余数而非独立计数，所以计数本身异常时它会停在 0，四者可能对不上。
+
+`success_count` 与 `failed_count` 始终出现；`partial_failed_count`、`skipped_count` 等可选计数带 `omitempty`，零值不出现在 JSON 里，因此「字段缺失」等于 0，不代表旧服务端不支持。`failed_entries` 非空时会尝试导出为 CSV：生成成功才清空内联列表并给出 `failed_entries_url`（此时判断部分失败必须看 `partial_failed_count`）；导出失败则保留内联 `failed_entries`、不写 URL。
+
+dry-run 任务的记录只描述它自己验证的这批条目，不会套用知识库上一次真实导入的统计。
 
 ```bash
 curl $BASE/api/v1/faq/import/progress/task-1 -H "X-API-Key: $API_KEY"

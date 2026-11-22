@@ -5,7 +5,7 @@
 # No host Node.js installation or prebuilt static-site/ is required.
 # WEBSITE_NGINX_PORT is written into default.conf at build time. The intranet
 # platform starts `nginx; sleep infinity` and does not run docker-entrypoint.sh.
-FROM node:24-bookworm-slim AS builder
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
@@ -20,12 +20,16 @@ RUN npm run setup
 COPY . .
 RUN npm run build
 
-# Pin the runtime base. Do NOT switch back to floating `nginx:stable-alpine`:
-# that tag is now Alpine 3.24+, which fails to start on intranet hosts with
-# CentOS 7's kernel 3.10 and old libseccomp (the v0.7.0 frontend outage).
-# This digest is nginx 1.30.3 / Alpine 3.23.5, the same base as the frontend
-# image that still starts there. apk stays on the 3.23 repos.
-FROM nginx:1.30.3-alpine@sha256:0d3b80406a13a767339fbe2f41406d6c7da727ab89cf8fae399e81f780f814d1 AS runtime
+# Pin the runtime base. Do NOT switch back to a floating `nginx:stable-alpine`
+# tag: it drifts with every stable release and the digest below is what was
+# audited. 1.30.7 is the stable release that fixes the 2026 "nginx2root"
+# remote-code-execution cluster (CVE-2026-123007 and friends) together with
+# every other advisory up to that point, so a downgrade reopens reachable
+# vulnerabilities. This digest is nginx 1.30.7 / Alpine 3.24.4; the host
+# therefore needs a kernel/libseccomp new enough to start it (CentOS 7 with
+# kernel 3.10 and libseccomp 2.3 cannot, which is why the older 1.30.3 pin
+# existed -- any maintained distro runs it).
+FROM nginx:1.30.7-alpine@sha256:bef154735288bc38d99fac41ae63730684bcc661503673a04a0f9bc526ba8598 AS runtime
 # Some deployment platforms wrap the startup command with /bin/bash -c.
 RUN apk add --no-cache bash
 # Baked into default.conf below. Entrypoint still honors a runtime override

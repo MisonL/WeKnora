@@ -2,11 +2,16 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
+	"gorm.io/gorm"
+
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
+	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
 func sortedFAQIDs[V any](values map[int64]V) []int64 {
@@ -68,7 +73,16 @@ func (s *knowledgeService) planFAQFields(
 	kb *types.KnowledgeBase,
 	req *types.FAQEntryFieldsBatchUpdate,
 ) (*faqFieldPlan, error) {
-	ids := append(sortedFAQIDs(req.ByID), req.ExcludeIDs...)
+	// Exclusions are only meaningful to a by_tag update: plan.excludeIDs is
+	// handed to the repository call that path makes, and nothing else reads it.
+	// Loading and validating them unconditionally would let a request that
+	// cannot use them cost a lookup per id -- and, with the cap relaxed for
+	// exactly that reason, make an unbounded exclusion list reachable.
+	exclusions := req.ExcludeIDs
+	if len(req.ByTag) == 0 {
+		exclusions = nil
+	}
+	ids := append(sortedFAQIDs(req.ByID), exclusions...)
 	chunks, err := s.loadFAQWriteChunks(ctx, kb, ids)
 	if err != nil {
 		return nil, err
@@ -81,7 +95,7 @@ func (s *knowledgeService) planFAQFields(
 	for _, chunk := range chunks {
 		plan.chunksByID[chunk.ID] = chunk
 	}
-	for _, id := range req.ExcludeIDs {
+	for _, id := range exclusions {
 		plan.excludeIDs = append(plan.excludeIDs, chunks[id].ID)
 	}
 	tagIDs := make(map[int64]bool)
@@ -136,8 +150,18 @@ func (s *knowledgeService) validateFAQImportTags(
 	kb *types.KnowledgeBase,
 	entries []types.FAQEntryPayload,
 ) error {
+	// validateFAQImportTags
+	//
 	// Import still reports per-entry content validation failures. Referenced
 	// resources must all be in scope before admission or execution, however.
+	//
+	// A tag id names a tag in one knowledge base. An export of KB A imported
+	// into KB B carries A's ids, which are out of scope in B and would refuse
+	// the whole import -- even though every entry also names its tag. Those ids
+	// are cleared here and resolved by name instead; an id with no name is left
+	// alone so the planner reports it.
+	normaliseFAQImportTagIDs(ctx, s.tagRepo, kb.TenantID, kb.ID, entries)
+
 	req := &types.FAQEntryFieldsBatchUpdate{ByTag: make(map[int64]types.FAQEntryFieldsUpdate)}
 	for _, entry := range entries {
 		if entry.TagID != 0 {
@@ -146,4 +170,51 @@ func (s *knowledgeService) validateFAQImportTags(
 	}
 	_, err := s.planFAQFields(ctx, kb, req)
 	return err
+}
+
+// normaliseFAQImportTagIDs clears tag ids that do not resolve to a tag of the
+// target knowledge base when the entry names its tag as well. Lookups are
+// cached per id: a batch references a handful of tags, not one per entry.
+func normaliseFAQImportTagIDs(
+	ctx context.Context,
+	tagRepo interfaces.KnowledgeTagRepository,
+	tenantID uint64,
+	kbID string,
+	entries []types.FAQEntryPayload,
+) {
+	if tagRepo == nil || kbID == "" {
+		return
+	}
+	// unresolvable[id] is true when the id names no tag of this KB. A lookup
+	// that fails for another reason (a database error) must not clear the id:
+	// clearing it would silently turn "reuse this tag" into "create a tag with
+	// this name". Left in place, the planner's own lookup reports the error.
+	unresolvable := make(map[int64]bool)
+	checked := make(map[int64]bool)
+	for i := range entries {
+		id := entries[i].TagID
+		if id == 0 {
+			continue
+		}
+		if !checked[id] {
+			checked[id] = true
+			unresolvable[id] = false
+			tag, err := tagRepo.GetBySeqID(ctx, tenantID, id)
+			switch {
+			case err == nil && tag != nil && tag.TenantID == tenantID && tag.KnowledgeBaseID == kbID:
+				// In scope: keep it.
+			case err == nil && tag != nil, errors.Is(err, gorm.ErrRecordNotFound), err == nil && tag == nil:
+				// It exists but belongs elsewhere (another KB or tenant), or
+				// nothing has this id; a name fallback is safe.
+				unresolvable[id] = true
+			default:
+				logger.Warnf(ctx, "FAQ import: could not look up tag id %d: %v; keeping it", id, err)
+			}
+		}
+		if unresolvable[id] && entries[i].TagName != "" {
+			logger.Infof(ctx, "FAQ import: tag id %d does not belong to KB %s; using tag name %q",
+				id, kbID, entries[i].TagName)
+			entries[i].TagID = 0
+		}
+	}
 }

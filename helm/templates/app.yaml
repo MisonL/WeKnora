@@ -68,6 +68,42 @@ spec:
               value: {{ .Values.app.env.TZ | quote }}
             - name: MAX_FILE_SIZE_MB
               value: {{ .Values.global.maxFileSizeMB | quote }}
+            {{- if gt (int .Values.global.faqImportMaxEntries) 0 }}
+            - name: WEKNORA_FAQ_IMPORT_MAX_ENTRIES
+              value: {{ .Values.global.faqImportMaxEntries | quote }}
+            {{- end }}
+            {{- if gt (int .Values.global.faqImportMaxJSONBytes) 0 }}
+            - name: WEKNORA_FAQ_IMPORT_MAX_JSON_BYTES
+              value: {{ .Values.global.faqImportMaxJSONBytes | quote }}
+            {{- end }}
+            {{- if gt (int .Values.global.faqImportMaxInflight) 0 }}
+            - name: WEKNORA_FAQ_IMPORT_MAX_INFLIGHT
+              value: {{ .Values.global.faqImportMaxInflight | quote }}
+            {{- end }}
+            {{- if gt (int .Values.global.faqImportMaxInflightBytes) 0 }}
+            - name: WEKNORA_FAQ_IMPORT_MAX_INFLIGHT_BYTES
+              value: {{ .Values.global.faqImportMaxInflightBytes | quote }}
+            {{- end }}
+            {{- if gt (int .Values.global.uploadMaxConcurrency) 0 }}
+            - name: UPLOAD_MAX_CONCURRENCY
+              value: {{ .Values.global.uploadMaxConcurrency | quote }}
+            {{- end }}
+            {{- if gt (int .Values.global.uploadBigBytes) 0 }}
+            - name: UPLOAD_BIG_BYTES
+              value: {{ .Values.global.uploadBigBytes | quote }}
+            {{- end }}
+            {{- if gt (int .Values.global.uploadMaxInflightBytes) 0 }}
+            - name: UPLOAD_MAX_INFLIGHT_BYTES
+              value: {{ .Values.global.uploadMaxInflightBytes | quote }}
+            {{- end }}
+            {{- if gt (int .Values.global.uploadMaxBackgroundBytes) 0 }}
+            - name: UPLOAD_MAX_BACKGROUND_BYTES
+              value: {{ .Values.global.uploadMaxBackgroundBytes | quote }}
+            {{- end }}
+            {{- if gt (int .Values.global.uploadMaxBackgroundJobs) 0 }}
+            - name: UPLOAD_MAX_BACKGROUND_JOBS
+              value: {{ .Values.global.uploadMaxBackgroundJobs | quote }}
+            {{- end }}
             # Database configuration
             - name: DB_DRIVER
               value: "postgres"

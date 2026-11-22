@@ -161,6 +161,41 @@ func (r *tenantRepository) DeleteTenant(ctx context.Context, id uint64) error {
 	})
 }
 
+// ReserveStorageQuota is the admission form of AdjustStorageUsed: it takes the
+// same row lock, checks the quota against the locked value, and either records
+// the reservation or reports that the quota is full. The caller must have the
+// exact size it is about to write -- an estimate computed after the check would
+// reintroduce the gap this closes.
+func (r *tenantRepository) ReserveStorageQuota(ctx context.Context, tenantID uint64, delta int64) (bool, error) {
+	reserved := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var tenant types.Tenant
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&tenant, tenantID).Error; err != nil {
+			return err
+		}
+		if delta > 0 && tenant.StorageQuota > 0 && tenant.StorageUsed+delta > tenant.StorageQuota {
+			return nil
+		}
+		tenant.StorageUsed += delta
+		if tenant.StorageUsed < 0 {
+			logger.Errorf(ctx, "tenant storage used is negative %d: %d", tenant.ID, tenant.StorageUsed)
+			tenant.StorageUsed = 0
+		}
+		// Same single-column write as AdjustStorageUsed, for the same reason:
+		// a full-row write would re-encode jsonb configs scanned before them.
+		if err := tx.Model(&types.Tenant{}).Where("id = ?", tenantID).
+			UpdateColumn("storage_used", tenant.StorageUsed).Error; err != nil {
+			return err
+		}
+		reserved = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return reserved, nil
+}
+
 func (r *tenantRepository) AdjustStorageUsed(ctx context.Context, tenantID uint64, delta int64) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var tenant types.Tenant

@@ -141,6 +141,9 @@ type ChunkRepository interface {
 	FindFAQChunkWithDuplicateQuestion(ctx context.Context, tenantID uint64, kbID string, excludeChunkID string, questions []string) (*types.Chunk, error)
 	// ListAllFAQChunksForExport lists all FAQ chunks for export with full metadata, tag_id, is_enabled, and flags
 	ListAllFAQChunksForExport(ctx context.Context, tenantID uint64, knowledgeID string) ([]*types.Chunk, error)
+	// SeqIDsInUse reports which of the given chunk seq ids already exist.
+	// Soft-deleted rows count as in use: the unique index covers them too.
+	SeqIDsInUse(ctx context.Context, ids []int64) (map[int64]bool, error)
 	// UpdateChunkFlagsBatch updates flags for multiple chunks in batch using a single SQL statement.
 	// setFlags: map of chunk ID to flags to set (OR operation)
 	// clearFlags: map of chunk ID to flags to clear (AND NOT operation)

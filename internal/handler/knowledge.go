@@ -307,6 +307,9 @@ func (h *KnowledgeHandler) enqueueKnowledgeListReparse(
 // @Success      200               {object}  handler.DataResponse{data=types.Knowledge}  "创建的知识"
 // @Failure      400               {object}  errors.AppError         "请求参数错误"
 // @Failure      409               {object}  map[string]interface{}  "文件重复"
+// @Failure      413               {object}  errors.AppError         "文件超过 MAX_FILE_SIZE_MB（code 1011）"
+// @Failure      429               {object}  errors.AppError         "上传准入已满（code 1006）或解析任务预算已满（文件已落盘，details 带 knowledge_id）；响应带 Retry-After 秒数，可据此等待后重试"
+// @Failure      503               {object}  errors.AppError         "文件已保存但解析任务入队失败（code 2500），error.details 带 knowledge_id，可直接重新解析"
 // @Security     Bearer
 // @Security     ApiKeyAuth
 // @Router       /knowledge-bases/{id}/knowledge/file [post]
@@ -340,12 +343,24 @@ func (h *KnowledgeHandler) CreateKnowledgeFromFile(c *gin.Context) {
 	// same cap for requests that reach the app without that proxy.
 	limitUploadBody(c, maxSize)
 
+	// Admit before the body is read, not after: ParseMultipartForm spills the
+	// whole request to disk, so a refusal that waited for the parse would have
+	// paid the cost it is meant to avoid. The slot is held for the whole
+	// handler (body read plus knowledge-row creation) and must be released on
+	// every return path, which defer covers.
+	admission, admissionErr := admitUpload(uploadDeclaredBytes(c, maxSize))
+	if admissionErr != nil {
+		c.Error(admissionErr)
+		return
+	}
+	defer admission.release()
+
 	// Get the uploaded file
 	file, err := c.FormFile("file")
 	if err != nil {
 		if isRequestBodyTooLarge(err) {
 			logger.Error(ctx, "File size too large")
-			c.Error(errors.NewBadRequestError(fmt.Sprintf("文件大小不能超过%dMB", maxSizeMB)))
+			c.Error(errors.NewPayloadTooLargeError(fmt.Sprintf("文件大小不能超过%dMB", maxSizeMB)))
 			return
 		}
 		logger.Error(ctx, "File upload failed", err)
@@ -354,7 +369,7 @@ func (h *KnowledgeHandler) CreateKnowledgeFromFile(c *gin.Context) {
 	}
 	if file.Size > maxSize {
 		logger.Error(ctx, "File size too large")
-		c.Error(errors.NewBadRequestError(fmt.Sprintf("文件大小不能超过%dMB", maxSizeMB)))
+		c.Error(errors.NewPayloadTooLargeError(fmt.Sprintf("文件大小不能超过%dMB", maxSizeMB)))
 		return
 	}
 
@@ -432,8 +447,9 @@ func (h *KnowledgeHandler) CreateKnowledgeFromFile(c *gin.Context) {
 		return
 	}
 
-	// Create knowledge entry from the file
-	knowledge, err := h.kgService.CreateKnowledgeFromFile(ctx, kbID, file, metadata, enableMultimodel, customFileName, tagIDs, channel, processOverrides)
+	// Create knowledge entry from the file. The admitted size travels with the
+	// context so the enqueue site charges the parse job the same figure.
+	knowledge, err := h.kgService.CreateKnowledgeFromFile(service.WithDeclaredUploadBytes(ctx, admission.bytes), kbID, file, metadata, enableMultimodel, customFileName, tagIDs, channel, processOverrides)
 	// Check for duplicate knowledge error
 	if err != nil {
 		if h.handleDuplicateKnowledgeError(c, err, knowledge, "file") {

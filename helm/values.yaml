@@ -25,6 +25,47 @@ global:
   # limit). Same knob as MAX_FILE_SIZE_MB in docker-compose.yml.
   maxFileSizeMB: 50
 
+  # -- FAQ batch import entry budget, mirroring WEKNORA_FAQ_IMPORT_MAX_ENTRIES.
+  # The app enforces it and the frontend reads it to fail early, so both pods
+  # get the same value. 0 leaves the server default (1000) in place.
+  faqImportMaxEntries: 0
+
+  # -- FAQ batch import body budget in bytes, mirroring
+  # WEKNORA_FAQ_IMPORT_MAX_JSON_BYTES. 0 leaves the server default (32 MiB,
+  # capped at maxFileSizeMB) in place.
+  faqImportMaxJSONBytes: 0
+
+  # -- Concurrent FAQ imports the app admits, mirroring
+  # WEKNORA_FAQ_IMPORT_MAX_INFLIGHT. 0 leaves the server default (4).
+  # Requests beyond it are refused with 429 rather than queued.
+  faqImportMaxInflight: 0
+
+  # -- Total bytes of in-flight FAQ import bodies, mirroring
+  # WEKNORA_FAQ_IMPORT_MAX_INFLIGHT_BYTES. 0 leaves the server default (96 MiB).
+  # Each request reserves the effective WEKNORA_FAQ_IMPORT_MAX_JSON_BYTES (32 MiB,
+  # capped by maxFileSizeMB), so this must be at least that value or the single
+  # request's own reservation exceeds the budget and nothing is admitted. The
+  # defaults are coupled: four full-size imports need 128 MiB, so 96 MiB admits
+  # three before the fourth gets 429; use faqImportMaxInflight × the JSON byte
+  # cap to actually allow that many.
+  faqImportMaxInflightBytes: 0
+
+  # -- Document upload admission, mirroring the app's UPLOAD_* knobs. 0 leaves
+  # each server default in place: 2 concurrent uploads, 32 MiB for "big",
+  # 128 MiB of in-flight bodies, 512 MiB of queued/running parse work, and 1000
+  # parse jobs. uploadMaxInflightBytes must be at least maxFileSizeMB ×
+  # 1048576 (both are different units: the former is bytes, the latter MB;
+  # the default 50 MB means 52428800 bytes), or an upload at the file-size cap
+  # is refused by admission with 429. Refusals are
+  # 429 with Retry-After (upload slots full, or the
+  # parse-work budget full: the file is already stored and details.knowledge_id
+  # points at the row) or 503/2500 (file stored but no parse job queued).
+  uploadMaxConcurrency: 0
+  uploadBigBytes: 0
+  uploadMaxInflightBytes: 0
+  uploadMaxBackgroundBytes: 0
+  uploadMaxBackgroundJobs: 0
+
   # -- Default security context for all pods
   # Note: Official images (nginx, postgres, redis) run as root by default
   # Enable runAsNonRoot only if using non-root compatible images
