@@ -43,6 +43,17 @@ type Client struct {
 
 通过 `NewClient(baseURL string, options ...ClientOption) *Client` 创建实例。默认的普通请求超时为 30 秒；流式（SSE）请求默认**无超时**，生命周期由 `context` 控制（除非显式调用 `WithTimeout`）。
 
+**文件上传不继承 30 秒默认值。** 上传耗时由「请求体体积」和「有效链路速率」共同决定，与 JSON 那种「几百字节、服务端算得快」的情形完全不同：一个 50 MiB 的文件在 5 Mbps 链路上就要 80 秒以上，用 30 秒的 JSON 上限会把健康的上传掐断。因此 `CreateKnowledgeFromFile` 与 `UploadSandboxSkill` 使用按体积推导的上限：
+
+```
+上限 = 60s + 请求体字节数 / 100 KiB/s      // 50 MiB ≈ 572s；字节数达到 731,136,000（约 697 MiB）即封顶 2 小时
+```
+
+推导值假设该次上传独占链路。如果调用方并发上传，各自只拿到链路的一部分，请用 `WithUploadTimeout` 按实测速率给一个明确的界。
+
+**把上传上限关掉（传 0）时请自己兜底。** 关闭后只有拨号和 TLS 握手有超时，写请求体、读响应头、读响应体都没有上限；服务端不返回时，这次调用会一直占着连接（`CreateKnowledgeFromFile` 的请求体是从文件流式读取的，占用的是文件句柄而不是堆上的第二份副本）。用 `context.WithTimeout` 给调用方 context 一个期限，是这种情况下唯一可靠的界。
+
+
 ### ClientOption 一览
 
 | Option | 说明 |
@@ -50,7 +61,8 @@ type Client struct {
 | `WithAPIKey(key string)` | 设置长期有效的 API Key，以 `X-API-Key` 请求头发送 |
 | `WithBearerToken(token string)` | 设置短期 JWT，以 `Authorization: Bearer <token>` 请求头发送（通常在 `Login` 成功后使用） |
 | `WithToken(token string)` | **Deprecated**：`WithAPIKey` 的 v0.x 兼容别名，将在下个大版本移除 |
-| `WithTimeout(timeout time.Duration)` | 同时设置普通请求与流式请求的超时上限 |
+| `WithTimeout(timeout time.Duration)` | 同时设置普通请求、流式请求与上传的超时上限；传 0 表示这些请求都无上限（上传同样无上限，而不是回落到推导值；流式请求也一并从默认的「无超时」变成由 `context` 独占控制）。注意 `WithUploadTimeout(0)` 无论与 `WithTimeout` 谁先调用都保持"无上限"；只有 `WithUploadTimeout(负值)` 才会把上传的决定权交回给本选项 |
+| `WithUploadTimeout(timeout time.Duration)` | 单独覆盖上传上限，**优先于 `WithTimeout`，且与两者传入的先后顺序无关**；传 0 表示上传无超时。传负值等于撤销这个 option：上传改由 `WithTimeout` 决定；`WithTimeout` 也没设时，上传回落到按体积推导的上限（而不是 30 秒默认值） |
 | `WithTransport(rt http.RoundTripper)` | 替换底层 `http.RoundTripper`（用于重试/埋点/签名等中间件）；传 `nil` 恢复 `http.DefaultTransport` |
 | `WithTenantID(tenantID uint64)` | 在每个请求上附加 `X-Tenant-ID` 请求头，仅用于具备 `CanAccessAllTenants` 权限的跨租户显式访问 |
 
@@ -283,8 +295,9 @@ v0.8.2 起的两处请求字段变化：
 | `UpdateFAQEntryTagBatch` | 批量更新标签 |
 | `DeleteFAQEntries` | 批量删除 |
 | `SearchFAQEntries` | 检索 FAQ |
-| `ExportFAQEntries` | 导出为 CSV（返回 `[]byte`） |
-| `GetFAQImportProgress` | 查询异步导入任务进度（含 dry run） |
+| `ExportFAQEntries` | 导出为 CSV（返回 `[]byte`）；非 2xx 现在返回 `*APIError`（`Retry-After` 在 `APIError.RetryAfter`），不再把错误体当数据 |
+| `ExportFAQEntriesJSON` | 导出为与 `FAQEntryPayload` 兼容的 JSON 数组（服务端 `?format=json`），可直接回灌导入 |
+| `GetFAQImportProgress` | 查询异步导入任务进度（含 dry run）；`FAQImportProgress` 带 `PartialFailedCount`、`ValidEntryIndices`、`MergeEntryIndices`、`NextEntryIndex`、`MergedCount`、`AddedCount`、`MergeDetails`，`FAQFailedEntry` 带 `FailureType`、`IsPartialFailure` 与被移除问题的明细 |
 | `UpdateLastFAQImportResultDisplayStatus` | 更新最近导入结果的展示状态 |
 
 ### 标签 Tag — `client/tag.go`
@@ -438,7 +451,7 @@ if errors.As(err, &apiErr) {
 }
 ```
 
-`Code` 为响应体 `{"code":N}` 中的结构化错误码，包内提供常量 `ServerErrBadRequest`(1000) 至 `ServerErrValidation`(1010)。`Error()` 保持 `"HTTP error <status>: <body>"` 的旧格式以兼容字符串匹配的消费者。
+`Code` 为响应体中的结构化错误码；解析器同时接受旧的顶层 `{"code":N}` 与本服务端的 `{"success":false,"error":{"code":N,...}}`。包内提供常量 `ServerErrBadRequest`(1000) 至 `ServerErrValidation`(1010)，以及 `ServerErrKnowledgeEnqueueFailed`(2500；上传已存但解析任务未入队，`details` 带 `knowledge_id`/`title`/`parse_status`)。`APIError.RetryAfter` 为 `Retry-After` 头解析出的等待秒数（只解析整数秒），429/503 时用它决定何时重试。`Error()` 保持 `"HTTP error <status>: <body>"` 的旧格式以兼容字符串匹配的消费者。
 
 ### 流层：`SSEStreamError`（`client/stream_errors.go`）
 

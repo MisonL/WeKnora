@@ -5,14 +5,12 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -100,6 +98,12 @@ type KnowledgeProcessOverrides struct {
 }
 
 // CreateKnowledgeFromFile creates a knowledge entry from a local file path
+//
+// The file is streamed while the request is sent rather than being read into
+// memory first, so the cost to the caller is the file on disk, not a second
+// copy on the heap. The request still carries an exact Content-Length, which is
+// what the server sizes its upload admission on.
+//
 // Parameters:
 //   - knowledgeBaseID: The ID of the knowledge base
 //   - filePath: The local file path
@@ -112,92 +116,66 @@ func (c *Client) CreateKnowledgeFromFile(ctx context.Context,
 	knowledgeBaseID string, filePath string, metadata map[string]string, enableMultimodel *bool, customFileName string, channel string,
 	processConfig *KnowledgeProcessOverrides,
 ) (*Knowledge, error) {
-	// Open the local file
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %w", err)
-	}
-	defer file.Close()
-
-	// Get file information
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get file information: %w", err)
-	}
-
-	// Create a multipart form writer
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile("file", fileInfo.Name())
-	if err != nil {
-		return nil, fmt.Errorf("failed to create form file: %w", err)
-	}
-
-	// Copy file contents
-	_, err = io.Copy(part, file)
-	if err != nil {
-		return nil, fmt.Errorf("failed to copy file content: %w", err)
-	}
-
-	// Add enable_multimodel field
+	// Assemble the form's fields in the order they are sent. Every one of them
+	// contributes bytes to the declared length, so nothing may be added to the
+	// request that is missing here.
+	var fields [][2]string
 	if enableMultimodel != nil {
-		if err := writer.WriteField("enable_multimodel", strconv.FormatBool(*enableMultimodel)); err != nil {
-			return nil, fmt.Errorf("failed to write enable_multimodel field: %w", err)
-		}
+		fields = append(fields, [2]string{"enable_multimodel", strconv.FormatBool(*enableMultimodel)})
 	}
-
-	// Add metadata to the request if provided
 	if metadata != nil {
 		metadataBytes, err := json.Marshal(metadata)
 		if err != nil {
 			return nil, fmt.Errorf("failed to serialize metadata: %w", err)
 		}
-		if err := writer.WriteField("metadata", string(metadataBytes)); err != nil {
-			return nil, fmt.Errorf("failed to write metadata field: %w", err)
-		}
+		fields = append(fields, [2]string{"metadata", string(metadataBytes)})
 	}
-
-	// Add custom file name if provided
 	if customFileName != "" {
-		if err := writer.WriteField("fileName", customFileName); err != nil {
-			return nil, fmt.Errorf("failed to write fileName field: %w", err)
-		}
+		fields = append(fields, [2]string{"fileName", customFileName})
 	}
-
 	if channel != "" {
-		if err := writer.WriteField("channel", channel); err != nil {
-			return nil, fmt.Errorf("failed to write channel field: %w", err)
-		}
+		fields = append(fields, [2]string{"channel", channel})
 	}
-
 	if processConfig != nil {
 		processConfigBytes, err := json.Marshal(processConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to serialize process_config: %w", err)
 		}
-		if err := writer.WriteField("process_config", string(processConfigBytes)); err != nil {
-			return nil, fmt.Errorf("failed to write process_config field: %w", err)
-		}
+		fields = append(fields, [2]string{"process_config", string(processConfigBytes)})
 	}
 
-	// Close the multipart writer
-	err = writer.Close()
+	// The body streams the file while the request is sent instead of buffering
+	// it in memory first, so uploading a document costs the size of the file
+	// on disk rather than a second copy on the heap. Its length is measured in
+	// a framing pre-pass, which keeps Content-Length exact -- the server sizes
+	// its upload admission from that header.
+	body, err := newFileUploadBody(filePath, "file", "", fields)
 	if err != nil {
-		return nil, fmt.Errorf("failed to close writer: %w", err)
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+	stream, err := body.open()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
 
-	// Construct the request with its completed buffer so net/http can replay it
-	// after an authentication refresh or a redirect.
 	path := fmt.Sprintf("/api/v1/knowledge-bases/%s/knowledge/file", knowledgeBaseID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, stream)
 	if err != nil {
+		_ = stream.Close()
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	// NewRequestWithContext cannot infer these from a generic stream: without
+	// ContentLength the body would go out chunked, and without GetBody the
+	// CLI's 401 retry would decline to replay the request.
+	req.ContentLength = body.size
+	req.GetBody = func() (io.ReadCloser, error) { return body.open() }
+	req.Header.Set("Content-Type", body.contentType())
 	c.applyAuthHeaders(ctx, req)
 
-	// Send the request
-	resp, err := c.httpClient.Do(req)
+	// Send the request under the upload ceiling rather than the ordinary
+	// request timeout: the body is transferred at the link's rate, and the
+	// 30-second JSON ceiling aborts healthy uploads of large files.
+	resp, err := c.doUpload(req, body.size)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
@@ -543,7 +521,7 @@ func (c *Client) OpenKnowledgeFile(ctx context.Context, knowledgeID string) (str
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body := readErrorBody(resp.Body)
 		_ = resp.Body.Close()
-		return "", nil, newAPIError(resp.StatusCode, body)
+		return "", nil, newAPIErrorFromResponse(resp, body)
 	}
 	filename := filenameFromContentDisposition(resp.Header.Get("Content-Disposition"))
 	return filename, resp.Body, nil
@@ -580,7 +558,7 @@ func (c *Client) OpenKnowledgeFilesArchive(ctx context.Context, knowledgeBaseID 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body := readErrorBody(resp.Body)
 		_ = resp.Body.Close()
-		return "", nil, newAPIError(resp.StatusCode, body)
+		return "", nil, newAPIErrorFromResponse(resp, body)
 	}
 	filename := filenameFromContentDisposition(resp.Header.Get("Content-Disposition"))
 	return filename, resp.Body, nil

@@ -1,10 +1,9 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"mime/multipart"
+	"io"
 	"net/http"
 	"net/url"
 )
@@ -86,28 +85,31 @@ func (c *Client) UploadSandboxSkill(
 	if filename == "" {
 		filename = "skill.zip"
 	}
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("file", filename)
+	// Frame the archive the same way a document upload is framed, so both
+	// multipart call sites send an exact Content-Length over a streamed body.
+	body, err := newBytesUploadBody(archive, "file", filename, nil)
 	if err != nil {
-		return "", fmt.Errorf("create skill upload part: %w", err)
+		return "", fmt.Errorf("frame skill upload: %w", err)
 	}
-	if _, err := part.Write(archive); err != nil {
-		return "", fmt.Errorf("write skill upload part: %w", err)
-	}
-	if err := writer.Close(); err != nil {
-		return "", fmt.Errorf("close skill upload form: %w", err)
+	stream, err := body.open()
+	if err != nil {
+		return "", fmt.Errorf("open skill upload body: %w", err)
 	}
 
 	path := "/api/v1/sandbox-configs/" + url.PathEscape(configID) + "/skills"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body.Bytes()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, stream)
 	if err != nil {
+		_ = stream.Close()
 		return "", err
 	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.ContentLength = body.size
+	req.GetBody = func() (io.ReadCloser, error) { return body.open() }
+	req.Header.Set("Content-Type", body.contentType())
 	c.applyAuthHeaders(ctx, req)
 
-	resp, err := c.httpClient.Do(req)
+	// Skill bundles are archives, so they hit the same transfer-rate problem
+	// as file uploads: send them under the upload ceiling.
+	resp, err := c.doUpload(req, body.size)
 	if err != nil {
 		return "", err
 	}

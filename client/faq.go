@@ -360,14 +360,34 @@ func (c *Client) SearchFAQEntries(ctx context.Context,
 // 机器人回答(必填-多个用##分隔), 是否全部回复(选填-默认FALSE), 是否停用(选填-默认FALSE),
 // 是否禁止被推荐(选填-默认False 可被推荐)
 func (c *Client) ExportFAQEntries(ctx context.Context, knowledgeBaseID string) ([]byte, error) {
+	return c.exportFAQEntries(ctx, knowledgeBaseID, "")
+}
+
+// ExportFAQEntriesJSON exports the same entries as a JSON array in the import
+// payload's entry shape, so a snapshot can be edited and re-imported without
+// converting a spreadsheet back.
+func (c *Client) ExportFAQEntriesJSON(ctx context.Context, knowledgeBaseID string) ([]byte, error) {
+	return c.exportFAQEntries(ctx, knowledgeBaseID, "json")
+}
+
+func (c *Client) exportFAQEntries(ctx context.Context, knowledgeBaseID, format string) ([]byte, error) {
 	path := fmt.Sprintf("/api/v1/knowledge-bases/%s/faq/entries/export", knowledgeBaseID)
-	resp, err := c.doRequest(ctx, http.MethodGet, path, nil, nil)
+	var query url.Values
+	if format != "" {
+		query = url.Values{"format": {format}}
+	}
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil, query)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	// Read the raw CSV data from response body
+	// The body of a refused export is the server's JSON error, not entries. A
+	// caller that saved it would later import the error as CSV/JSON content.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, newAPIErrorFromResponse(resp, readErrorBody(resp.Body))
+	}
+
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read export response: %w", err)
@@ -377,16 +397,37 @@ func (c *Client) ExportFAQEntries(ctx context.Context, knowledgeBaseID string) (
 }
 
 // FAQFailedEntry represents a failed entry during FAQ import/validation.
+//
+// A partial failure (IsPartialFailure) is not a failed import: the entry lands
+// with the questions named in RemovedSimilarQuestions/RemovedNegativeQuestions
+// stripped. The two are reported in the same list because both are rows the
+// caller has to look at, so a reader that only counts entries must check
+// IsPartialFailure to tell them apart -- or read PartialFailedCount, which
+// stays correct even after the list has been moved into a CSV.
 type FAQFailedEntry struct {
-	Index             int      `json:"index"`
-	Reason            string   `json:"reason"`
-	TagName           string   `json:"tag_name,omitempty"`
-	StandardQuestion  string   `json:"standard_question"`
-	SimilarQuestions  []string `json:"similar_questions,omitempty"`
-	NegativeQuestions []string `json:"negative_questions,omitempty"`
-	Answers           []string `json:"answers,omitempty"`
-	AnswerAll         bool     `json:"answer_all,omitempty"`
-	IsDisabled        bool     `json:"is_disabled,omitempty"`
+	Index                    int      `json:"index"`
+	Reason                   string   `json:"reason"`
+	FailureType              string   `json:"failure_type,omitempty"`       // pre_validation / post_validation
+	IsPartialFailure         bool     `json:"is_partial_failure,omitempty"` // Imported, but with questions removed
+	TagName                  string   `json:"tag_name,omitempty"`
+	StandardQuestion         string   `json:"standard_question"`
+	SimilarQuestions         []string `json:"similar_questions,omitempty"`
+	NegativeQuestions        []string `json:"negative_questions,omitempty"`
+	Answers                  []string `json:"answers,omitempty"`
+	AnswerAll                bool     `json:"answer_all,omitempty"`
+	IsDisabled               bool     `json:"is_disabled,omitempty"`
+	RemovedSimilarQuestions  []string `json:"removed_similar_questions,omitempty"`
+	RemovedNegativeQuestions []string `json:"removed_negative_questions,omitempty"`
+}
+
+// FAQMergeDetail summarises an append-mode entry that merged into an existing
+// chunk instead of creating a new one.
+type FAQMergeDetail struct {
+	Index            int    `json:"index"`
+	StandardQuestion string `json:"standard_question"`
+	AnswerChanged    bool   `json:"answer_changed"`
+	NewSimilarCount  int    `json:"new_similar_count"`
+	NewNegativeCount int    `json:"new_negative_count"`
 }
 
 // FAQSuccessEntry represents a successfully imported FAQ entry.
@@ -400,25 +441,54 @@ type FAQSuccessEntry struct {
 
 // FAQImportProgress represents the progress of an async FAQ import task.
 // When Status is "completed", the result fields (SkippedCount, ImportMode, ImportedAt, DisplayStatus, ProcessingTime) are populated.
+//
+// PartialFailedCount is not optional in practice even though its JSON tag is:
+// SuccessCount counts only entries that landed intact, and a partially failed
+// entry is in neither it nor FailedCount, so failed_count alone under-reports
+// what went wrong. (The server derives SkippedCount as the remainder and floors
+// it at 0, so the four counts add up to Total only when nothing else is
+// inconsistent -- do not use the identity to recover a missing count.) The
+// server also moves the inline FailedEntries list into a CSV (and
+// FailedEntriesURL) as soon as there is one, leaving PartialFailedCount as the
+// only reliable count after the fact.
+//
+// Several fields carry omitempty, so a zero value is simply absent from the
+// JSON. Absence means zero here, never "this server is too old to have the
+// field".
 type FAQImportProgress struct {
-	TaskID           string            `json:"task_id"`
-	KBID             string            `json:"kb_id"`
-	KnowledgeID      string            `json:"knowledge_id"`
-	Status           string            `json:"status"`
-	Progress         int               `json:"progress"`
-	Total            int               `json:"total"`
-	Processed        int               `json:"processed"`
-	SuccessCount     int               `json:"success_count"`
-	FailedCount      int               `json:"failed_count"`
-	SkippedCount     int               `json:"skipped_count,omitempty"`
-	FailedEntries    []FAQFailedEntry  `json:"failed_entries,omitempty"`
-	SuccessEntries   []FAQSuccessEntry `json:"success_entries,omitempty"`    // Successfully imported entries (when count is small)
-	FailedEntriesURL string            `json:"failed_entries_url,omitempty"` // Object-storage path of the failed-entries CSV; download via the authenticated /files proxy
-	Message          string            `json:"message"`
-	Error            string            `json:"error,omitempty"`
-	CreatedAt        int64             `json:"created_at"`
-	UpdatedAt        int64             `json:"updated_at"`
-	DryRun           bool              `json:"dry_run,omitempty"` // Whether this is a dry run validation
+	TaskID             string            `json:"task_id"`
+	KBID               string            `json:"kb_id"`
+	KnowledgeID        string            `json:"knowledge_id"`
+	Status             string            `json:"status"`
+	Progress           int               `json:"progress"`
+	Total              int               `json:"total"`
+	Processed          int               `json:"processed"`
+	SuccessCount       int               `json:"success_count"`
+	FailedCount        int               `json:"failed_count"`
+	PartialFailedCount int               `json:"partial_failed_count,omitempty"` // Imported, but with conflicting similar/negative questions removed
+	SkippedCount       int               `json:"skipped_count,omitempty"`
+	FailedEntries      []FAQFailedEntry  `json:"failed_entries,omitempty"`
+	SuccessEntries     []FAQSuccessEntry `json:"success_entries,omitempty"`    // Successfully imported entries (when count is small)
+	FailedEntriesURL   string            `json:"failed_entries_url,omitempty"` // Object-storage path of the failed-entries CSV; download via the authenticated /files proxy
+	// ValidEntryIndices is the set of entries that passed validation. A retry
+	// reuses it instead of validating again, which is why it is part of the
+	// record rather than an implementation detail.
+	ValidEntryIndices []int `json:"valid_entry_indices,omitempty"`
+	// MergeEntryIndices is the subset of ValidEntryIndices that merge into an
+	// existing chunk in append mode. Internal: read it only to explain a retry.
+	MergeEntryIndices []int `json:"merge_entry_indices,omitempty"`
+	// NextEntryIndex is the retry cursor into the validated entries. It is not
+	// Processed: skip and merge bookkeeping pollutes Processed, so it cannot be
+	// used as a slice offset.
+	NextEntryIndex int              `json:"next_entry_index,omitempty"`
+	MergedCount    int              `json:"merged_count,omitempty"`
+	AddedCount     int              `json:"added_count,omitempty"`
+	MergeDetails   []FAQMergeDetail `json:"merge_details,omitempty"`
+	Message        string           `json:"message"`
+	Error          string           `json:"error,omitempty"`
+	CreatedAt      int64            `json:"created_at"`
+	UpdatedAt      int64            `json:"updated_at"`
+	DryRun         bool             `json:"dry_run,omitempty"` // Whether this is a dry run validation
 
 	// Result fields (populated when Status == "completed")
 	ImportMode     string    `json:"import_mode,omitempty"`
