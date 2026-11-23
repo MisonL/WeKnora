@@ -68,6 +68,18 @@ CLI history before v0.3 is recorded in the project root
   client-side `--limit` truncation).
 
 ### Changed
+- `faq export` snapshots carry tag identity by `tag_name` only -- the `tag_id`
+  (seq_id) field is no longer written. The server resolves an import's tag by
+  `tag_id` first whenever that id exists in the target knowledge base, so a
+  snapshot carried to another tenant/KB could have its entries filed under a
+  same-numbered but different tag; names resolve back to the right tag
+  in-round-trip and cannot collide across tenants.
+- `faq export` (and the pre-import snapshot of `faq import`) now reads the
+  whole list at least twice and only writes what two consecutive full reads
+  agreed on, resampling up to 3 passes. Offset paging can mix two states into
+  one snapshot even when the total never moves (a delete in the read prefix
+  plus an insert in the unread tail); a knowledge base that never settles is
+  refused with `operation.failed` (exit 1) instead of exported.
 - JSON, text, and MCP now share one event projector and filtering policy.
 - Projected references contain lookup indexes only; fetch full
   passages with `chunk view <chunk_id>` or `chunk view <parent_chunk_id>`.

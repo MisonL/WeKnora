@@ -1,10 +1,12 @@
 package faq
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 
 	sdk "github.com/Tencent/WeKnora/client"
 	"github.com/spf13/cobra"
@@ -23,6 +25,15 @@ type FAQService interface {
 // exportPageSize is the server's page size for FAQ entries. The list endpoint
 // returns at most this many rows per call.
 const exportPageSize = 20
+
+// maxExportPasses caps how many full collections the export may run looking for
+// two consecutive identical ones. The list is offset-paginated, so any
+// concurrent modification can shift rows across page boundaries and mix two
+// states into one snapshot; two identical full passes are the strongest signal
+// the endpoint offers that the knowledge base was idle throughout. A knowledge
+// base that has not settled after this many reads is refused rather than
+// handed back as a snapshot of nothing in particular.
+const maxExportPasses = 3
 
 type exportOptions struct {
 	KB string
@@ -44,10 +55,17 @@ payload's entry shape (standard_question / similar_questions / answers / ...).
 The output is a snapshot for backup or for feeding back to 'faq import'. It
 carries no import state. Entry ids are written as the optional import "id"
 field, so a snapshot can be re-imported where an id is still free; the server
-drops any id that is already taken rather than failing the import.
+drops any id that is already taken rather than failing the import. Tags travel
+by tag_name only: the server resolves an import's tag by tag_id first when
+that id still exists in the target knowledge base, so a carried-over tag id
+could collide with a different tag after a migration; names resolve back to
+the right tag in a same-tenant round trip and cannot collide across tenants.
 
-The list endpoint pages 20 rows at a time, so a large knowledge base takes one
-request per twenty entries.`,
+The list endpoint pages 20 rows at a time and offset paging is not stable
+under concurrent modification, so the export reads the whole list at least
+twice and only writes a snapshot two consecutive reads agreed on. A knowledge
+base that keeps changing under the read is refused (exit 1) rather than
+exported as a mixed snapshot.`,
 		Example: `  weknora faq export --kb kb_abc --out faq-backup.json
   weknora faq export --kb kb_abc | jq length`,
 		Args: cobra.NoArgs,
@@ -98,7 +116,9 @@ func runExport(ctx context.Context, opts *exportOptions, svc FAQService) error {
 	return nil
 }
 
-// exportEntries pages through the list endpoint until it has every row.
+// exportEntries collects the knowledge base's FAQ entries as a snapshot,
+// reading the list at least twice and only accepting content two consecutive
+// full reads agree on.
 //
 // The listing is offset-paginated in (updated_at, id) order, so a knowledge
 // base that changes while it is being read can shift rows across page
@@ -106,14 +126,44 @@ func runExport(ctx context.Context, opts *exportOptions, svc FAQService) error {
 // read yet into the page before it, and the export silently misses it while
 // keeping the row that was deleted. Deduplicating ids and comparing the final
 // count against the final total cannot detect that -- the two numbers agree.
+// The worst case is balanced: delete one row from the already-read prefix and
+// insert one into the unread tail and even the total stays put, while the
+// pages were slices of two different states.
 //
-// So the total from the first page is the reference: any later page reporting a
-// different total means the knowledge base changed under the read, and the
-// export fails rather than hand back a snapshot that is not the state it says
-// it is. The caller retries while the knowledge base is idle. A snapshot missing
-// rows is worse than no snapshot: fed to `faq import --mode replace` it deletes
-// the entries it does not list.
+// A single consistent read is therefore impossible to obtain from the endpoint
+// as it stands, and the strongest available signal is repetition: collect
+// everything (exportPass), then re-collect in the same order and compare entry
+// by entry on normalised JSON. Two identical consecutive passes mean the
+// knowledge base did not move while either was read; content is only handed
+// back then. If two passes disagree the list was being modified under the
+// read and the export re-collects, up to maxExportPasses reads in total; a
+// knowledge base that never settles is refused -- a snapshot mixing two
+// states, fed to `faq import --mode replace`, deletes the entries it does not
+// list, so a wrong snapshot is worse than no snapshot. Within each pass the
+// total from page 1 is still the reference, so a pass whose own pages report
+// different totals is refused immediately; the two-pass comparison is built
+// on top of that guard, not instead of it. The caller retries while the
+// knowledge base is idle.
 func exportEntries(ctx context.Context, svc FAQService, kbID string) ([]sdk.FAQEntryPayload, error) {
+	var previous []sdk.FAQEntryPayload
+	for pass := 1; pass <= maxExportPasses; pass++ {
+		current, err := exportPass(ctx, svc, kbID, pass)
+		if err != nil {
+			return nil, err
+		}
+		if previous != nil && snapshotsEqual(previous, current) {
+			return current, nil
+		}
+		previous = current
+	}
+	return nil, cmdutil.NewError(cmdutil.CodeOperationFailed, fmt.Sprintf(
+		"export aborted after %d full reads: the knowledge base changed while it was being read (no two reads returned the same entries); retry while it is idle",
+		maxExportPasses))
+}
+
+// exportPass pages through the list endpoint once, until it has every row.
+// passNum only identifies the pass inside error messages.
+func exportPass(ctx context.Context, svc FAQService, kbID string, passNum int) ([]sdk.FAQEntryPayload, error) {
 	out := make([]sdk.FAQEntryPayload, 0, exportPageSize)
 	seen := make(map[int64]struct{})
 	var total int64
@@ -139,8 +189,8 @@ func exportEntries(ctx context.Context, svc FAQService, kbID string) ([]sdk.FAQE
 			// The total moved: rows were added or removed under the read, so
 			// the pages are not slices of one consistent snapshot.
 			return nil, fail(
-				"export aborted at page %d: the knowledge base changed while it was being read (%d entries became %d); retry while it is idle",
-				page, total, res.Total)
+				"export aborted at pass %d page %d: the knowledge base changed while it was being read (%d entries became %d); retry while it is idle",
+				passNum, page, total, res.Total)
 		}
 		rows := res.Entries
 		if len(rows) == 0 {
@@ -164,6 +214,111 @@ func exportEntries(ctx context.Context, svc FAQService, kbID string) ([]sdk.FAQE
 		if len(rows) < exportPageSize {
 			return finish()
 		}
+	}
+}
+
+// snapshotsEqual compares two full collections entry by entry on normalised
+// JSON. The comparison is per entry rather than of the concatenated bytes:
+// an irrelevant difference in JSON key order between responses must not look
+// like the knowledge base changed, while any real content difference -- and
+// any reordering, since both passes page through the same (updated_at, id)
+// order -- must.
+func snapshotsEqual(a, b []sdk.FAQEntryPayload) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		rawA, errA := json.Marshal(a[i])
+		rawB, errB := json.Marshal(b[i])
+		if errA != nil || errB != nil {
+			return false
+		}
+		equal, err := canonicalJSONEqual(rawA, rawB)
+		if err != nil || !equal {
+			return false
+		}
+	}
+	return true
+}
+
+// canonicalJSONEqual reports whether two JSON values are equal ignoring
+// object key order. A payload that cannot be canonicalised is reported as an
+// error, which snapshotsEqual treats as a mismatch (fail closed: an export
+// that cannot prove two passes agree does not hand back a snapshot).
+func canonicalJSONEqual(a, b json.RawMessage) (bool, error) {
+	ca, err := canonicalJSON(a)
+	if err != nil {
+		return false, err
+	}
+	cb, err := canonicalJSON(b)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(ca, cb), nil
+}
+
+// canonicalJSON re-encodes a JSON value with every object's keys sorted, so
+// two payloads that differ only in key order produce identical bytes.
+// Numbers keep their original text (UseNumber), so no value is altered by the
+// round trip.
+func canonicalJSON(raw []byte) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var decoded any
+	if err := dec.Decode(&decoded); err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := writeCanonical(&buf, decoded); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func writeCanonical(buf *bytes.Buffer, v any) error {
+	switch t := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		buf.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			keyBytes, err := json.Marshal(k)
+			if err != nil {
+				return err
+			}
+			buf.Write(keyBytes)
+			buf.WriteByte(':')
+			if err := writeCanonical(buf, t[k]); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte('}')
+		return nil
+	case []any:
+		buf.WriteByte('[')
+		for i, item := range t {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := writeCanonical(buf, item); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte(']')
+		return nil
+	default:
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		buf.Write(encoded)
+		return nil
 	}
 }
 
@@ -192,9 +347,15 @@ func payloadFromEntry(e sdk.FAQEntry) sdk.FAQEntryPayload {
 		strategy := e.AnswerStrategy
 		p.AnswerStrategy = &strategy
 	}
-	if e.TagID != 0 {
-		p.TagID = e.TagID
-	}
+	// Deliberately no tag_id: the server resolves an import's tag by seq_id
+	// FIRST when that id exists and belongs to the target KB, using tag_name
+	// only as a fallback (internal/application/service/knowledge_faq.go
+	// resolveTagID). A carried-over tag_id is therefore unsafe across a
+	// tenant/KB migration -- the source seq_id can collide with a
+	// same-numbered but different tag in the destination and file the entry
+	// under the wrong classification. Tag identity travels by name, not by
+	// id: the same-tenant round trip resolves the name back to the original
+	// id, and a migration cannot be hijacked by an id collision.
 	if e.TagName != "" {
 		p.TagName = e.TagName
 	}
