@@ -28,12 +28,12 @@ export function fixture(
     requestAnimationFrame: (callback: () => void) => setTimeout(callback, 16),
     document: { documentElement: { clientHeight: 900 }, querySelector: () => null },
   }
-  function evaluate(source: string, dependencies: Record<string, unknown>, fallback?: (name: string) => unknown) {
+  function evaluate(source: string, dependencies: Record<string, unknown>, fallback?: (name: string) => unknown, extraGlobals: Record<string, unknown> = {}) {
     const exports: any = {}
     runInNewContext(ts.transpileModule(source, {
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
     }).outputText, {
-      exports, console, ...globals,
+      exports, console, ...globals, ...extraGlobals,
       require(name: string) {
         if (name in dependencies) return dependencies[name]
         if (fallback) return fallback(name)
@@ -57,7 +57,10 @@ export function fixture(
     t.after(close)
     return { vm, close }
   }
-  function component(file: URL, dependencies: Record<string, unknown>, props = {}) {
+  function component(file: URL, dependencies: Record<string, unknown>, props = {}, vmOverrides: Record<string, unknown> = {}) {
+    // The component's own context may need more than the fixture's globals
+    // (e.g. a URL stub for blob downloads); vmOverrides only replaces the
+    // minimal document here, not the shared assistantDataChange evaluation.
     const { descriptor } = parse(readFileSync(file, 'utf8'), { filename: file.pathname })
     const script = compileScript(descriptor, { id: 'assistant-refresh-test' }).content
       .replace('__expose();', '')
@@ -69,7 +72,7 @@ export function fixture(
       if (name.endsWith('.vue')) return { default: {} }
       if (name.startsWith('.')) return require(name)
       assert.fail(`Unexpected component dependency: ${name}`)
-    })
+    }, vmOverrides)
     return mount(compiled.default, props)
   }
   return { window, evaluate, mount, component, dataChange, emit: dataChange.emitAssistantDataChange }

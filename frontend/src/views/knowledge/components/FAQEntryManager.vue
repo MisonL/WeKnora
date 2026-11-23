@@ -921,6 +921,7 @@ interface FAQEntry {
   similar_questions: string[]
   negative_questions: string[]
   answers: string[]
+  answer_strategy?: 'all' | 'random'
   updated_at: string
   showMore?: boolean
   score?: number
@@ -933,6 +934,9 @@ interface FAQEntry {
 }
 
 interface FAQEntryPayload {
+  // Present on rows that came from a JSON export: the server maps it back to
+  // the entry's seq id on re-import (and rejects it if it is not this KB's).
+  id?: number
   standard_question: string
   similar_questions: string[]
   negative_questions: string[]
@@ -1183,6 +1187,7 @@ const editorForm = reactive<FAQEntryPayload>({
   similar_questions: [],
   negative_questions: [],
   answers: [],
+  answer_strategy: 'all',
   tag_id: undefined,
 })
 const editorFormRef = ref<FormInstanceFunctions>()
@@ -1660,6 +1665,7 @@ const resetEditorForm = () => {
   editorForm.similar_questions = []
   editorForm.negative_questions = []
   editorForm.answers = []
+  editorForm.answer_strategy = 'all'
   editorForm.tag_id = undefined
   answerInput.value = ''
   similarInput.value = ''
@@ -1674,6 +1680,9 @@ const openEditor = (entry?: FAQEntry) => {
     editorForm.similar_questions = [...(entry.similar_questions || [])]
     editorForm.negative_questions = [...(entry.negative_questions || [])]
     editorForm.answers = [...(entry.answers || [])]
+    // Legacy rows may come back without the field; treat that as the
+    // server default so a save never has to guess.
+    editorForm.answer_strategy = entry.answer_strategy || 'all'
     editorForm.tag_id = entry.tag_id || undefined
   } else {
     editorMode.value = 'create'
@@ -1749,6 +1758,9 @@ const handleSubmitEntry = async () => {
       similar_questions: [...editorForm.similar_questions],
       negative_questions: [...editorForm.negative_questions],
       answers: [...editorForm.answers],
+      // Always sent: the server reads an omitted strategy as "all", so a
+      // payload without it would reset a "random" entry on every save.
+      answer_strategy: editorForm.answer_strategy || 'all',
       tag_id: editorForm.tag_id || undefined,
     }
     if (editorMode.value === 'create') {
@@ -2251,6 +2263,9 @@ const splitByDelimiter = (value?: string) => {
 }
 
 const normalizePayload = (payload: Partial<FAQEntryPayload>): FAQEntryPayload => ({
+  // Carried through so an export → edit → re-import round trip can rewrite
+  // the same entry; a brand-new row never has one and must not gain an id.
+  ...(payload.id !== undefined ? { id: payload.id } : {}),
   standard_question: payload.standard_question || '',
   answers: payload.answers?.filter(Boolean) || [],
   similar_questions: payload.similar_questions?.filter(Boolean) || [],
@@ -2851,7 +2866,8 @@ const downloadExportBlob = (blob: Blob, ext: 'csv' | 'json') => {
   document.body.appendChild(link)
   link.click()
   document.body.removeChild(link)
-  URL.revokeObjectURL(url)
+  // Revoke after the click has been processed so the download actually starts.
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 const handleExportFAQ = async (format: 'csv' | 'json') => {
   if (!props.kbId) {
