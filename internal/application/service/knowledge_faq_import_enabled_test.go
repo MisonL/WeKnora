@@ -40,7 +40,8 @@ func TestFAQImportPreservesEnabledStateInStorageAndIndex(t *testing.T) {
 			}
 			progress := &types.FAQImportProgress{TaskID: "enabled-import", KBID: f.kb.ID}
 			require.NoError(t, f.svc.executeFAQImport(f.ctx, progress.TaskID, f.kb.ID,
-				&types.FAQBatchUpsertPayload{Mode: mode, Entries: entries}, f.kb.TenantID, 0, progress))
+				&types.FAQBatchUpsertPayload{Mode: mode, Entries: entries}, f.kb.TenantID, 0, 0,
+				progress))
 			var saved []types.Chunk
 			require.NoError(t, f.db.Where("knowledge_id = ?", "faq").Order("seq_id").Find(&saved).Error)
 			require.Len(t, saved, 3)

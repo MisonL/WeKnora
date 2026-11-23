@@ -70,9 +70,9 @@ func TestRealRedisLeaseScriptsKeepOwnership(t *testing.T) {
 	ttl := svc.redisClient.TTL(ctx, getFAQImportRunningKey(kbID)).Val()
 	require.True(t, ttl > faqImportLeaseTTL/2 && ttl <= faqImportLeaseTTL, "unexpected lease TTL %v", ttl)
 
-	require.NoError(t, svc.renewFAQImportLease(ctx, kbID, "task-a", "inst-a"))
-	require.ErrorIs(t, svc.renewFAQImportLease(ctx, kbID, "task-a", "inst-b"), errFAQImportLeaseTaken)
-	require.ErrorIs(t, svc.renewFAQImportLease(ctx, kbID, "task-b", "inst-a"), errFAQImportLeaseTaken)
+	require.NoError(t, svc.renewFAQImportLease(ctx, kbID, "task-a", "inst-a", 0))
+	require.ErrorIs(t, svc.renewFAQImportLease(ctx, kbID, "task-a", "inst-b", 0), errFAQImportLeaseTaken)
+	require.ErrorIs(t, svc.renewFAQImportLease(ctx, kbID, "task-b", "inst-a", 0), errFAQImportLeaseTaken)
 
 	// A clear from the wrong instance leaves the marker in place.
 	require.NoError(t, svc.clearRunningFAQImportInfoIfMatches(ctx, kbID, "task-a", "inst-b", info.EnqueuedAt))

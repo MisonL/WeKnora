@@ -825,6 +825,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(router.NewRouter))
 	if redisAvailable {
 		must(container.Invoke(router.RunAsynqServer))
+		must(container.Invoke(wireUploadWorkQueueProbe))
 	} else {
 		must(container.Invoke(router.RegisterSyncHandlers))
 	}
@@ -2393,4 +2394,25 @@ func envIntValue(name string) int {
 		return 0
 	}
 	return v
+}
+
+// wireUploadWorkQueueProbe teaches the upload-work handoff sweep to tell a job
+// that left this deployment's queue from one that is merely backlogged behind
+// busy workers. Without it the sweep reclaims a reservation at the handoff
+// deadline alone, which frees budget exactly when the host is too busy to
+// pick jobs up -- the opposite of what the budget is for. Lite mode never
+// wires this: inline executors do not queue, and the sweep stays
+// timestamp-only.
+func wireUploadWorkQueueProbe(inspector interfaces.TaskInspector) {
+	service.SetUploadWorkQueueProbe(func(ctx context.Context) (map[string]bool, error) {
+		ids, err := inspector.QueuedKnowledgeIDs(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string]bool, len(ids))
+		for id := range ids {
+			out[id] = true
+		}
+		return out, nil
+	})
 }

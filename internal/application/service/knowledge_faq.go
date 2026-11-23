@@ -1528,7 +1528,10 @@ func (s *knowledgeService) buildFAQCSV(chunks []*types.Chunk, tagMap map[string]
 			escapeCSVField(strings.Join(meta.SimilarQuestions, "##")),
 			escapeCSVField(strings.Join(meta.NegativeQuestions, "##")),
 			escapeCSVField(strings.Join(meta.Answers, "##")),
-			boolToCSV(meta.AnswerStrategy == types.AnswerStrategyAll),
+			// An empty strategy is the legacy shape of "all" -- the same
+			// default the read path applies (chunkToFAQEntry) -- so the CSV
+			// round trip must not turn it into random.
+			boolToCSV(meta.AnswerStrategy == "" || meta.AnswerStrategy == types.AnswerStrategyAll),
 			boolToCSV(!chunk.IsEnabled),                                 // 是否停用：取反
 			boolToCSV(!chunk.Flags.HasFlag(types.ChunkFlagRecommended)), // 是否禁止被推荐：取反
 		}

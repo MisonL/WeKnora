@@ -124,8 +124,8 @@ func TestLegacyRollbackProtocolCompatibility(t *testing.T) {
 	// it exists, so a rolled-back submission keeps the KB reserved from the
 	// new code.
 	require.NoError(t, svc.redisClient.Set(ctx, key, "legacy-task", 3*time.Hour).Err())
-	require.NoError(t, svc.renewFAQImportLease(ctx, kbID, "legacy-task", ""))
-	require.ErrorIs(t, svc.renewFAQImportLease(ctx, kbID, "other-task", "inst-other"),
+	require.NoError(t, svc.renewFAQImportLease(ctx, kbID, "legacy-task", "", 0))
+	require.ErrorIs(t, svc.renewFAQImportLease(ctx, kbID, "other-task", "inst-other", 0),
 		errFAQImportLeaseTaken)
 	var held *faqImportLeaseHeldError
 	require.ErrorAs(t, svc.claimFAQImportLease(ctx, kbID, leaseInfo("modern")), &held)
@@ -137,7 +137,7 @@ func TestLegacyRollbackProtocolCompatibility(t *testing.T) {
 	// directions, so a rolled-back worker cannot extend or orphan a marker the
 	// new version owns.
 	require.NoError(t, svc.claimFAQImportLease(ctx, kbID, leaseInfo("modern")))
-	require.ErrorIs(t, svc.renewFAQImportLease(ctx, kbID, "modern", ""), errFAQImportLeaseTaken)
+	require.ErrorIs(t, svc.renewFAQImportLease(ctx, kbID, "modern", "", 0), errFAQImportLeaseTaken)
 	require.NoError(t, svc.clearRunningFAQImportInfoIfMatches(ctx, kbID, "modern", "", 0))
 	marker, err := svc.getRunningFAQImportInfo(ctx, kbID)
 	require.NoError(t, err)
@@ -149,9 +149,9 @@ func TestLegacyRollbackProtocolCompatibility(t *testing.T) {
 	// on.
 	require.NoError(t, svc.clearRunningFAQImportInfoIfMatches(ctx, kbID, "modern", "inst-modern", 0))
 	require.NoError(t, svc.claimFAQImportLease(ctx, kbID, leaseInfo("newer")))
-	require.ErrorIs(t, svc.renewFAQImportLease(ctx, kbID, "stale-retry", "inst-stale"),
+	require.ErrorIs(t, svc.renewFAQImportLease(ctx, kbID, "stale-retry", "inst-stale", 0),
 		errFAQImportLeaseTaken)
-	require.ErrorIs(t, svc.renewFAQImportLeaseAllow(ctx, kbID, "stale-retry", "inst-stale", true),
+	require.ErrorIs(t, svc.renewFAQImportLeaseAllow(ctx, kbID, "stale-retry", "inst-stale", 0, true),
 		errFAQImportLeaseTaken, "reclaim must not fire beside a live marker")
 	require.NoError(t, svc.clearRunningFAQImportInfoIfMatches(ctx, kbID, "stale-retry", "inst-stale", 0))
 	marker, err = svc.getRunningFAQImportInfo(ctx, kbID)

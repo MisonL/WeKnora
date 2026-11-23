@@ -27,7 +27,7 @@ func TestAppendMergeKeepsStoredStrategyWhenTheEntryOmitsIt(t *testing.T) {
 	}}
 	progress := &types.FAQImportProgress{TaskID: "strategy-merge-task", KBID: f.kb.ID}
 	require.NoError(t, f.svc.executeFAQImport(f.ctx, progress.TaskID, f.kb.ID,
-		&types.FAQBatchUpsertPayload{Mode: types.FAQBatchModeAppend, Entries: entries}, f.kb.TenantID, 0, progress))
+		&types.FAQBatchUpsertPayload{Mode: types.FAQBatchModeAppend, Entries: entries}, f.kb.TenantID, 0, 0, progress))
 
 	require.Equal(t, 1, progress.MergedCount)
 	var chunk types.Chunk
@@ -57,7 +57,7 @@ func TestAppendMergeAppliesAnExplicitStrategy(t *testing.T) {
 	}}
 	progress := &types.FAQImportProgress{TaskID: "strategy-explicit-task", KBID: f.kb.ID}
 	require.NoError(t, f.svc.executeFAQImport(f.ctx, progress.TaskID, f.kb.ID,
-		&types.FAQBatchUpsertPayload{Mode: types.FAQBatchModeAppend, Entries: entries}, f.kb.TenantID, 0, progress))
+		&types.FAQBatchUpsertPayload{Mode: types.FAQBatchModeAppend, Entries: entries}, f.kb.TenantID, 0, 0, progress))
 
 	require.Equal(t, 1, progress.MergedCount)
 	var chunk types.Chunk
@@ -93,7 +93,7 @@ func TestReplaceKeepsStoredStrategyWhenTheEntryOmitsIt(t *testing.T) {
 	}}
 	progress := &types.FAQImportProgress{TaskID: "strategy-replace-task", KBID: f.kb.ID}
 	require.NoError(t, f.svc.executeFAQImport(f.ctx, progress.TaskID, f.kb.ID,
-		&types.FAQBatchUpsertPayload{Mode: types.FAQBatchModeReplace, Entries: entries}, f.kb.TenantID, 0, progress))
+		&types.FAQBatchUpsertPayload{Mode: types.FAQBatchModeReplace, Entries: entries}, f.kb.TenantID, 0, 0, progress))
 
 	var all []types.Chunk
 	require.NoError(t, f.db.Where("knowledge_id = ?", "faq").Find(&all).Error)

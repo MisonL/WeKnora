@@ -80,7 +80,8 @@ func TestFAQImportResumesFromNextEntryIndex(t *testing.T) {
 	payload := &types.FAQBatchUpsertPayload{Mode: types.FAQBatchModeAppend, Entries: entries}
 	progress := &types.FAQImportProgress{TaskID: "resume", KBID: f.kb.ID}
 	// 模拟首批已成功、任务中断后从第 3 条续跑：游标之前的下标不得重复处理。
-	require.NoError(t, f.svc.executeFAQImport(f.ctx, progress.TaskID, f.kb.ID, payload, f.kb.TenantID, 3, progress))
+	require.NoError(t, f.svc.executeFAQImport(f.ctx, progress.TaskID, f.kb.ID, payload, f.kb.TenantID, 3, 0,
+		progress))
 
 	var created []types.Chunk
 	require.NoError(t, f.db.Where("knowledge_id = ? AND id <> ?", "faq", "one").Find(&created).Error)
@@ -106,7 +107,8 @@ func TestFAQImportPlannedIndicesSurviveSkipsAndMerges(t *testing.T) {
 	}
 	progress := &types.FAQImportProgress{TaskID: "indices", KBID: f.kb.ID}
 	require.NoError(t, f.svc.executeFAQImport(f.ctx, progress.TaskID, f.kb.ID,
-		&types.FAQBatchUpsertPayload{Mode: types.FAQBatchModeAppend, Entries: entries}, f.kb.TenantID, 0, progress))
+		&types.FAQBatchUpsertPayload{Mode: types.FAQBatchModeAppend, Entries: entries}, f.kb.TenantID, 0, 0,
+		progress))
 
 	require.Equal(t, 1, progress.MergedCount)
 	require.Len(t, progress.MergeDetails, 1)
@@ -172,7 +174,8 @@ func TestFAQImportFailureDoesNotAdvanceCursor(t *testing.T) {
 	}
 	progress := &types.FAQImportProgress{TaskID: "fail", KBID: f.kb.ID}
 	err := f.svc.executeFAQImport(f.ctx, progress.TaskID, f.kb.ID,
-		&types.FAQBatchUpsertPayload{Mode: types.FAQBatchModeAppend, Entries: entries}, f.kb.TenantID, 0, progress)
+		&types.FAQBatchUpsertPayload{Mode: types.FAQBatchModeAppend, Entries: entries}, f.kb.TenantID, 0, 0,
+		progress)
 	require.ErrorContains(t, err, "engine unavailable")
 	require.Zero(t, progress.NextEntryIndex, "a failed batch must not advance the retry cursor")
 }

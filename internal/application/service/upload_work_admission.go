@@ -178,9 +178,21 @@ func (h *heldUploadWork) claimLocked(byUploader bool) {
 // reclaimStaleUploaderClaimsLocked drops enqueue-side claims whose worker never
 // arrived, which happens whenever the job is run by another replica. Only rows
 // that are not worker-owned here are candidates; a running parse keeps its row.
-// The caller holds uploadWorkMu.
+//
+// A deadline past is not yet proof the job left the queue: on the shipped
+// deployment (API and worker in one process) a busy worker leaves queued jobs
+// unclaimed for longer than the handoff TTL, and freeing their budget then
+// loosens the guard exactly while the host is backed up. When a queue probe is
+// wired, a row whose task is still queued (or whose queue cannot be read)
+// keeps its charge until the worker arrives and settles the account; only a
+// confirmed-departed job is reclaimed.
+//
+// The caller holds uploadWorkMu; the probe is only consulted for expired
+// rows, which makes it a once-per-queue-depth call, not per reservation.
 func reclaimStaleUploaderClaimsLocked() {
 	now := time.Now().UnixNano()
+	probe := uploadWorkQueueProbe
+	var expired []string
 	uploadWorkIDs.Range(func(_, value any) bool {
 		held := value.(*heldUploadWork)
 		if held.workerClaims.Load() > 0 || held.uploaderClaims.Load() == 0 {
@@ -190,11 +202,64 @@ func reclaimStaleUploaderClaimsLocked() {
 		if deadline == 0 || now < deadline {
 			return true
 		}
-		held.uploaderClaims.Store(0)
-		held.uploaderDeadline.Store(0)
-		held.freeIfIdleLocked()
+		if probe != nil {
+			expired = append(expired, held.id)
+			return true
+		}
+		reclaimUploaderClaimLocked(held)
 		return true
 	})
+	if probe == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), uploadWorkProbeTimeout)
+	defer cancel()
+	queued, err := probe(ctx)
+	for _, id := range expired {
+		// A confirmed-queued job keeps its charge; so does an unreadable
+		// queue -- a failed probe is not proof the job left.
+		if err != nil || queued[id] {
+			continue
+		}
+		if raw, ok := uploadWorkIDs.Load(id); ok {
+			reclaimUploaderClaimLocked(raw.(*heldUploadWork))
+		}
+	}
+}
+
+// reclaimUploaderClaimLocked drops one row's expired uploader claim. A row a
+// concurrent path just handed to a worker is no longer a candidate.
+func reclaimUploaderClaimLocked(held *heldUploadWork) {
+	if held.workerClaims.Load() > 0 || held.uploaderClaims.Load() == 0 {
+		return
+	}
+	held.uploaderClaims.Store(0)
+	held.uploaderDeadline.Store(0)
+	held.freeIfIdleLocked()
+}
+
+// uploadWorkQueueProbe, when set, answers "which knowledge ids still have a
+// document-process task in the queue". Container wiring installs it from the
+// asynq inspector; untested processes (and lite mode, which has no queue)
+// leave it nil so reclaiming keeps the timestamp-only rule. err means the
+// queue could not be read, which keeps every charge (an unreadable queue is
+// not proof a job is gone).
+var (
+	uploadWorkQueueProbe func(context.Context) (map[string]bool, error)
+	// uploadWorkProbeTimeout bounds the sweep-side queue scan. The sweep runs
+	// under uploadWorkMu, so the budget is a ceiling on how long reservations
+	// can stall while the queue is being read; on timeout the probe counts as
+	// unreadable and every charge stays (the conservative direction -- it
+	// delays reclaiming, never over-admits).
+	uploadWorkProbeTimeout = 3 * time.Second
+)
+
+// SetUploadWorkQueueProbe wires the queue-liveness probe used by the handoff
+// sweep. Pass nil to restore the timestamp-only behaviour.
+func SetUploadWorkQueueProbe(probe func(context.Context) (map[string]bool, error)) {
+	uploadWorkMu.Lock()
+	defer uploadWorkMu.Unlock()
+	uploadWorkQueueProbe = probe
 }
 
 // release ends one claim and frees the row when nothing is left. A claim whose
@@ -322,10 +387,16 @@ func declaredUploadBytes(ctx context.Context) int64 {
 // HTTP admission (IM, datasource, worker), the size recorded on the row. Zero
 // when neither is known, so the unattributable floor applies.
 func declaredUploadFileBytes(ctx context.Context, rowSize int64) int64 {
-	if n := declaredUploadBytes(ctx); n > 0 {
-		return n
+	n := declaredUploadBytes(ctx)
+	// The declared figure comes from Content-Length and a client can
+	// understate it; knowledge.FileSize is computed by the multipart parser
+	// as bytes hit the disk. Charge the larger: an overstated declaration
+	// stays (chunked uploads pre-charge the cap on purpose), an understated
+	// one no longer buys a discount on the parse budget.
+	if rowSize > n {
+		return rowSize
 	}
-	return rowSize
+	return n
 }
 
 // parseWorkKeyForTask names a parse job's reservation. The knowledge id is the

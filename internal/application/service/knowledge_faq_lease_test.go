@@ -52,7 +52,7 @@ func TestImportLeaseExpiresWithoutRenewalAndIsKeptByIt(t *testing.T) {
 	ctx := context.Background()
 
 	require.NoError(t, svc.claimFAQImportLease(ctx, "kb-1", leaseInfo("first")))
-	require.NoError(t, svc.renewFAQImportLease(ctx, "kb-1", "first", "inst-first"))
+	require.NoError(t, svc.renewFAQImportLease(ctx, "kb-1", "first", "inst-first", 0))
 
 	// Past the original lease but inside the renewal: still held.
 	mr.FastForward(faqImportLeaseTTL - time.Second)
@@ -76,7 +76,7 @@ func TestRenewalIsOwnershipCheckedAndReclaimsALapsedLease(t *testing.T) {
 
 	// A different task's renewal is reported as a takeover and leaves the
 	// holder's lease alone: the key still names the first task.
-	err := svc.renewFAQImportLease(ctx, "kb-1", "second", "inst-second")
+	err := svc.renewFAQImportLease(ctx, "kb-1", "second", "inst-second", 0)
 	require.ErrorIs(t, err, errFAQImportLeaseTaken)
 	info, err := svc.getRunningFAQImportInfo(ctx, "kb-1")
 	require.NoError(t, err)
@@ -85,7 +85,7 @@ func TestRenewalIsOwnershipCheckedAndReclaimsALapsedLease(t *testing.T) {
 	// Let the lease lapse; the owning task reclaims it rather than renewing
 	// nothing, and its next admission still sees it held.
 	mr.FastForward(faqImportLeaseTTL + time.Second)
-	require.NoError(t, svc.renewFAQImportLease(ctx, "kb-1", "first", "inst-first"),
+	require.NoError(t, svc.renewFAQImportLease(ctx, "kb-1", "first", "inst-first", 0),
 		"the owning task has to take back its own lapsed lease")
 	var held *faqImportLeaseHeldError
 	require.ErrorAs(t, svc.claimFAQImportLease(ctx, "kb-1", leaseInfo("third")), &held)
@@ -94,7 +94,7 @@ func TestRenewalIsOwnershipCheckedAndReclaimsALapsedLease(t *testing.T) {
 	// A takeover by someone else is still reported after the lapse.
 	mr.FastForward(faqImportLeaseTTL + time.Second)
 	require.NoError(t, svc.claimFAQImportLease(ctx, "kb-1", leaseInfo("third")))
-	require.ErrorIs(t, svc.renewFAQImportLease(ctx, "kb-1", "stale", "inst-stale"), errFAQImportLeaseTaken)
+	require.ErrorIs(t, svc.renewFAQImportLease(ctx, "kb-1", "stale", "inst-stale", 0), errFAQImportLeaseTaken)
 }
 
 // The same ownership rule has to hold on the in-memory path.
@@ -103,8 +103,8 @@ func TestRenewalIsOwnershipCheckedWithoutRedis(t *testing.T) {
 	ctx := context.Background()
 
 	require.NoError(t, svc.claimFAQImportLease(ctx, "kb-1", leaseInfo("first")))
-	require.NoError(t, svc.renewFAQImportLease(ctx, "kb-1", "first", "inst-first"))
-	require.ErrorIs(t, svc.renewFAQImportLease(ctx, "kb-1", "second", "inst-second"), errFAQImportLeaseTaken)
+	require.NoError(t, svc.renewFAQImportLease(ctx, "kb-1", "first", "inst-first", 0))
+	require.ErrorIs(t, svc.renewFAQImportLease(ctx, "kb-1", "second", "inst-second", 0), errFAQImportLeaseTaken)
 }
 
 // Failing open would admit the concurrency the lease exists to stop, at the
@@ -217,7 +217,7 @@ func TestLegacyRunCannotRenewOrClearAModernMarker(t *testing.T) {
 
 	require.NoError(t, svc.claimFAQImportLease(ctx, "kb-1", leaseInfo("shared")))
 
-	require.ErrorIs(t, svc.renewFAQImportLease(ctx, "kb-1", "shared", ""), errFAQImportLeaseTaken,
+	require.ErrorIs(t, svc.renewFAQImportLease(ctx, "kb-1", "shared", "", 0), errFAQImportLeaseTaken,
 		"a run without an instance id cannot prove ownership of a modern marker")
 
 	require.NoError(t, svc.clearRunningFAQImportInfoIfMatches(ctx, "kb-1", "shared", "", 0))
@@ -238,7 +238,7 @@ func TestLegacyRunCannotRenewOrClearAModernMarkerWithoutRedis(t *testing.T) {
 	ctx := context.Background()
 
 	require.NoError(t, svc.claimFAQImportLease(ctx, "kb-1", leaseInfo("shared")))
-	require.ErrorIs(t, svc.renewFAQImportLease(ctx, "kb-1", "shared", ""), errFAQImportLeaseTaken)
+	require.ErrorIs(t, svc.renewFAQImportLease(ctx, "kb-1", "shared", "", 0), errFAQImportLeaseTaken)
 	require.NoError(t, svc.clearRunningFAQImportInfoIfMatches(ctx, "kb-1", "shared", "", 0))
 	info, err := svc.getRunningFAQImportInfo(ctx, "kb-1")
 	require.NoError(t, err)
@@ -305,7 +305,7 @@ func TestHeartbeatKeepsTheLeaseThroughALongBatch(t *testing.T) {
 	faqImportLeaseHeartbeatInterval = 5 * time.Millisecond
 	t.Cleanup(func() { faqImportLeaseHeartbeatInterval = old })
 
-	stop := svc.startFAQImportLeaseHeartbeat(ctx, "kb-1", "running", "inst-running", nil)
+	stop := svc.startFAQImportLeaseHeartbeat(ctx, "kb-1", "running", "inst-running", 0, nil)
 
 	// The lease is nearly gone while the batch is still running: the next
 	// heartbeat tick pushes the deadline out, exactly as a periodic renewal
@@ -341,9 +341,10 @@ func TestHeartbeatDoesNotResurrectAClearedLease(t *testing.T) {
 	faqImportLeaseHeartbeatInterval = 5 * time.Millisecond
 	t.Cleanup(func() { faqImportLeaseHeartbeatInterval = old })
 	notLost := make(chan struct{}, 1)
-	stop := svc.startFAQImportLeaseHeartbeat(ctx, "kb-1", "running", "inst-running", func() {
-		notLost <- struct{}{}
-	})
+	stop := svc.startFAQImportLeaseHeartbeat(ctx, "kb-1", "running", "inst-running", 0,
+		func() {
+			notLost <- struct{}{}
+		})
 
 	require.NoError(t, svc.clearRunningFAQImportInfoIfMatches(
 		ctx, "kb-1", "running", "inst-running", info.EnqueuedAt))
@@ -355,7 +356,7 @@ func TestHeartbeatDoesNotResurrectAClearedLease(t *testing.T) {
 	}, 100*time.Millisecond, 5*time.Millisecond,
 		"a heartbeat that outlived its run must not resurrect the lease")
 
-	require.ErrorIs(t, svc.renewFAQImportLeaseAllow(ctx, "kb-1", "running", "inst-running", false),
+	require.ErrorIs(t, svc.renewFAQImportLeaseAllow(ctx, "kb-1", "running", "inst-running", 0, false),
 		errFAQImportLeaseMissing, "a periodic renewal must not take a missing lease back")
 	require.Equal(t, time.Duration(0), mr.TTL(getFAQImportRunningKey("kb-1")))
 	select {
@@ -401,9 +402,10 @@ func TestHeartbeatCancelsTheRunWhenTheLeaseMoves(t *testing.T) {
 	t.Cleanup(func() { faqImportLeaseHeartbeatInterval = old })
 
 	lost := make(chan struct{}, 1)
-	stop := svc.startFAQImportLeaseHeartbeat(ctx, "kb-1", "running", "inst-running", func() {
-		lost <- struct{}{}
-	})
+	stop := svc.startFAQImportLeaseHeartbeat(ctx, "kb-1", "running", "inst-running", 0,
+		func() {
+			lost <- struct{}{}
+		})
 	select {
 	case <-lost:
 	case <-time.After(2 * time.Second):
@@ -468,13 +470,13 @@ func TestIrreversibleGateRefusesAnUnverifiableLease(t *testing.T) {
 	t.Cleanup(func() { mr.SetError("") })
 
 	require.ErrorIs(t,
-		svc.ensureFAQImportLeaseForWriteStrict(ctx, "kb-1", "mine", "inst-mine"),
+		svc.ensureFAQImportLeaseForWriteStrict(ctx, "kb-1", "mine", "inst-mine", 0),
 		errFAQImportLeaseUnverifiable)
-	require.NoError(t, svc.ensureFAQImportLeaseForWrite(ctx, "kb-1", "mine", "inst-mine"),
+	require.NoError(t, svc.ensureFAQImportLeaseForWrite(ctx, "kb-1", "mine", "inst-mine", 0),
 		"an ordinary renewal still logs and continues")
 
 	mr.SetError("")
-	require.NoError(t, svc.ensureFAQImportLeaseForWriteStrict(ctx, "kb-1", "mine", "inst-mine"))
+	require.NoError(t, svc.ensureFAQImportLeaseForWriteStrict(ctx, "kb-1", "mine", "inst-mine", 0))
 }
 
 // An unreachable store is not proof of a takeover: the heartbeat keeps trying
@@ -489,9 +491,10 @@ func TestHeartbeatTreatsAnUnverifiableLeaseAsTransient(t *testing.T) {
 	t.Cleanup(func() { faqImportLeaseHeartbeatInterval = old })
 
 	lost := make(chan struct{}, 1)
-	stop := svc.startFAQImportLeaseHeartbeat(ctx, "kb-1", "running", "inst-running", func() {
-		lost <- struct{}{}
-	})
+	stop := svc.startFAQImportLeaseHeartbeat(ctx, "kb-1", "running", "inst-running", 0,
+		func() {
+			lost <- struct{}{}
+		})
 	mr.SetError("ERR lease store unavailable")
 	t.Cleanup(func() { mr.SetError("") })
 
@@ -523,7 +526,7 @@ func TestHeartbeatExitsWhenTheRunContextIsCancelled(t *testing.T) {
 	faqImportLeaseHeartbeatInterval = 5 * time.Millisecond
 	t.Cleanup(func() { faqImportLeaseHeartbeatInterval = old })
 
-	stop := svc.startFAQImportLeaseHeartbeat(ctx, "kb-1", "running", "inst-running", nil)
+	stop := svc.startFAQImportLeaseHeartbeat(ctx, "kb-1", "running", "inst-running", 0, nil)
 	cancel()
 
 	done := make(chan struct{})

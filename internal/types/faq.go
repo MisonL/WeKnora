@@ -487,7 +487,12 @@ type FAQImportProgress struct {
 	// InstanceID identifies the enqueued run that wrote this record. A task id
 	// may be reused by a later submission; the record then belongs to the newer
 	// instance, and a stale queued instance must not overwrite or resume it.
-	InstanceID         string              `json:"instance_id,omitempty"`
+	InstanceID string `json:"instance_id,omitempty"`
+	// EnqueuedAt is the submission time (unix seconds) this record's run was
+	// accepted at. Lease renewals carry it so a reclaimed marker keeps the
+	// timestamp leg of its identity; records from older builds leave it empty
+	// and renewals then pass 0, which matches any marker.
+	EnqueuedAt         int64               `json:"enqueued_at,omitempty"`
 	Status             FAQImportTaskStatus `json:"status"`                         // Task status
 	Progress           int                 `json:"progress"`                       // 0-100 percentage
 	Total              int                 `json:"total"`                          // Total entries to import
@@ -548,6 +553,13 @@ type FAQImportResult struct {
 	// order imports that complete within one second. Older results lack it.
 	ImportedAtMillis int64  `json:"imported_at_ms,omitempty"`
 	TaskID           string `json:"task_id"` // 导入任务ID
+	// InstanceID names the run that wrote this result. The staleness fence uses
+	// it to tell a crash-retry resuming its own completion (same task, same
+	// instance: idempotent, must not be fenced) from an older queued instance
+	// of a reused task id watching a newer instance's completion (must fence).
+	// Results written by older builds leave it empty and the fence falls back
+	// to the timestamp-only comparison.
+	InstanceID string `json:"instance_id,omitempty"`
 
 	// 失败详情对象路径（失败条目较多时提供下载）
 	FailedEntriesURL string `json:"failed_entries_url,omitempty"` // 失败条目CSV的对象存储路径；需走 /files 鉴权代理下载
