@@ -119,8 +119,13 @@ func ReserveUploadWork(knowledgeID string, bytes int64, byUploader bool) (func()
 		bytes = parseJobUnknownCharge
 	}
 
+	// The sweep's queue read must not run under uploadWorkMu: it can take up to
+	// uploadWorkProbeTimeout, and every reservation, release and worker claim
+	// waits on the same lock. The sweep collects its candidates and applies its
+	// verdicts under the lock; the probe itself runs in between.
+	sweepStaleUploaderClaims()
+
 	uploadWorkMu.Lock()
-	reclaimStaleUploaderClaimsLocked()
 	if actual, ok := uploadWorkIDs.Load(knowledgeID); ok {
 		joined := actual.(*heldUploadWork)
 		joined.claimLocked(byUploader)
@@ -175,7 +180,37 @@ func (h *heldUploadWork) claimLocked(byUploader bool) {
 	h.workerClaims.Add(1)
 }
 
-// reclaimStaleUploaderClaimsLocked drops enqueue-side claims whose worker never
+// sweepStaleUploaderClaims runs the stale-claim sweep without holding
+// uploadWorkMu across the queue read. The probe can take up to
+// uploadWorkProbeTimeout, and every reservation, release and worker claim waits
+// on that same lock; keeping the lock for the candidate scan and the verdicts
+// only leaves the read outside it.
+func sweepStaleUploaderClaims() {
+	uploadWorkMu.Lock()
+	expired, probe := collectStaleUploaderClaimsLocked()
+	uploadWorkMu.Unlock()
+	if probe == nil || len(expired) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), uploadWorkProbeTimeout)
+	defer cancel()
+	queued, err := probe(ctx)
+	uploadWorkMu.Lock()
+	defer uploadWorkMu.Unlock()
+	for _, id := range expired {
+		// A confirmed-queued job keeps its charge; so does an unreadable
+		// queue -- a failed probe is not proof the job left. A row reclaimed or
+		// handed to a worker while the read ran is skipped by the claim check.
+		if err != nil || queued[id] {
+			continue
+		}
+		if raw, ok := uploadWorkIDs.Load(id); ok {
+			reclaimUploaderClaimLocked(raw.(*heldUploadWork))
+		}
+	}
+}
+
+// collectStaleUploaderClaimsLocked drops enqueue-side claims whose worker never
 // arrived, which happens whenever the job is run by another replica. Only rows
 // that are not worker-owned here are candidates; a running parse keeps its row.
 //
@@ -183,16 +218,16 @@ func (h *heldUploadWork) claimLocked(byUploader bool) {
 // deployment (API and worker in one process) a busy worker leaves queued jobs
 // unclaimed for longer than the handoff TTL, and freeing their budget then
 // loosens the guard exactly while the host is backed up. When a queue probe is
-// wired, a row whose task is still queued (or whose queue cannot be read)
-// keeps its charge until the worker arrives and settles the account; only a
-// confirmed-departed job is reclaimed.
+// wired, a row whose task is still queued keeps its charge until the worker
+// arrives and settles the account; only a confirmed-departed job is reclaimed.
+// Without a probe the timestamp rule is the only evidence there is.
 //
-// The caller holds uploadWorkMu; the probe is only consulted for expired
-// rows, which makes it a once-per-queue-depth call, not per reservation.
-func reclaimStaleUploaderClaimsLocked() {
+// The caller holds uploadWorkMu. It returns the expired row ids and the probe
+// that has to judge them; the caller runs the probe outside the lock and then
+// reclaims the confirmed-departed rows.
+func collectStaleUploaderClaimsLocked() (expired []string, probe func(context.Context) (map[string]bool, error)) {
 	now := time.Now().UnixNano()
-	probe := uploadWorkQueueProbe
-	var expired []string
+	probe = uploadWorkQueueProbe
 	uploadWorkIDs.Range(func(_, value any) bool {
 		held := value.(*heldUploadWork)
 		if held.workerClaims.Load() > 0 || held.uploaderClaims.Load() == 0 {
@@ -209,22 +244,7 @@ func reclaimStaleUploaderClaimsLocked() {
 		reclaimUploaderClaimLocked(held)
 		return true
 	})
-	if probe == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), uploadWorkProbeTimeout)
-	defer cancel()
-	queued, err := probe(ctx)
-	for _, id := range expired {
-		// A confirmed-queued job keeps its charge; so does an unreadable
-		// queue -- a failed probe is not proof the job left.
-		if err != nil || queued[id] {
-			continue
-		}
-		if raw, ok := uploadWorkIDs.Load(id); ok {
-			reclaimUploaderClaimLocked(raw.(*heldUploadWork))
-		}
-	}
+	return expired, probe
 }
 
 // reclaimUploaderClaimLocked drops one row's expired uploader claim. A row a

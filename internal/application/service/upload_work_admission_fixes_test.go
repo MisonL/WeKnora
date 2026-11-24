@@ -6,6 +6,7 @@ package service
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -99,6 +100,96 @@ func setUploadWorkQueueProbe(t *testing.T, queued map[string]bool) {
 		return queued, nil
 	})
 	t.Cleanup(func() { SetUploadWorkQueueProbe(nil) })
+}
+
+// A reservation must not pay for a queue scan when no claim is a reclaim
+// candidate. The probe answers a question about expired rows; an empty
+// candidate set has no question, and the scan runs under the reservation lock.
+func TestReserveSkipsTheQueueProbeWhenNothingIsExpired(t *testing.T) {
+	withUploadBackgroundBudget(t, 30<<20)
+
+	releaseA, err := ReserveUploadWork("row-a", 1<<20, requestUploadWork)
+	require.NoError(t, err)
+	defer releaseA()
+
+	var mu sync.Mutex
+	calls := 0
+	SetUploadWorkQueueProbe(func(context.Context) (map[string]bool, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return nil, nil
+	})
+	t.Cleanup(func() { SetUploadWorkQueueProbe(nil) })
+
+	releaseB, err := ReserveUploadWork("row-b", 1<<20, requestUploadWork)
+	require.NoError(t, err)
+	defer releaseB()
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Zero(t, calls, "no expired claim means no queue scan")
+}
+
+// The queue read is the slow part of the sweep and it must not hold the
+// reservation lock: a release arriving while the probe is still reading has to
+// finish, or every upload in flight waits behind one scan.
+func TestQueueProbeRunsOutsideTheReservationLock(t *testing.T) {
+	withUploadBackgroundBudget(t, 30<<20)
+
+	// One expired uploader claim makes the next reservation consult the probe.
+	releaseStale, err := ReserveUploadWork("row-stale", 1<<20, requestUploadWork)
+	require.NoError(t, err)
+	t.Cleanup(releaseStale)
+
+	releaseOther, err := ReserveUploadWork("row-other", 1<<20, requestUploadWork)
+	require.NoError(t, err)
+	t.Cleanup(releaseOther)
+
+	// Install the probe before the row expires: without one the sweep itself
+	// reclaims the row and there would be nothing left to ask about.
+	entered := make(chan struct{})
+	leave := make(chan struct{})
+	SetUploadWorkQueueProbe(func(context.Context) (map[string]bool, error) {
+		close(entered)
+		<-leave
+		return map[string]bool{"row-stale": true}, nil
+	})
+	t.Cleanup(func() { SetUploadWorkQueueProbe(nil) })
+
+	raw, ok := uploadWorkIDs.Load("row-stale")
+	require.True(t, ok)
+	raw.(*heldUploadWork).uploaderDeadline.Store(time.Now().Add(-time.Second).UnixNano())
+
+	reserved := make(chan error, 1)
+	go func() {
+		release, err := ReserveUploadWork("row-next", 1<<20, requestUploadWork)
+		if err == nil {
+			t.Cleanup(release)
+		}
+		reserved <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the sweep never reached the probe")
+	}
+
+	// The probe is blocked. A release must not wait behind it.
+	released := make(chan struct{})
+	go func() {
+		releaseOther()
+		close(released)
+	}()
+	select {
+	case <-released:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a release blocked on the reservation lock while the queue probe was reading")
+	}
+
+	close(leave)
+	require.NoError(t, <-reserved)
 }
 
 func setUploadWorkQueueProbeError(t *testing.T, failing bool) {

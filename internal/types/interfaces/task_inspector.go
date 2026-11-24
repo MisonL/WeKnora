@@ -48,7 +48,9 @@ type TaskInspector interface {
 	// one pass over the queues — for answering many documents at once
 	// where HasQueuedTasksForKnowledge would rescan per document. Unlike
 	// that probe it returns list errors instead of reading them as "no
-	// match". Lite mode returns an empty set.
+	// match", and it stops with the caller's context error once the
+	// deadline passes (a caller that gave up must not keep scanning). Lite
+	// mode returns an empty set.
 	QueuedKnowledgeIDs(ctx context.Context) (map[string]struct{}, error)
 
 	// HasQueuedDeleteTasksForKnowledge reports whether any pending /

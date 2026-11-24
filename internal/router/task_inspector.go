@@ -207,15 +207,22 @@ func (a *asynqTaskInspector) HasQueuedTasksForKnowledge(
 }
 
 // QueuedKnowledgeIDs scans every cancellable state of every queue once and
-// collects the knowledge IDs its tasks reference.
-func (a *asynqTaskInspector) QueuedKnowledgeIDs(_ context.Context) (map[string]struct{}, error) {
+// collects the knowledge IDs its tasks reference. The caller's deadline bounds
+// the scan: a caller that gave up must not keep the upload-work lock busy.
+func (a *asynqTaskInspector) QueuedKnowledgeIDs(ctx context.Context) (map[string]struct{}, error) {
 	out := make(map[string]struct{})
 	if a == nil || a.inspector == nil {
 		return out, nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for _, queue := range queuesScanned {
 		for _, state := range a.cancellableTaskStates() {
 			for page := 1; ; page++ {
+				if err := ctx.Err(); err != nil {
+					return nil, fmt.Errorf("scan %s tasks in queue %s: %w", state.name, queue, err)
+				}
 				tasks, err := state.list(queue, asynq.PageSize(listPageSize), asynq.Page(page))
 				if err != nil {
 					if isAsynqQueueNotFound(err) {
