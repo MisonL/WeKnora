@@ -677,63 +677,93 @@ func (r *chunkRepository) DeleteChunk(ctx context.Context, tenantID uint64, id s
 }
 
 // UnchangedChunks returns the planned chunks whose rows still hold the same
-// seq id and content hash. A replace-mode import plans its deletions from a
-// snapshot taken before it re-checks ownership, so between the two a concurrent
-// writer can rewrite a row the plan had picked; deleting that row would discard
-// the newer content. The comparison is on the identity the plan selected the row
-// by, which is exactly what makes it a valid target.
+// identity the plan selected them by (seq id, content hash, tag, enabled and
+// recommended flags). A replace-mode import plans its deletions from a snapshot
+// taken before it re-checks ownership, so between the two a concurrent writer
+// can rewrite a row the plan had picked; deleting that row would discard the
+// newer content. The comparison is on the identity the plan selected the row by,
+// which is exactly what makes it a valid target.
 func (r *chunkRepository) UnchangedChunks(
 	ctx context.Context, tenantID uint64, chunks []*types.Chunk,
 ) ([]*types.Chunk, error) {
 	if len(chunks) == 0 {
 		return nil, nil
 	}
-	ids := make([]string, 0, len(chunks))
-	for _, c := range chunks {
-		ids = append(ids, c.ID)
-	}
-	var rows []*types.Chunk
-	if err := r.db.WithContext(ctx).
-		Select("id, seq_id, COALESCE(content_hash, '') AS content_hash").
-		Where("tenant_id = ? AND id IN ?", tenantID, ids).
-		Find(&rows).Error; err != nil {
-		return nil, err
-	}
-	current := make(map[string]*types.Chunk, len(rows))
-	for _, row := range rows {
-		current[row.ID] = row
-	}
+	// One IN list would put every id into a single statement's bind parameters;
+	// the FAQ import cap is configurable, so the list's size is not bounded by
+	// anything this repository controls.
 	unchanged := make([]*types.Chunk, 0, len(chunks))
-	for _, planned := range chunks {
-		row := current[planned.ID]
-		if row == nil || row.SeqID != planned.SeqID || row.ContentHash != planned.ContentHash {
-			continue
+	for i := 0; i < len(chunks); i += chunkFenceBatchSize {
+		end := i + chunkFenceBatchSize
+		if end > len(chunks) {
+			end = len(chunks)
 		}
-		unchanged = append(unchanged, planned)
+		batch := chunks[i:end]
+		ids := make([]string, 0, len(batch))
+		for _, c := range batch {
+			ids = append(ids, c.ID)
+		}
+		var rows []*types.Chunk
+		if err := r.db.WithContext(ctx).
+			Select("id, seq_id, COALESCE(content_hash, '') AS content_hash, COALESCE(tag_id, '') AS tag_id, " +
+				"COALESCE(is_enabled, false) AS is_enabled, COALESCE(flags, 0) AS flags").
+			Where("tenant_id = ? AND id IN ?", tenantID, ids).
+			Find(&rows).Error; err != nil {
+			return nil, err
+		}
+		current := make(map[string]*types.Chunk, len(rows))
+		for _, row := range rows {
+			current[row.ID] = row
+		}
+		for _, planned := range batch {
+			row := current[planned.ID]
+			if !sameChunkIdentity(row, planned) {
+				continue
+			}
+			unchanged = append(unchanged, planned)
+		}
 	}
 	return unchanged, nil
 }
 
+// chunkFenceBatchSize bounds how many ids one fence statement carries.
+const chunkFenceBatchSize = 200
+
+// sameChunkIdentity reports whether a re-read row still carries everything the
+// plan selected it by. Content hash covers the question and answers only, so a
+// concurrent edit that changes nothing but the tag, the enabled flag or the
+// recommended flag leaves it identical -- and that edit is exactly what a
+// replace import must not discard. A nil row (the id vanished) is never a match.
+func sameChunkIdentity(row, planned *types.Chunk) bool {
+	if row == nil || planned == nil {
+		return false
+	}
+	return row.SeqID == planned.SeqID &&
+		row.ContentHash == planned.ContentHash &&
+		row.TagID == planned.TagID &&
+		row.IsEnabled == planned.IsEnabled &&
+		row.Flags == planned.Flags
+}
+
 // DeleteChunksIfUnchanged deletes each chunk only while its row still carries
-// the planned seq id and content hash, and returns the ids it left soft-deleted.
-// Rows a concurrent write changed since the plan are left untouched and are not
-// in the result.
+// the planned identity (see sameChunkIdentity), and returns the ids it left
+// soft-deleted. Rows a concurrent write changed since the plan are left
+// untouched and are not in the result.
 //
 // The ids are read back after each batch rather than assumed from the plan: the
 // row can change between the statement's check and its execution, and the caller
-// deletes vectors with them. Reporting a row we did not delete would strip the
-// vectors of another writer's entry; reporting too few only leaves vectors of a
-// dead row behind, which no query can reach.
+// deletes vectors with them. The read-back is by tenant and id, so a row another
+// writer soft-deleted in the same window is reported too; that row is dead
+// either way, and deleting dead vectors twice is harmless.
 func (r *chunkRepository) DeleteChunksIfUnchanged(
 	ctx context.Context, tenantID uint64, chunks []*types.Chunk,
 ) ([]string, error) {
 	if len(chunks) == 0 {
 		return nil, nil
 	}
-	const batchSize = 200
 	deleted := make([]string, 0, len(chunks))
-	for i := 0; i < len(chunks); i += batchSize {
-		end := i + batchSize
+	for i := 0; i < len(chunks); i += chunkFenceBatchSize {
+		end := i + chunkFenceBatchSize
 		if end > len(chunks) {
 			end = len(chunks)
 		}
@@ -744,9 +774,13 @@ func (r *chunkRepository) DeleteChunksIfUnchanged(
 		for _, c := range batch {
 			// COALESCE: a row whose seq id was never assigned (lite/SQLite, no
 			// sequence) holds NULL, which `= 0` would not match even though the
-			// planned chunk reads back as 0.
-			conds = append(conds, "(id = ? AND COALESCE(seq_id, 0) = ? AND COALESCE(content_hash, '') = ?)")
-			args = append(args, c.ID, c.SeqID, c.ContentHash)
+			// planned chunk reads back as 0. The same holds for the columns of
+			// an FAQ row written before they existed. The last three predicates
+			// are what plugin edits touch without moving the content hash; the
+			// re-read above and this statement must agree on the identity.
+			conds = append(conds, "(id = ? AND COALESCE(seq_id, 0) = ? AND COALESCE(content_hash, '') = ?"+
+				" AND COALESCE(tag_id, '') = ? AND COALESCE(is_enabled, false) = ? AND COALESCE(flags, 0) = ?)")
+			args = append(args, c.ID, c.SeqID, c.ContentHash, c.TagID, c.IsEnabled, int(c.Flags))
 			batchIDs = append(batchIDs, c.ID)
 		}
 		res := r.db.WithContext(ctx).
@@ -759,6 +793,14 @@ func (r *chunkRepository) DeleteChunksIfUnchanged(
 		if res.RowsAffected == 0 {
 			continue
 		}
+		// The read-back is scoped by tenant and id, so a row another writer
+		// soft-deleted in this batch's window is already at deleted_at and is
+		// reported too. That is deliberate: such a row is dead either way, the
+		// writer that deleted it removes its vectors on the same path, and no
+		// code path restores a soft-deleted chunk (SeqIDsInUse reads them with
+		// Unscoped only to keep the unique index honest). A row that was
+		// rewritten and then deleted by another writer is likewise not ours to
+		// index, and removing dead vectors twice is harmless.
 		var gone []string
 		if err := r.db.WithContext(ctx).Unscoped().
 			Model(&types.Chunk{}).

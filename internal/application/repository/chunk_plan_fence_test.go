@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -28,9 +29,9 @@ func TestDeleteChunksIfUnchangedLeavesRowsThatMovedSinceThePlan(t *testing.T) {
 	}
 	// The plan was computed while "rewritten" still carried h1.
 	planned := []*types.Chunk{
-		{ID: "same", SeqID: seqIDOf(t, db, "same"), ContentHash: "h1"},
-		{ID: "rewritten", SeqID: seqIDOf(t, db, "rewritten"), ContentHash: "h1"},
-		{ID: "other-tenant", SeqID: seqIDOf(t, db, "other-tenant"), ContentHash: "h1"},
+		plannedFromDB(t, db, "same"),
+		plannedFromDB(t, db, "rewritten"),
+		plannedFromDB(t, db, "other-tenant"),
 	}
 	// A user edits "rewritten" after the plan was taken.
 	require.NoError(t, db.Model(&types.Chunk{}).Where("id = ?", "rewritten").
@@ -68,7 +69,7 @@ func TestDeleteChunksIfUnchangedToleratesRowsThatVanished(t *testing.T) {
 		ID: "live", TenantID: 7, KnowledgeBaseID: "kb", ChunkType: types.ChunkTypeFAQ, ContentHash: "h",
 	}).Error)
 	planned := []*types.Chunk{
-		{ID: "live", SeqID: seqIDOf(t, db, "live"), ContentHash: "h"},
+		plannedFromDB(t, db, "live"),
 		{ID: "gone", SeqID: 42, ContentHash: "h"},
 	}
 
@@ -77,9 +78,10 @@ func TestDeleteChunksIfUnchangedToleratesRowsThatVanished(t *testing.T) {
 	require.Equal(t, []string{"live"}, removed)
 }
 
-// A row whose seq id and content hash were never assigned stores NULL for both
-// (Lite/SQLite deployments have no sequence). The plan reads them back as zero
-// values, and the fence must still match: `seq_id = 0` alone would not.
+// A row whose identity columns were never assigned stores NULL for seq id and
+// content hash (Lite/SQLite deployments have no sequence). The plan reads them
+// back as zero values, and the fence must still match: `seq_id = 0` alone would
+// not.
 func TestDeleteChunksIfUnchangedMatchesUnassignedIdentity(t *testing.T) {
 	db := setupChunkTestDB(t)
 	repo := NewChunkRepository(db)
@@ -89,17 +91,156 @@ func TestDeleteChunksIfUnchangedMatchesUnassignedIdentity(t *testing.T) {
 		ID: "null-identity", TenantID: 7, KnowledgeBaseID: "kb", ChunkType: types.ChunkTypeFAQ,
 	}).Error)
 
-	removed, err := repo.DeleteChunksIfUnchanged(ctx, 7, []*types.Chunk{
-		{ID: "null-identity", SeqID: 0, ContentHash: ""},
-	})
+	planned := plannedFromDB(t, db, "null-identity")
+	require.Zero(t, planned.SeqID)
+	require.Empty(t, planned.ContentHash)
+
+	removed, err := repo.DeleteChunksIfUnchanged(ctx, 7, []*types.Chunk{planned})
 	require.NoError(t, err)
 	require.Equal(t, []string{"null-identity"}, removed,
 		"an unassigned identity must still be deletable")
 }
 
-func seqIDOf(t *testing.T, db *gorm.DB, id string) int64 {
+// The import cap is configurable, so the planned row list is not bounded by
+// anything this repository controls. Both fence statements walk it in batches;
+// the verdict must be the same as if it were one statement, including rows that
+// changed on either side of a batch boundary.
+func TestChunkFenceBatchesGiveTheSameVerdictPerRow(t *testing.T) {
+	db := setupChunkTestDB(t)
+	repo := NewChunkRepository(db)
+	ctx := context.Background()
+
+	const total = chunkFenceBatchSize*2 + 7
+	rows := make([]*types.Chunk, 0, total)
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("c%03d", i)
+		rows = append(rows, &types.Chunk{
+			ID: id, TenantID: 7, KnowledgeBaseID: "kb", ChunkType: types.ChunkTypeFAQ, ContentHash: "h",
+		})
+	}
+	require.NoError(t, db.CreateInBatches(rows, 100).Error)
+	planned := make([]*types.Chunk, 0, total)
+	for _, row := range rows {
+		planned = append(planned, plannedFromDB(t, db, row.ID))
+	}
+
+	// Rewrite one row inside the first batch, one exactly at the boundary, and
+	// one in the trailing partial batch.
+	moved := map[string]bool{"c005": true}
+	for i := 0; i < len(planned); i += chunkFenceBatchSize {
+		moved[planned[i].ID] = true
+	}
+	for id := range moved {
+		require.NoError(t, db.Model(&types.Chunk{}).Where("id = ?", id).
+			Update("content_hash", "rewritten").Error)
+	}
+
+	unchanged, err := repo.UnchangedChunks(ctx, 7, planned)
+	require.NoError(t, err)
+	require.Len(t, unchanged, total-len(moved), "every batch is checked, none is dropped")
+
+	removed, err := repo.DeleteChunksIfUnchanged(ctx, 7, planned)
+	require.NoError(t, err)
+	require.Len(t, removed, total-len(moved), "the delete walk covers the same rows")
+	for id := range moved {
+		require.NotContains(t, removed, id, "a row that moved is never deleted")
+		_, err := repo.GetChunkByID(ctx, 7, id)
+		require.NoError(t, err, "and it survives the delete")
+	}
+}
+
+// plannedFromDB builds the row a replace import would have put in its plan: the
+// identity columns ListAllFAQChunksByKnowledgeID selects, as the database holds
+// them.
+func plannedFromDB(t *testing.T, db *gorm.DB, id string) *types.Chunk {
 	t.Helper()
 	var chunk types.Chunk
 	require.NoError(t, db.Model(&types.Chunk{}).Where("id = ?", id).First(&chunk).Error)
-	return chunk.SeqID
+	return &types.Chunk{
+		ID:          chunk.ID,
+		SeqID:       chunk.SeqID,
+		ContentHash: chunk.ContentHash,
+		TagID:       chunk.TagID,
+		IsEnabled:   chunk.IsEnabled,
+		Flags:       chunk.Flags,
+	}
+}
+
+// A plugin edit that only moves a tag (or flips enabled / recommended) leaves
+// the content hash untouched, because the hash covers the question and answers
+// only. The plan would then match a row the user just categorised or disabled,
+// and deleting it would discard that edit -- the fence has to carry the whole
+// identity the plan read.
+func TestDeleteChunksIfUnchangedLeavesRowsWhoseTagEnabledOrFlagsMoved(t *testing.T) {
+	for _, change := range []struct {
+		name  string
+		apply func(db *gorm.DB, id string)
+	}{
+		{"tag", func(db *gorm.DB, id string) {
+			require.NoError(t, db.Model(&types.Chunk{}).Where("id = ?", id).Update("tag_id", "new-tag").Error)
+		}},
+		{"enabled", func(db *gorm.DB, id string) {
+			require.NoError(t, db.Model(&types.Chunk{}).Where("id = ?", id).Update("is_enabled", false).Error)
+		}},
+		{"flags", func(db *gorm.DB, id string) {
+			require.NoError(t, db.Model(&types.Chunk{}).Where("id = ?", id).Update("flags", 0).Error)
+		}},
+	} {
+		t.Run(change.name, func(t *testing.T) {
+			db := setupChunkTestDB(t)
+			repo := NewChunkRepository(db)
+			ctx := context.Background()
+
+			require.NoError(t, db.Create(&types.Chunk{
+				ID: "entry", TenantID: 7, KnowledgeBaseID: "kb", ChunkType: types.ChunkTypeFAQ,
+				ContentHash: "h", IsEnabled: true, Flags: types.ChunkFlagRecommended,
+			}).Error)
+			planned := []*types.Chunk{plannedFromDB(t, db, "entry")}
+
+			change.apply(db, "entry")
+
+			unchanged, err := repo.UnchangedChunks(ctx, 7, planned)
+			require.NoError(t, err)
+			require.Empty(t, unchanged, "the row moved since the plan; it is not the import's to delete")
+
+			removed, err := repo.DeleteChunksIfUnchanged(ctx, 7, planned)
+			require.NoError(t, err)
+			require.Empty(t, removed)
+			_, err = repo.GetChunkByID(ctx, 7, "entry")
+			require.NoError(t, err, "the concurrent edit survives")
+		})
+	}
+}
+
+// The read-back after the delete is scoped by tenant and id, so it also sees a
+// row another writer soft-deleted in the same window. That is the intended
+// behaviour, not a leak: the row is dead either way, the writer that deleted it
+// removes its vectors on its own path, and deleting already-dead vectors twice
+// is harmless. This test pins that reading so a future change to the read-back
+// is a deliberate decision rather than an accident.
+func TestDeleteChunksIfUnchangedReadBackCoversRowsAnotherWriterDeleted(t *testing.T) {
+	db := setupChunkTestDB(t)
+	repo := NewChunkRepository(db)
+	ctx := context.Background()
+
+	require.NoError(t, db.Create(&types.Chunk{
+		ID: "ours", TenantID: 7, KnowledgeBaseID: "kb", ChunkType: types.ChunkTypeFAQ, ContentHash: "h",
+	}).Error)
+	require.NoError(t, db.Create(&types.Chunk{
+		ID: "theirs", TenantID: 7, KnowledgeBaseID: "kb", ChunkType: types.ChunkTypeFAQ, ContentHash: "h",
+	}).Error)
+	planned := []*types.Chunk{
+		plannedFromDB(t, db, "ours"),
+		plannedFromDB(t, db, "theirs"),
+	}
+
+	// Another writer soft-deletes one planned row before this delete runs.
+	require.NoError(t, db.Where("id = ?", "theirs").Delete(&types.Chunk{}).Error)
+
+	removed, err := repo.DeleteChunksIfUnchanged(ctx, 7, planned)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"ours", "theirs"}, removed,
+		"both rows are unreachable afterwards; the caller may clear vectors for either")
+	_, err = repo.GetChunkByID(ctx, 7, "theirs")
+	require.Error(t, err, "neither row is live")
 }
