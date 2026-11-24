@@ -1750,7 +1750,7 @@ func (s *knowledgeService) executeFAQImport(ctx context.Context, taskID string, 
 		// check -- too late to stop before this batch's writes. Check ownership
 		// at the batch start, before anything in it is persisted.
 		if err := s.ensureFAQImportLeaseForWrite(ctx, kbID, taskID, progress.InstanceID, enqueuedAt); err != nil {
-			return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
+			return faqImportLeaseGateError(err)
 		}
 
 		// 1. 本批内的合并操作（Append 模式的智能合并）
@@ -1969,27 +1969,59 @@ func (s *knowledgeService) executeFAQImport(ctx context.Context, taskID string, 
 }
 
 // deleteReplacedFAQChunks removes the chunks replaced by a replace-mode import.
-// Vectors go first: a failed vector delete leaves both rows and vectors intact,
-// so a retry recomputes the same plan; a failed row delete leaves rows without
-// vectors, which are harmless (they cannot be retrieved) and are removed by the
-// retry.
+// The plan was computed before the caller re-checked ownership, so each row is
+// deleted only while it still carries the seq id and content hash the plan
+// picked it by: a row another writer rewrote in between belongs to that writer,
+// not to this import.
+//
+// Rows go first, and their vectors second, only for the rows this call actually
+// soft-deleted. Deleting vectors first would strip the vectors of a row that
+// changed between the identity check and the delete -- a live entry another
+// writer just reindexed -- which no retry restores. With this order a failed
+// vector delete leaves vectors behind for rows that are already unreachable;
+// that leaks storage but cannot corrupt a live entry, and the retry plan no
+// longer lists those rows.
 func (s *knowledgeService) deleteReplacedFAQChunks(ctx context.Context, taskID string,
 	tenantID uint64, kb *types.KnowledgeBase, faqKnowledge *types.Knowledge, chunksToDelete []*types.Chunk,
 ) error {
 	if len(chunksToDelete) == 0 {
 		return nil
 	}
-	if err := s.deleteFAQChunkVectors(ctx, kb, faqKnowledge, chunksToDelete); err != nil {
-		return fmt.Errorf("failed to delete chunk vectors: %w", err)
+	unchanged, err := s.chunkRepo.UnchangedChunks(ctx, tenantID, chunksToDelete)
+	if err != nil {
+		return fmt.Errorf("failed to re-read replaced chunks: %w", err)
 	}
-	chunkIDsToDelete := make([]string, 0, len(chunksToDelete))
-	for _, chunk := range chunksToDelete {
-		chunkIDsToDelete = append(chunkIDsToDelete, chunk.ID)
+	if skipped := len(chunksToDelete) - len(unchanged); skipped > 0 {
+		logger.Infof(ctx,
+			"FAQ import task %s: %d replaced chunks changed since the plan and are left alone",
+			taskID, skipped)
 	}
-	if err := s.chunkRepo.DeleteChunks(ctx, tenantID, chunkIDsToDelete); err != nil {
+	if len(unchanged) == 0 {
+		return nil
+	}
+	deletedIDs, err := s.chunkRepo.DeleteChunksIfUnchanged(ctx, tenantID, unchanged)
+	if err != nil {
 		return fmt.Errorf("failed to delete chunks: %w", err)
 	}
-	logger.Infof(ctx, "FAQ import task %s: deleted %d replaced chunks (including updates)", taskID, len(chunksToDelete))
+	if len(deletedIDs) == 0 {
+		logger.Infof(ctx, "FAQ import task %s: every replaced chunk changed before the delete; nothing to remove", taskID)
+		return nil
+	}
+	deleted := make(map[string]struct{}, len(deletedIDs))
+	for _, id := range deletedIDs {
+		deleted[id] = struct{}{}
+	}
+	removedChunks := make([]*types.Chunk, 0, len(deletedIDs))
+	for _, chunk := range unchanged {
+		if _, ok := deleted[chunk.ID]; ok {
+			removedChunks = append(removedChunks, chunk)
+		}
+	}
+	if err := s.deleteFAQChunkVectors(ctx, kb, faqKnowledge, removedChunks); err != nil {
+		return fmt.Errorf("failed to delete chunk vectors for %d deleted chunks: %w", len(removedChunks), err)
+	}
+	logger.Infof(ctx, "FAQ import task %s: deleted %d replaced chunks and their vectors (including updates)",
+		taskID, len(removedChunks))
 	return nil
 }
 
@@ -2283,10 +2315,12 @@ var errFAQImportLeaseUnverifiable = errors.New("FAQ import lease could not be ve
 // silent no-op, letting a second import be admitted while this one keeps
 // writing. When the key is gone, nobody holds it and it is taken back for this
 // run; when it names another task (or another instance of the same task id),
-// errFAQImportLeaseTaken stops this import. A Redis error is only logged: the
-// lease guards admission, and failing an import over a transient renewal error
-// would be worse than a late renewal (the ownership check at ProcessFAQImport
-// still runs on every attempt).
+// errFAQImportLeaseTaken stops this import.
+//
+// This is the progress-save renewal only. A Redis error is logged and the save
+// goes ahead: the record is what the initiator polls, and a transient error must
+// not freeze it. The gates in front of row writes do not use this and do not
+// fail open; see ensureFAQImportLeaseForWrite.
 func (s *knowledgeService) renewFAQImportLease(
 	ctx context.Context, kbID, taskID, instanceID string, enqueuedAt int64,
 ) error {
@@ -2383,19 +2417,38 @@ func (s *knowledgeService) renewFAQImportLeaseAllow(
 	return nil
 }
 
-// ensureFAQImportLeaseForWrite is the gate for a reversible write (progress,
-// batch saves). On a takeover it closes out this run's record (unless the taker
-// is a newer instance of the same task id) and reports the takeover, so the
-// caller stops with asynq.SkipRetry instead of writing beside the new owner.
+// ensureFAQImportLeaseForWrite is the gate in front of a batch's row writes.
+// On a takeover it closes out this run's record (unless the taker is a newer
+// instance of the same task id) and reports it, so the caller stops instead of
+// writing beside the new owner.
+//
+// Unlike the progress-save renewal it does not fail open when the lease store
+// cannot be reached. The caller is about to write rows, and a store that stops
+// answering is exactly how a partitioned run keeps writing after its lease has
+// lapsed and a new import has been admitted. The error is reported instead;
+// callers treat it as retryable because nothing of the batch has been written
+// yet, and the retry resumes from the progress cursor.
 func (s *knowledgeService) ensureFAQImportLeaseForWrite(ctx context.Context, kbID, taskID, instanceID string, enqueuedAt int64) error {
-	if err := s.renewFAQImportLease(ctx, kbID, taskID, instanceID, enqueuedAt); err != nil {
-		if errors.Is(err, errFAQImportLeaseTaken) &&
-			!s.faqImportLeaseHeldByAnotherInstanceOfSameTask(ctx, kbID, taskID, instanceID) {
-			s.markFAQImportStopped(ctx, taskID, instanceID, errFAQImportStoppedMessage)
-		}
-		return err
+	err := s.renewFAQImportLeaseAllow(ctx, kbID, taskID, instanceID, enqueuedAt, true)
+	if err == nil {
+		return nil
 	}
-	return nil
+	if errors.Is(err, errFAQImportLeaseTaken) &&
+		!s.faqImportLeaseHeldByAnotherInstanceOfSameTask(ctx, kbID, taskID, instanceID) {
+		s.markFAQImportStopped(ctx, taskID, instanceID, errFAQImportStoppedMessage)
+	}
+	return err
+}
+
+// faqImportLeaseGateError picks the asynq disposition for a failed write gate.
+// A takeover is final for this attempt, while an unreadable lease store is
+// retried: nothing of the batch has been written yet, and the retry resumes
+// from the progress cursor instead of being archived as failed.
+func faqImportLeaseGateError(err error) error {
+	if errors.Is(err, errFAQImportLeaseUnverifiable) {
+		return fmt.Errorf("FAQ import lease could not be verified: %w", err)
+	}
+	return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
 }
 
 // ensureFAQImportLeaseForWriteStrict is the gate for an irreversible write (the
@@ -3230,7 +3283,7 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 	// now that this attempt has passed the ownership check: with the key gone
 	// this takes it back, so the rest of the run is not unleased.
 	if err := s.ensureFAQImportLeaseForWrite(ctx, payload.KBID, payload.TaskID, payload.InstanceID, payload.EnqueuedAt); err != nil {
-		return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
+		return faqImportLeaseGateError(err)
 	}
 
 	// The check above ran before this attempt held the lease; an import that
@@ -4072,12 +4125,30 @@ func cloneFAQImportProgress(p *types.FAQImportProgress) *types.FAQImportProgress
 		return nil
 	}
 	c := *p
-	c.FailedEntries = append([]types.FAQFailedEntry(nil), p.FailedEntries...)
-	c.SuccessEntries = append([]types.FAQSuccessEntry(nil), p.SuccessEntries...)
-	c.ValidEntryIndices = append([]int(nil), p.ValidEntryIndices...)
-	c.MergeEntryIndices = append([]int(nil), p.MergeEntryIndices...)
-	c.MergeDetails = append([]types.FAQMergeDetail(nil), p.MergeDetails...)
+	// FAQFailedEntry carries its own string slices; copying only the outer slice
+	// would leave the writer and a reader sharing the backing arrays.
+	c.FailedEntries = cloneFAQFailedEntries(p.FailedEntries)
+	c.SuccessEntries = slices.Clone(p.SuccessEntries)
+	c.ValidEntryIndices = slices.Clone(p.ValidEntryIndices)
+	c.MergeEntryIndices = slices.Clone(p.MergeEntryIndices)
+	c.MergeDetails = slices.Clone(p.MergeDetails)
 	return &c
+}
+
+func cloneFAQFailedEntries(in []types.FAQFailedEntry) []types.FAQFailedEntry {
+	if in == nil {
+		return nil
+	}
+	out := make([]types.FAQFailedEntry, len(in))
+	copy(out, in)
+	for i := range out {
+		out[i].SimilarQuestions = slices.Clone(in[i].SimilarQuestions)
+		out[i].NegativeQuestions = slices.Clone(in[i].NegativeQuestions)
+		out[i].Answers = slices.Clone(in[i].Answers)
+		out[i].RemovedSimilarQuestions = slices.Clone(in[i].RemovedSimilarQuestions)
+		out[i].RemovedNegativeQuestions = slices.Clone(in[i].RemovedNegativeQuestions)
+	}
+	return out
 }
 
 func faqImportProgressExpired(progress *types.FAQImportProgress, now time.Time) bool {

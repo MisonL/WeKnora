@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -459,9 +460,11 @@ func TestMemoryMarkersOfUntouchedKBsAreSwept(t *testing.T) {
 	require.True(t, loaded, "a live marker is untouched")
 }
 
-// The gate before an irreversible write must not act on a lease it could not
-// read. Ordinary renewals keep the old fail-open behaviour on a transient error.
-func TestIrreversibleGateRefusesAnUnverifiableLease(t *testing.T) {
+// The gate before a write must not act on a lease it could not read, at either
+// tier: an ordinary batch writes rows just as an irreversible step does. Only
+// the periodic progress renewal keeps the fail-open behaviour, so a transient
+// outage does not freeze the record the initiator polls.
+func TestWriteGateRefusesAnUnverifiableLease(t *testing.T) {
 	svc, mr := newLeaseService(t)
 	ctx := context.Background()
 	require.NoError(t, svc.claimFAQImportLease(ctx, "kb-1", leaseInfo("mine")))
@@ -472,11 +475,29 @@ func TestIrreversibleGateRefusesAnUnverifiableLease(t *testing.T) {
 	require.ErrorIs(t,
 		svc.ensureFAQImportLeaseForWriteStrict(ctx, "kb-1", "mine", "inst-mine", 0),
 		errFAQImportLeaseUnverifiable)
-	require.NoError(t, svc.ensureFAQImportLeaseForWrite(ctx, "kb-1", "mine", "inst-mine", 0),
-		"an ordinary renewal still logs and continues")
+	require.ErrorIs(t, svc.ensureFAQImportLeaseForWrite(ctx, "kb-1", "mine", "inst-mine", 0),
+		errFAQImportLeaseUnverifiable)
+	require.NoError(t, svc.renewFAQImportLease(ctx, "kb-1", "mine", "inst-mine", 0),
+		"the progress renewal still logs and continues")
 
 	mr.SetError("")
 	require.NoError(t, svc.ensureFAQImportLeaseForWriteStrict(ctx, "kb-1", "mine", "inst-mine", 0))
+	require.NoError(t, svc.ensureFAQImportLeaseForWrite(ctx, "kb-1", "mine", "inst-mine", 0))
+}
+
+// A takeover is final for the attempt; an unreadable lease store is not. The
+// batch gate's caller writes its error straight into the asynq disposition, so
+// an unverifiable lease must be retryable -- nothing of the batch was written,
+// and a retry resumes from the progress cursor.
+func TestWriteGateErrorKeepsAnUnverifiableLeaseRetryable(t *testing.T) {
+	gateErr := faqImportLeaseGateError(fmt.Errorf("wrapped: %w", errFAQImportLeaseUnverifiable))
+	require.NotErrorIs(t, gateErr, asynq.SkipRetry,
+		"an unreadable lease store is retried, not archived")
+	require.ErrorIs(t, gateErr, errFAQImportLeaseUnverifiable)
+
+	takeover := faqImportLeaseGateError(errFAQImportLeaseTaken)
+	require.ErrorIs(t, takeover, asynq.SkipRetry,
+		"another import owns the knowledge base; retrying would only be refused again")
 }
 
 // An unreachable store is not proof of a takeover: the heartbeat keeps trying

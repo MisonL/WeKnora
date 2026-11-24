@@ -109,6 +109,17 @@ type ChunkRepository interface {
 	DeleteChunk(ctx context.Context, tenantID uint64, id string) error
 	// DeleteChunks deletes chunks by IDs in batch
 	DeleteChunks(ctx context.Context, tenantID uint64, ids []string) error
+	// UnchangedChunks returns the subset of chunks whose rows still carry the
+	// seq id and content hash the caller planned from. A row a concurrent writer
+	// rewrote no longer matches. Used to fence a deletion whose plan was
+	// computed before the caller re-checked that it still owns the work.
+	UnchangedChunks(ctx context.Context, tenantID uint64, chunks []*types.Chunk) ([]*types.Chunk, error)
+	// DeleteChunksIfUnchanged deletes each listed chunk only while its row still
+	// carries the planned seq id and content hash, and returns the ids it left
+	// soft-deleted. Rows that changed since the plan are left alone and absent
+	// from the result, so a caller can scope follow-up work (vector deletion) to
+	// exactly the rows it removed.
+	DeleteChunksIfUnchanged(ctx context.Context, tenantID uint64, chunks []*types.Chunk) ([]string, error)
 	// DeleteChunksByKnowledgeID deletes chunks by knowledge id
 	DeleteChunksByKnowledgeID(ctx context.Context, tenantID uint64, knowledgeID string) error
 	// DeleteByKnowledgeList deletes all chunks for a knowledge list

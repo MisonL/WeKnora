@@ -676,6 +676,101 @@ func (r *chunkRepository) DeleteChunk(ctx context.Context, tenantID uint64, id s
 	return r.db.WithContext(ctx).Where("tenant_id = ? AND id = ?", tenantID, id).Delete(&types.Chunk{}).Error
 }
 
+// UnchangedChunks returns the planned chunks whose rows still hold the same
+// seq id and content hash. A replace-mode import plans its deletions from a
+// snapshot taken before it re-checks ownership, so between the two a concurrent
+// writer can rewrite a row the plan had picked; deleting that row would discard
+// the newer content. The comparison is on the identity the plan selected the row
+// by, which is exactly what makes it a valid target.
+func (r *chunkRepository) UnchangedChunks(
+	ctx context.Context, tenantID uint64, chunks []*types.Chunk,
+) ([]*types.Chunk, error) {
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+	ids := make([]string, 0, len(chunks))
+	for _, c := range chunks {
+		ids = append(ids, c.ID)
+	}
+	var rows []*types.Chunk
+	if err := r.db.WithContext(ctx).
+		Select("id, seq_id, COALESCE(content_hash, '') AS content_hash").
+		Where("tenant_id = ? AND id IN ?", tenantID, ids).
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	current := make(map[string]*types.Chunk, len(rows))
+	for _, row := range rows {
+		current[row.ID] = row
+	}
+	unchanged := make([]*types.Chunk, 0, len(chunks))
+	for _, planned := range chunks {
+		row := current[planned.ID]
+		if row == nil || row.SeqID != planned.SeqID || row.ContentHash != planned.ContentHash {
+			continue
+		}
+		unchanged = append(unchanged, planned)
+	}
+	return unchanged, nil
+}
+
+// DeleteChunksIfUnchanged deletes each chunk only while its row still carries
+// the planned seq id and content hash, and returns the ids it left soft-deleted.
+// Rows a concurrent write changed since the plan are left untouched and are not
+// in the result.
+//
+// The ids are read back after each batch rather than assumed from the plan: the
+// row can change between the statement's check and its execution, and the caller
+// deletes vectors with them. Reporting a row we did not delete would strip the
+// vectors of another writer's entry; reporting too few only leaves vectors of a
+// dead row behind, which no query can reach.
+func (r *chunkRepository) DeleteChunksIfUnchanged(
+	ctx context.Context, tenantID uint64, chunks []*types.Chunk,
+) ([]string, error) {
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+	const batchSize = 200
+	deleted := make([]string, 0, len(chunks))
+	for i := 0; i < len(chunks); i += batchSize {
+		end := i + batchSize
+		if end > len(chunks) {
+			end = len(chunks)
+		}
+		batch := chunks[i:end]
+		var conds []string
+		var args []interface{}
+		batchIDs := make([]string, 0, len(batch))
+		for _, c := range batch {
+			// COALESCE: a row whose seq id was never assigned (lite/SQLite, no
+			// sequence) holds NULL, which `= 0` would not match even though the
+			// planned chunk reads back as 0.
+			conds = append(conds, "(id = ? AND COALESCE(seq_id, 0) = ? AND COALESCE(content_hash, '') = ?)")
+			args = append(args, c.ID, c.SeqID, c.ContentHash)
+			batchIDs = append(batchIDs, c.ID)
+		}
+		res := r.db.WithContext(ctx).
+			Where("tenant_id = ?", tenantID).
+			Where(strings.Join(conds, " OR "), args...).
+			Delete(&types.Chunk{})
+		if res.Error != nil {
+			return deleted, res.Error
+		}
+		if res.RowsAffected == 0 {
+			continue
+		}
+		var gone []string
+		if err := r.db.WithContext(ctx).Unscoped().
+			Model(&types.Chunk{}).
+			Where("tenant_id = ? AND id IN ? AND deleted_at IS NOT NULL", tenantID, batchIDs).
+			Pluck("id", &gone).Error; err != nil {
+			return deleted, err
+		}
+		deleted = append(deleted, gone...)
+	}
+	return deleted, nil
+}
+
 // DeleteChunks deletes chunks by IDs in batch.
 // To avoid MySQL Error 1390 (too many placeholders), IDs are split into batches.
 func (r *chunkRepository) DeleteChunks(ctx context.Context, tenantID uint64, ids []string) error {

@@ -77,12 +77,14 @@ func (s *knowledgeService) ListFAQEntries(ctx context.Context,
 		}
 	}
 	if len(tagIDs) > 0 {
-		tags, err := s.tagRepo.GetByIDs(ctx, effectiveTenantID, tagIDs)
-		if err == nil {
-			for _, tag := range tags {
-				tagNameMap[tag.ID] = tag.Name
-				tagSeqIDMap[tag.ID] = tag.SeqID
-			}
+		var err error
+		tagNameMap, tagSeqIDMap, err = s.faqTagNameMaps(ctx, effectiveTenantID, tagIDs)
+		if err != nil {
+			// A listing without names is not "uncategorised": it is a listing
+			// whose classification could not be read. Returning the error keeps
+			// an export built on it from silently carrying no tag identity,
+			// which would re-import every entry as uncategorised.
+			return nil, err
 		}
 	}
 
@@ -100,6 +102,25 @@ func (s *knowledgeService) ListFAQEntries(ctx context.Context,
 		entries = append(entries, entry)
 	}
 	return types.NewPageResult(total, page, entries), nil
+}
+
+func (s *knowledgeService) faqTagNameMaps(
+	ctx context.Context, tenantID uint64, tagIDs []string,
+) (map[string]string, map[string]int64, error) {
+	names := make(map[string]string, len(tagIDs))
+	seqIDs := make(map[string]int64, len(tagIDs))
+	if s.tagRepo == nil {
+		return names, seqIDs, nil
+	}
+	tags, err := s.tagRepo.GetByIDs(ctx, tenantID, tagIDs)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, tag := range tags {
+		names[tag.ID] = tag.Name
+		seqIDs[tag.ID] = tag.SeqID
+	}
+	return names, seqIDs, nil
 }
 
 // faqCreateIndexBudget caps the indexing step of a single interactive FAQ
