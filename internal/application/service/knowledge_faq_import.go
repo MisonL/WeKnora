@@ -2026,6 +2026,10 @@ func (s *knowledgeService) deleteReplacedFAQChunks(ctx context.Context, taskID s
 		for _, chunk := range removedChunks {
 			deletedChunkIDs = append(deletedChunkIDs, chunk.ID)
 		}
+		// Every one of these paths ends with the vectors still in place:
+		// deleteFAQChunkVectors returns before its own delete when the engine or
+		// the index list cannot be built, so the ids must be handed over here
+		// rather than only around the engine call.
 		s.enqueueFAQIndexDeleteFallback(ctx, tenantID, kb, deletedChunkIDs)
 		return fmt.Errorf("failed to delete chunk vectors for %d deleted chunks: %w", len(removedChunks), err)
 	}
@@ -2497,7 +2501,9 @@ func faqImportLeaseGateError(err error) error {
 	if errors.Is(err, errFAQImportLeaseUnverifiable) {
 		return fmt.Errorf("FAQ import lease could not be verified: %w", err)
 	}
-	return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
+	// %w on both: SkipRetry is what asynq reads, and the cause stays reachable
+	// for errors.Is (a takeover reason that a caller logs or matches on).
+	return fmt.Errorf("%w: %w", asynq.SkipRetry, err)
 }
 
 // ensureFAQImportLeaseForWriteStrict is the gate for an irreversible write (the
@@ -3467,6 +3473,17 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 		return fmt.Errorf("%w: %s", asynq.SkipRetry, message)
 	}
 
+	// 缓存的索引只对同一份 payload 有效：同一 task id 的旧记录可能带着超出
+	// 当前条目数的索引，直接拿来遍历 payload.Entries 会越界。
+	reusableValidation := existingProgress != nil &&
+		len(existingProgress.ValidEntryIndices) > 0 &&
+		faqEntryIndicesInRange(existingProgress.ValidEntryIndices, len(payload.Entries))
+	if existingProgress != nil && len(existingProgress.ValidEntryIndices) > 0 && !reusableValidation {
+		logger.Warnf(ctx,
+			"FAQ import: cached validation indices for task %s do not fit %d entries; re-validating",
+			payload.TaskID, len(payload.Entries))
+	}
+
 	progress := &types.FAQImportProgress{
 		TaskID:         payload.TaskID,
 		KBID:           payload.KBID,
@@ -3487,27 +3504,21 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 		UpdatedAt:      time.Now().Unix(),
 		DryRun:         payload.DryRun,
 	}
-	if err := s.saveFAQImportProgressOrStop(ctx, progress); err != nil {
-		return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
-	}
-
-	// 缓存的索引只对同一份 payload 有效：同一 task id 的旧记录可能带着超出
-	// 当前条目数的索引，直接拿来遍历 payload.Entries 会越界。
-	reusableValidation := existingProgress != nil &&
-		len(existingProgress.ValidEntryIndices) > 0 &&
-		faqEntryIndicesInRange(existingProgress.ValidEntryIndices, len(payload.Entries))
-	if existingProgress != nil && len(existingProgress.ValidEntryIndices) > 0 && !reusableValidation {
-		logger.Warnf(ctx,
-			"FAQ import: cached validation indices for task %s do not fit %d entries; re-validating",
-			payload.TaskID, len(payload.Entries))
-	}
 	var validEntryIndices []int
 	if reusableValidation {
-		// 重试时直接使用之前的验证结果
+		// Populate the record from the previous attempt before writing it. This
+		// first save replaces whatever the previous attempt left, and an
+		// attempt that dies between here and its next save (a refused lease a
+		// moment later, a failed embed) would otherwise leave behind a record
+		// with no validation result and cursor 0 -- the retry after it then
+		// re-imports from the start, replanning deletions over entries this
+		// task already wrote.
+		//
+		// Must be written back to the new record and persisted: NextEntryIndex
+		// is an offset into validEntries, and a later retry that drops the
+		// validation result and recomputes a different valid set would point
+		// the cursor at other data.
 		validEntryIndices = existingProgress.ValidEntryIndices
-		// 必须写回新 progress 并落库：NextEntryIndex 是相对 validEntries 的
-		// 偏移，一旦后续重试丢掉验证结果、重新算出不同的有效条目集合，
-		// 游标就会指向另一条数据。
 		progress.ValidEntryIndices = validEntryIndices
 		progress.FailedCount = existingProgress.FailedCount
 		progress.FailedEntries = existingProgress.FailedEntries
@@ -3520,10 +3531,17 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 		if len(existingProgress.MergeDetails) > 0 {
 			progress.MergeDetails = existingProgress.MergeDetails
 		}
+		carryFAQImportResumeCursor(progress, existingProgress)
 		logger.Infof(ctx, "Reusing previous validation result: valid=%d, failed=%d, partial_failed=%d, merged=%d",
 			len(validEntryIndices), progress.FailedCount, progress.PartialFailedCount, progress.MergedCount)
-	} else {
-		// 第一步：执行验证（无论是 dry run 还是 import 模式都需要验证）
+	}
+
+	if err := s.saveFAQImportProgressOrStop(ctx, progress); err != nil {
+		return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
+	}
+
+	// 第一步：执行验证（无论是 dry run 还是 import 模式都需要验证）
+	if !reusableValidation {
 		validEntryIndices = s.executeFAQDryRunValidation(ctx, &payload, progress)
 		// 保存验证通过的索引，用于重试时跳过验证
 		progress.ValidEntryIndices = validEntryIndices
@@ -3659,6 +3677,27 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 
 	// 最终完成处理（生成失败条目 CSV 等）
 	return s.finalizeFAQValidation(ctx, &payload, progress, originalTotalEntries)
+}
+
+// carryFAQImportResumeCursor restores the retry cursor and the display list of
+// entries this task already imported. Only call it when the cached validation
+// result is reused: the cursor is a position in validEntries, and a fresh
+// re-validation can produce a different, shorter set.
+func carryFAQImportResumeCursor(progress, existing *types.FAQImportProgress) {
+	if progress == nil || existing == nil {
+		return
+	}
+	cursor := existing.NextEntryIndex
+	if cursor < 0 {
+		cursor = 0
+	}
+	if limit := len(existing.ValidEntryIndices); cursor > limit {
+		cursor = limit
+	}
+	progress.NextEntryIndex = cursor
+	if len(existing.SuccessEntries) > 0 {
+		progress.SuccessEntries = existing.SuccessEntries
+	}
 }
 
 // finalizeFAQValidation 完成 FAQ 验证/导入任务，生成失败条目 CSV（如果有）
