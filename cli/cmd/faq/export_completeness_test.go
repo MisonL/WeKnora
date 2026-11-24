@@ -43,6 +43,7 @@ func (p *pagedService) GetFAQImportProgress(context.Context, string) (*sdk.FAQIm
 	panic("not used")
 }
 
+// entryPage serves one page of the synthetic listing: rows [from, to).
 func entryPage(from, to int) []sdk.FAQEntry {
 	rows := make([]sdk.FAQEntry, 0, to-from)
 	for i := from; i < to; i++ {
@@ -51,18 +52,35 @@ func entryPage(from, to int) []sdk.FAQEntry {
 	return rows
 }
 
+// pagesOf splits n synthetic rows the way the endpoint paginates them: full
+// pages of exportPageSize plus one short tail. Only a full page makes the
+// export ask for the next one, so fixtures with a short first page cannot
+// exercise page-to-page drift.
+func pagesOf(n int) [][]sdk.FAQEntry {
+	pages := make([][]sdk.FAQEntry, 0, n/exportPageSize+1)
+	for from := 0; from < n; from += exportPageSize {
+		to := from + exportPageSize
+		if to > n {
+			to = n
+		}
+		pages = append(pages, entryPage(from, to))
+	}
+	return pages
+}
+
 // A complete read is a normal export.
 func TestExportAcceptsACompleteRead(t *testing.T) {
+	const total = exportPageSize + 5
 	svc := &pagedService{
-		pages: [][]sdk.FAQEntry{entryPage(0, exportPageSize), entryPage(exportPageSize, 25)},
-		total: 25,
+		pages: pagesOf(total),
+		total: total,
 	}
 	got, err := exportEntries(context.Background(), svc, "kb-1")
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}
-	if len(got) != 25 {
-		t.Fatalf("read %d entries, want 25", len(got))
+	if len(got) != total {
+		t.Fatalf("read %d entries, want %d", len(got), total)
 	}
 }
 
@@ -72,8 +90,8 @@ func TestExportAcceptsACompleteRead(t *testing.T) {
 // the same one. A total that changes between pages is the detectable signal.
 func TestExportRefusesAReadTheKnowledgeBaseChangedUnder(t *testing.T) {
 	svc := &pagedService{
-		pages:  [][]sdk.FAQEntry{entryPage(0, exportPageSize), entryPage(exportPageSize, 25)},
-		totals: []int64{40, 39},
+		pages:  pagesOf(exportPageSize + 5),
+		totals: []int64{exportPageSize + 5, exportPageSize + 4},
 	}
 	got, err := exportEntries(context.Background(), svc, "kb-1")
 	if err == nil {
@@ -87,14 +105,14 @@ func TestExportRefusesAReadTheKnowledgeBaseChangedUnder(t *testing.T) {
 	}
 }
 
-// The server reported 40 rows but paging ended at 25 (entries were deleted
-// between page reads, or the listing and the count disagree). Returning those
-// 25 quietly would make a backup that --mode replace later deletes the other
-// 15 with.
+// The server reported more rows than paging ended at (entries were deleted
+// between page reads, or the listing and the count disagree). Returning the
+// short read quietly would make a backup that --mode replace later deletes the
+// rest with.
 func TestExportRefusesAShortRead(t *testing.T) {
 	svc := &pagedService{
-		pages: [][]sdk.FAQEntry{entryPage(0, exportPageSize), entryPage(exportPageSize, 25)},
-		total: 40,
+		pages: pagesOf(exportPageSize + 5),
+		total: exportPageSize + 10,
 	}
 	got, err := exportEntries(context.Background(), svc, "kb-1")
 	if err == nil {
@@ -109,5 +127,25 @@ func TestExportRefusesAShortRead(t *testing.T) {
 	}
 	if appErr.Code != cmdutil.CodeOperationFailed {
 		t.Fatalf("code = %s, want %s", appErr.Code, cmdutil.CodeOperationFailed)
+	}
+}
+
+// The other direction of the same guard: rows were added while the pass ran,
+// so paging turned up more than page 1's total. Those extra rows are a slice
+// of a state the total does not describe, and the snapshot is refused too.
+func TestExportRefusesAReadThatOutranItsTotal(t *testing.T) {
+	svc := &pagedService{
+		pages: pagesOf(exportPageSize + 5),
+		total: exportPageSize,
+	}
+	got, err := exportEntries(context.Background(), svc, "kb-1")
+	if err == nil {
+		t.Fatalf("an over-long read returned %d entries and no error; want a refusal", len(got))
+	}
+	if got != nil {
+		t.Fatalf("a refused export must not return partial data")
+	}
+	if !strings.Contains(err.Error(), "changed while it was being read") {
+		t.Fatalf("error should say the knowledge base changed, got: %v", err)
 	}
 }

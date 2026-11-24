@@ -39,6 +39,9 @@ type scriptedPasses struct {
 	calls int
 	// listCalls counts every ListFAQEntries call, for cost assertions.
 	listCalls int
+	// totalsByPage overrides the total reported by one (1-based) call number,
+	// which is how a pass that mixed two states looks from the CLI.
+	totalsByPage map[int]int64
 }
 
 func (s *scriptedPasses) ListFAQEntries(_ context.Context, _ string, page, _ int, _ int64, _, _, _ string) (*sdk.FAQEntriesPage, error) {
@@ -52,13 +55,17 @@ func (s *scriptedPasses) ListFAQEntries(_ context.Context, _ string, page, _ int
 		idx = len(s.passes) - 1
 	}
 	pages := s.passes[idx]
+	total := s.total
+	if override, ok := s.totalsByPage[s.listCalls]; ok {
+		total = override
+	}
 	if s.calls >= len(pages) {
 		s.calls++
-		return &sdk.FAQEntriesPage{Total: s.total, Page: page}, nil
+		return &sdk.FAQEntriesPage{Total: total, Page: page}, nil
 	}
 	rows := pages[s.calls]
 	s.calls++
-	return &sdk.FAQEntriesPage{Total: s.total, Page: page, Entries: rows}, nil
+	return &sdk.FAQEntriesPage{Total: total, Page: page, Entries: rows}, nil
 }
 
 func (s *scriptedPasses) UpsertFAQEntries(context.Context, string, *sdk.FAQBatchUpsertPayload) (string, error) {
@@ -125,31 +132,38 @@ func TestExportTwoPassStillReturnsTheStableSnapshot(t *testing.T) {
 // the read looks complete. The KB then settles: pass 2 and pass 3 agree, and
 // only their content may be handed back.
 func TestExportResamplesPastADriftThatKeepsTheTotal(t *testing.T) {
-	// Pass 1: page 1 read the old state (r1..r20); page 2, after delete(r1)
-	// + insert(r26) with the total still 25, served the new ordering's tail
-	// -- so q1 (deleted) is present and q21 (shifted across the boundary) is
+	const total = exportPageSize + 25
+	// Pass 1: page 1 read the old state (r1..r100); page 2, after delete(r1)
+	// + insert(r126) with the total still 125, served the new ordering's tail
+	// -- so q1 (deleted) is present and q101 (shifted across the boundary) is
 	// missing.
-	drifted := [][]sdk.FAQEntry{rowsFrom(0, 20), rowsFrom(21, 26)}
-	// Pass 2 onwards: the settled state r2..r26.
-	settled := [][]sdk.FAQEntry{rowsFrom(1, 21), rowsFrom(21, 26)}
-	svc := &scriptedPasses{passes: [][][]sdk.FAQEntry{drifted, settled}, total: 25}
+	drifted := [][]sdk.FAQEntry{
+		rowsFrom(0, exportPageSize),
+		rowsFrom(exportPageSize+1, total+1),
+	}
+	// Pass 2 onwards: the settled state r2..r126.
+	settled := [][]sdk.FAQEntry{
+		rowsFrom(1, exportPageSize+1),
+		rowsFrom(exportPageSize+1, total+1),
+	}
+	svc := &scriptedPasses{passes: [][][]sdk.FAQEntry{drifted, settled}, total: total}
 
 	got, err := exportEntries(context.Background(), svc, "kb-1")
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}
 	qs := questions(got)
-	if len(got) != 25 {
-		t.Fatalf("snapshot has %d entries, want 25: %s", len(got), qs)
+	if len(got) != total {
+		t.Fatalf("snapshot has %d entries, want %d: %s", len(got), total, qs)
 	}
 	if err := notContains(qs, "q1"); err != nil {
 		t.Fatal(err)
 	}
-	if !contains(qs, "q21") {
-		t.Fatalf("snapshot missed q21 (the row that drifted across the page boundary): %s", qs)
+	if !contains(qs, "q101") {
+		t.Fatalf("snapshot missed q101 (the row that drifted across the page boundary): %s", qs)
 	}
-	if !contains(qs, "q26") {
-		t.Fatalf("snapshot missed q26 (inserted during pass 1): %s", qs)
+	if !contains(qs, "q126") {
+		t.Fatalf("snapshot missed q126 (inserted during pass 1): %s", qs)
 	}
 }
 
@@ -157,14 +171,14 @@ func TestExportResamplesPastADriftThatKeepsTheTotal(t *testing.T) {
 // pass 3: passes 2 and 3 match and the export succeeds with that content.
 func TestExportSucceedsWhenTheKnowledgeBaseSettlesWithinTheRetryCap(t *testing.T) {
 	a := rowsFrom(0, 2) // q1,q2
-	b := rowsFrom(1, 4) // q2,q3,q4
+	b := rowsFrom(1, 3) // q2,q3
 	svc := &scriptedPasses{passes: [][][]sdk.FAQEntry{{a}, {b}}, total: 2}
 	got, err := exportEntries(context.Background(), svc, "kb-1")
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}
-	if questions(got) != "q2,q3,q4" {
-		t.Fatalf("snapshot = %s, want the settled q2,q3,q4", questions(got))
+	if questions(got) != "q2,q3" {
+		t.Fatalf("snapshot = %s, want the settled q2,q3", questions(got))
 	}
 	if svc.listCalls != 3 {
 		t.Fatalf("%d list calls, want 3 passes (two unstable, third confirming)", svc.listCalls)
@@ -208,6 +222,40 @@ func TestExportFailsAfterThreeUnstablePasses(t *testing.T) {
 	if svc.listCalls != 3 {
 		t.Fatalf("%d list calls, want the export to stop at the 3-pass cap", svc.listCalls)
 	}
+}
+
+// A pass that mixes two states of its own (the total moved between its pages)
+// must not be fatal on its own: the export retries it like any other unstable
+// read, and a later read that matches the last stable one is the snapshot.
+func TestExportRetriesAPassWhoseOwnPagesDisagreed(t *testing.T) {
+	const total = exportPageSize + 5
+	stable := pagesOfStable(total)
+	svc := &scriptedPasses{passes: [][][]sdk.FAQEntry{stable}, total: total}
+	// Pass 2's second page reports a different total.
+	svc.totalsByPage = map[int]int64{2: total + 1}
+	got, err := exportEntries(context.Background(), svc, "kb-1")
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if len(got) != total {
+		t.Fatalf("snapshot has %d entries, want %d", len(got), total)
+	}
+	// Three full reads of two pages each: one stable, one mixed, one confirming.
+	if svc.listCalls != 6 {
+		t.Fatalf("%d list calls, want the mixed pass retried and the result re-confirmed", svc.listCalls)
+	}
+}
+
+func pagesOfStable(n int) [][]sdk.FAQEntry {
+	pages := make([][]sdk.FAQEntry, 0, n/exportPageSize+1)
+	for from := 0; from < n; from += exportPageSize {
+		to := from + exportPageSize
+		if to > n {
+			to = n
+		}
+		pages = append(pages, rowsFrom(from, to))
+	}
+	return pages
 }
 
 // The stability comparison must not report a spurious mismatch over details
@@ -266,10 +314,15 @@ func TestCanonicalJSONIgnoresObjectKeyOrder(t *testing.T) {
 		t.Fatal("changed values must not compare equal")
 	}
 	// Numbers survive the round trip exactly (no float re-serialisation).
-	precise := json.RawMessage(`{"id":100000001}`)
-	precise2 := json.RawMessage(`{"id":100000001}`)
-	equal, err = canonicalJSONEqual(precise, precise2)
-	if err != nil || !equal {
-		t.Fatalf("large ints must survive normalisation unchanged: equal=%v err=%v", equal, err)
+	// 9007199254740992 and 9007199254740993 are the same float64; only a
+	// json.Number path can tell them apart.
+	precise := json.RawMessage(`{"id":9007199254740993}`)
+	nearby := json.RawMessage(`{"id":9007199254740992}`)
+	equal, err = canonicalJSONEqual(precise, nearby)
+	if err != nil {
+		t.Fatalf("canonicalise: %v", err)
+	}
+	if equal {
+		t.Fatal("integers above 2^53 must not collapse onto the same float value")
 	}
 }

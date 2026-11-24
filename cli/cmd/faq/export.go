@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -22,18 +23,34 @@ type FAQService interface {
 	GetFAQImportProgress(ctx context.Context, taskID string) (*sdk.FAQImportProgress, error)
 }
 
-// exportPageSize is the server's page size for FAQ entries. The list endpoint
-// returns at most this many rows per call.
-const exportPageSize = 20
+// exportPageSize is the page size the export asks for. The list endpoint
+// accepts up to 1000 per call; 100 keeps a full pass to a handful of requests
+// without a single response growing large enough to dominate memory.
+const exportPageSize = 100
 
 // maxExportPasses caps how many full collections the export may run looking for
 // two consecutive identical ones. The list is offset-paginated, so any
 // concurrent modification can shift rows across page boundaries and mix two
-// states into one snapshot; two identical full passes are the strongest signal
-// the endpoint offers that the knowledge base was idle throughout. A knowledge
-// base that has not settled after this many reads is refused rather than
-// handed back as a snapshot of nothing in particular.
+// states into one snapshot. Two identical consecutive passes are the strongest
+// signal this endpoint offers that the knowledge base was idle throughout; the
+// check is a heuristic, not a consistency guarantee -- a writer that happens to
+// keep both passes in the same mixed state cannot be told apart from an idle
+// knowledge base. A knowledge base that has not settled after this many reads
+// is refused rather than handed back as a snapshot of nothing in particular.
 const maxExportPasses = 3
+
+// errExportUnstable marks a pass whose own pages disagreed with each other.
+// Such a pass mixes two states and is useless as a snapshot, but a later full
+// read still can be.
+var errExportUnstable = errors.New("the knowledge base changed while it was being read")
+
+// unstablePassError reports one mixed pass with the CLI's operation-failed code
+// while staying detectable by errors.Is.
+func unstablePassError(message string) error {
+	e := cmdutil.NewError(cmdutil.CodeOperationFailed, message)
+	e.Cause = errExportUnstable
+	return e
+}
 
 type exportOptions struct {
 	KB string
@@ -54,18 +71,20 @@ payload's entry shape (standard_question / similar_questions / answers / ...).
 
 The output is a snapshot for backup or for feeding back to 'faq import'. It
 carries no import state. Entry ids are written as the optional import "id"
-field, so a snapshot can be re-imported where an id is still free; the server
-drops any id that is already taken rather than failing the import. Tags travel
-by tag_name only: the server resolves an import's tag by tag_id first when
-that id still exists in the target knowledge base, so a carried-over tag id
-could collide with a different tag after a migration; names resolve back to
-the right tag in a same-tenant round trip and cannot collide across tenants.
+field. The server keeps one only below its sequence start (100000000) and only
+when no row already holds it, and a replace-mode import keeps none -- so the
+ids survive on SQLite deployments but not on PostgreSQL, where every id this
+server assigns is at or above the sequence start. Tags travel by tag_name
+only: the server resolves an import's tag by tag_id first when that id still
+exists in the target knowledge base, so a carried-over tag id could collide
+with a different tag after a migration; names resolve back to the right tag in
+a same-tenant round trip and cannot collide across tenants. Renaming a tag
+between export and import is therefore not followed.
 
-The list endpoint pages 20 rows at a time and offset paging is not stable
-under concurrent modification, so the export reads the whole list at least
-twice and only writes a snapshot two consecutive reads agreed on. A knowledge
-base that keeps changing under the read is refused (exit 1) rather than
-exported as a mixed snapshot.`,
+Offset paging is not stable under concurrent modification, so the export reads
+the whole list at least twice and only writes a snapshot two consecutive reads
+agreed on. A knowledge base that keeps changing under the read is refused
+(exit 1) rather than exported as a mixed snapshot.`,
 		Example: `  weknora faq export --kb kb_abc --out faq-backup.json
   weknora faq export --kb kb_abc | jq length`,
 		Args: cobra.NoArgs,
@@ -140,15 +159,24 @@ func runExport(ctx context.Context, opts *exportOptions, svc FAQService) error {
 // knowledge base that never settles is refused -- a snapshot mixing two
 // states, fed to `faq import --mode replace`, deletes the entries it does not
 // list, so a wrong snapshot is worse than no snapshot. Within each pass the
-// total from page 1 is still the reference, so a pass whose own pages report
-// different totals is refused immediately; the two-pass comparison is built
-// on top of that guard, not instead of it. The caller retries while the
-// knowledge base is idle.
+// total from page 1 is still the reference: a pass whose own pages report
+// different totals cannot be compared with anything and is retried like any
+// other disagreeing read, but it never becomes the snapshot. The caller
+// retries while the knowledge base is idle.
 func exportEntries(ctx context.Context, svc FAQService, kbID string) ([]sdk.FAQEntryPayload, error) {
 	var previous []sdk.FAQEntryPayload
+	var unstable error
 	for pass := 1; pass <= maxExportPasses; pass++ {
 		current, err := exportPass(ctx, svc, kbID, pass)
 		if err != nil {
+			if errors.Is(err, errExportUnstable) {
+				// This read mixed two states, so it cannot be a candidate. The
+				// previous stable read stays as the comparison point: a later
+				// full read that matches it is the same evidence two consecutive
+				// passes would have given.
+				unstable = err
+				continue
+			}
 			return nil, err
 		}
 		if previous != nil && snapshotsEqual(previous, current) {
@@ -156,8 +184,11 @@ func exportEntries(ctx context.Context, svc FAQService, kbID string) ([]sdk.FAQE
 		}
 		previous = current
 	}
+	if unstable != nil {
+		return nil, unstable
+	}
 	return nil, cmdutil.NewError(cmdutil.CodeOperationFailed, fmt.Sprintf(
-		"export aborted after %d full reads: the knowledge base changed while it was being read (no two reads returned the same entries); retry while it is idle",
+		"export aborted after %d full reads: the knowledge base changed while it was being read (no two consecutive reads returned the same entries); retry while it is idle",
 		maxExportPasses))
 }
 
@@ -168,10 +199,13 @@ func exportPass(ctx context.Context, svc FAQService, kbID string, passNum int) (
 	seen := make(map[int64]struct{})
 	var total int64
 	fail := func(format string, args ...any) error {
-		return cmdutil.NewError(cmdutil.CodeOperationFailed, fmt.Sprintf(format, args...))
+		return unstablePassError(fmt.Sprintf(format, args...))
 	}
 	finish := func() ([]sdk.FAQEntryPayload, error) {
-		if total > int64(len(out)) {
+		// Either direction means the pages do not add up to the total the first
+		// page reported: rows were removed (fewer read) or added (more read)
+		// while the pass ran. Both mix two states and are retried.
+		if total != int64(len(out)) {
 			return nil, fail(
 				"export read %d of %d entries; the knowledge base changed while it was being read, retry while it is idle",
 				len(out), total)
@@ -335,10 +369,13 @@ func payloadFromEntry(e sdk.FAQEntry) sdk.FAQEntryPayload {
 		IsEnabled:         &enabled,
 		IsRecommended:     &recommended,
 	}
-	// The client's seq id is informational for a snapshot but part of the
-	// entry it came from, and the server accepts it on import where it cannot
-	// collide (it drops it otherwise). Keeping it makes a round trip faithful
-	// and matches what the server's own JSON export writes.
+	// The client's seq id is part of the entry it came from and is kept in the
+	// snapshot, but only a value below the server's sequence start can ever be
+	// preserved: the server drops an id at or above FAQExternalSeqIDLimit
+	// (100000000) and an id already held by a row, and a replace-mode import
+	// drops every id. On PostgreSQL, where the sequence starts at that limit,
+	// every id this server assigns is therefore dropped on import and the row
+	// gets a fresh one; SQLite deployments (ids from 1) do keep them.
 	if e.ID != 0 {
 		id := e.ID
 		p.ID = &id
@@ -380,6 +417,12 @@ func writeFileAtomic(path string, data []byte) error {
 	}
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }()
+	// CreateTemp opens 0600; a snapshot replaces a backup file the caller
+	// already has, so match the mode an ordinary write would have given it.
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		return err
@@ -391,7 +434,16 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	// Persist the directory entry too: without it a power loss can keep the
+	// old name pointing at the old content after the data blocks are on disk.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 func lastSlash(s string) int {
