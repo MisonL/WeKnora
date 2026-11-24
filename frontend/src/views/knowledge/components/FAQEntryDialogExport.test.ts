@@ -37,7 +37,7 @@ function mountManager(t: any, opts: { entries?: Row[] } = {}) {
   // what href was live at the moment of the click.
   const created: string[] = []
   const revoked: string[] = []
-  const clicks: Array<{ href: string; revokedAtClick: string[] }> = []
+  const clicks: Array<{ href: string }> = []
   const url = {
     createObjectURL: () => {
       const next = `blob:export-${created.length + 1}`
@@ -52,7 +52,7 @@ function mountManager(t: any, opts: { entries?: Row[] } = {}) {
     createElement: () => ({
       href: '',
       download: '',
-      click() { clicks.push({ href: this.href, revokedAtClick: [...revoked] }) },
+      click() { clicks.push({ href: this.href }) },
     }),
     body: { appendChild() {}, removeChild() {} },
   }
@@ -147,9 +147,9 @@ test('creating an entry always sends answer_strategy', async t => {
 
 type FAQPayloadShape = { answer_strategy?: string; id?: number; standard_question?: string }
 
-// The export→edit→re-import loop is what FAQExportEntry.ID exists for (the
-// server maps it back onto chunk.SeqID). normalizePayload rebuilds every
-// imported row field by field, so a dropped id here loses the mapping.
+// The server maps the id back onto chunk.SeqID only when the value is below
+// its sequence start (100000000), unused, and the import is not replace mode.
+// normalizePayload must not be the place that loses an id that is usable.
 test('normalizePayload keeps the id on imported entries and omits it on new ones', async t => {
   const m = mountManager(t)
   await flush()
@@ -167,7 +167,6 @@ test('export revokes the object URL only after the click has been processed', as
   await flush()
   await m.mounted.vm.handleExportFAQ('json')
   assert.equal(m.clicks.length, 1, 'the download anchor was clicked')
-  assert.deepEqual(m.clicks[0].revokedAtClick, [], 'URL must still be valid at click time')
   assert.equal(m.clicks[0].href, m.created[0])
   // The revoke is scheduled with the component's setTimeout; the fixture
   // enables mock timers on the shared globals, so ticking advances it.

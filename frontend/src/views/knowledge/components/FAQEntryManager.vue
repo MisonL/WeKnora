@@ -934,8 +934,10 @@ interface FAQEntry {
 }
 
 interface FAQEntryPayload {
-  // Present on rows that came from a JSON export: the server maps it back to
-  // the entry's seq id on re-import (and rejects it if it is not this KB's).
+  // Present on rows that came from a JSON export. On re-import the server
+  // keeps it only when the value is below its sequence start (100000000) and
+  // no row already holds it, and a replace-mode import keeps none; otherwise
+  // it is dropped silently and the row gets a fresh id.
   id?: number
   standard_question: string
   similar_questions: string[]
@@ -2790,15 +2792,7 @@ const handleDownloadExample = (data: { value: string }) => {
 // 下载 JSON 示例
 const downloadJSONExample = () => {
   const jsonStr = JSON.stringify(exampleData, null, 2)
-  const blob = new Blob([jsonStr], { type: 'application/json;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const link = document.createElement('a')
-  link.href = url
-  link.download = 'faq_example.json'
-  document.body.appendChild(link)
-  link.click()
-  document.body.removeChild(link)
-  URL.revokeObjectURL(url)
+  downloadBlob(new Blob([jsonStr], { type: 'application/json;charset=utf-8' }), 'faq_example.json')
 }
 
 // 下载 CSV 示例
@@ -2827,14 +2821,7 @@ const downloadCSVExample = () => {
     }).join('\t')),
   ].join('\n')
   const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const link = document.createElement('a')
-  link.href = url
-  link.download = 'faq_example.csv'
-  document.body.appendChild(link)
-  link.click()
-  document.body.removeChild(link)
-  URL.revokeObjectURL(url)
+  downloadBlob(blob, 'faq_example.csv')
 }
 
 // 下载 Excel 示例
@@ -2856,18 +2843,22 @@ const downloadExcelExample = () => {
   XLSX.writeFile(workbook, 'faq_example.xlsx')
 }
 
-// 导出 FAQ 数据
+// 下载 FAQ 数据
 const exportLoading = ref(false)
-const downloadExportBlob = (blob: Blob, ext: 'csv' | 'json') => {
+// 统一走这里下发 blob：revoke 必须发生在 click 之后，否则浏览器还没接手
+// 下载句柄就已经失效。同步 revoke 是曾经真实踩到的坑，示例下载也一样。
+const downloadBlob = (blob: Blob, filename: string) => {
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
-  link.download = `faq_export_${new Date().toISOString().slice(0, 10)}.${ext}`
+  link.download = filename
   document.body.appendChild(link)
   link.click()
   document.body.removeChild(link)
-  // Revoke after the click has been processed so the download actually starts.
   setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+const downloadExportBlob = (blob: Blob, ext: 'csv' | 'json') => {
+  downloadBlob(blob, `faq_export_${new Date().toISOString().slice(0, 10)}.${ext}`)
 }
 const handleExportFAQ = async (format: 'csv' | 'json') => {
   if (!props.kbId) {

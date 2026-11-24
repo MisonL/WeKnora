@@ -659,10 +659,16 @@ func (h *FAQHandler) GetImportProgress(c *gin.Context) {
 		c.Error(err)
 		return
 	}
+	// The instance id and enqueue time are the server's fencing identity for a
+	// run; clients address a task by task_id alone. Trim them from the response
+	// copy rather than the record, which still needs both for renewals.
+	trimmed := *progress
+	trimmed.InstanceID = ""
+	trimmed.EnqueuedAt = 0
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    progress,
+		"data":    &trimmed,
 	})
 }
 
