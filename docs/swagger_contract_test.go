@@ -417,3 +417,35 @@ func TestNotificationInboxContract(t *testing.T) {
 		})
 	}
 }
+
+// The FAQ progress handler strips the run identity before responding, so the
+// response schema must not advertise those fields: an agent writing against
+// the schema would wait for a field that is never sent.
+func TestFAQImportProgressHidesRunIdentityContract(t *testing.T) {
+	for _, tt := range swaggerDocuments() {
+		t.Run(tt.name, func(t *testing.T) {
+			var spec struct {
+				Definitions map[string]struct {
+					Properties map[string]any `json:"properties" yaml:"properties"`
+				} `json:"definitions" yaml:"definitions"`
+			}
+			if err := tt.parse(tt.loadSpec(t), &spec); err != nil {
+				t.Fatal(err)
+			}
+			properties := spec.Definitions["github_com_Tencent_WeKnora_internal_types.FAQImportProgress"].Properties
+			if len(properties) == 0 {
+				t.Fatal("FAQImportProgress definition is missing")
+			}
+			for _, hidden := range []string{"instance_id", "enqueued_at"} {
+				if _, ok := properties[hidden]; ok {
+					t.Errorf("FAQImportProgress must not document %q: the handler removes it from the response", hidden)
+				}
+			}
+			for _, shown := range []string{"task_id", "status", "progress", "next_entry_index"} {
+				if _, ok := properties[shown]; !ok {
+					t.Errorf("FAQImportProgress must document %q", shown)
+				}
+			}
+		})
+	}
+}

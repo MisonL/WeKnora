@@ -30524,10 +30524,6 @@ const docTemplate = `{
                     "description": "导入完成时间",
                     "type": "string"
                 },
-                "instance_id": {
-                    "description": "InstanceID identifies the enqueued run that wrote this record. A task id\nmay be reused by a later submission; the record then belongs to the newer\ninstance, and a stale queued instance must not overwrite or resume it.",
-                    "type": "string"
-                },
                 "kb_id": {
                     "description": "Knowledge Base ID",
                     "type": "string"
@@ -30571,7 +30567,7 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "processing_time": {
-                    "description": "处理耗时（毫秒）",
+                    "description": "处理耗时（秒）",
                     "type": "integer"
                 },
                 "progress": {

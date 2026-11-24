@@ -487,12 +487,15 @@ type FAQImportProgress struct {
 	// InstanceID identifies the enqueued run that wrote this record. A task id
 	// may be reused by a later submission; the record then belongs to the newer
 	// instance, and a stale queued instance must not overwrite or resume it.
-	InstanceID string `json:"instance_id,omitempty"`
+	// Internal plumbing: the progress handler strips it, so it is not part of
+	// the documented response.
+	InstanceID string `json:"instance_id,omitempty" swaggerignore:"true"`
 	// EnqueuedAt is the submission time (unix seconds) this record's run was
 	// accepted at. Lease renewals carry it so a reclaimed marker keeps the
 	// timestamp leg of its identity; records from older builds leave it empty
-	// and renewals then pass 0, which matches any marker.
-	EnqueuedAt         int64               `json:"enqueued_at,omitempty"`
+	// and renewals then pass 0, which matches any marker. Stripped by the
+	// handler along with InstanceID.
+	EnqueuedAt         int64               `json:"enqueued_at,omitempty" swaggerignore:"true"`
 	Status             FAQImportTaskStatus `json:"status"`                         // Task status
 	Progress           int                 `json:"progress"`                       // 0-100 percentage
 	Total              int                 `json:"total"`                          // Total entries to import
