@@ -7,6 +7,8 @@ package service
 // already wrote.
 
 import (
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -46,4 +48,37 @@ func TestCarryFAQImportResumeCursorLeavesAFreshRecordAlone(t *testing.T) {
 	require.Zero(t, progress.NextEntryIndex)
 	require.Empty(t, progress.SuccessEntries)
 	require.Equal(t, "fresh", progress.Message)
+}
+
+// A replace retry whose row deletions already happened must still hand those
+// rows' vectors over in batches the queue accepts: the id list is whatever the
+// knowledge base held, not the import's entry cap.
+func TestFAQIndexDeleteFallbackSplitsThePayload(t *testing.T) {
+	enqueuer := &recordingEnqueuer{}
+	s := &knowledgeService{task: enqueuer}
+	ctx := faqVectorFallbackContext()
+	kb := &types.KnowledgeBase{ID: "kb", TenantID: 1, EmbeddingModelID: "model"}
+
+	ids := make([]string, 0, 450)
+	for i := 0; i < 450; i++ {
+		ids = append(ids, fmt.Sprintf("c%03d", i))
+	}
+	s.enqueueFAQIndexDeleteFallback(ctx, 1, kb, ids)
+
+	require.Len(t, enqueuer.tasks, 3, "one task per batch, so no single message can be too large")
+	var seen []string
+	for _, task := range enqueuer.tasks {
+		var payload types.IndexDeletePayload
+		require.NoError(t, json.Unmarshal(task.Payload(), &payload))
+		seen = append(seen, payload.ChunkIDs...)
+	}
+	require.ElementsMatch(t, ids, seen, "every id is handed over exactly once")
+}
+
+// No enqueuer (Lite without a registered handler) must not panic: the ids go to
+// the log for an operator instead.
+func TestFAQIndexDeleteFallbackWithoutAnEnqueuerIsANoOp(t *testing.T) {
+	s := &knowledgeService{}
+	s.enqueueFAQIndexDeleteFallback(faqVectorFallbackContext(), 1,
+		&types.KnowledgeBase{ID: "kb"}, []string{"c1"})
 }

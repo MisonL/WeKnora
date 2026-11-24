@@ -2046,6 +2046,24 @@ func (s *knowledgeService) deleteReplacedFAQChunks(ctx context.Context, taskID s
 func (s *knowledgeService) enqueueFAQIndexDeleteFallback(
 	ctx context.Context, tenantID uint64, kb *types.KnowledgeBase, chunkIDs []string,
 ) {
+	// The replaced rows of a replace import are not bounded by the import's
+	// entry cap -- they are whatever the knowledge base held -- so the id list
+	// is split before it becomes a queue message. A single oversized payload
+	// fails to enqueue, and a failed enqueue is exactly the case that leaves
+	// the vectors behind.
+	const fallbackBatch = 200
+	for start := 0; start < len(chunkIDs); start += fallbackBatch {
+		end := start + fallbackBatch
+		if end > len(chunkIDs) {
+			end = len(chunkIDs)
+		}
+		s.enqueueOneFAQIndexDeleteFallback(ctx, tenantID, kb, chunkIDs[start:end])
+	}
+}
+
+func (s *knowledgeService) enqueueOneFAQIndexDeleteFallback(
+	ctx context.Context, tenantID uint64, kb *types.KnowledgeBase, chunkIDs []string,
+) {
 	if len(chunkIDs) == 0 || s.task == nil {
 		return
 	}
@@ -2072,7 +2090,20 @@ func (s *knowledgeService) enqueueFAQIndexDeleteFallback(
 	task := asynq.NewTask(types.TypeIndexDelete, payloadBytes,
 		asynq.Queue(types.QueueMaintenance), asynq.MaxRetry(10), asynq.Timeout(time.Hour))
 	if _, err := s.task.Enqueue(task); err != nil {
-		logger.Errorf(ctx, "FAQ import: cannot enqueue index delete fallback for %d orphaned vectors: %v", len(chunkIDs), err)
+		// Nothing retries this: the rows are already soft-deleted, so the
+		// import's own retry recomputes a plan that cannot see them. The ids go
+		// into the log so an operator can clear the vectors by hand; that is the
+		// only remaining recovery path for this batch.
+		sample := chunkIDs
+		if len(sample) > 20 {
+			sample = sample[:20]
+		}
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"kb_id":           kb.ID,
+			"tenant_id":       tenantID,
+			"chunk_id_count":  len(chunkIDs),
+			"chunk_id_sample": sample,
+		})
 		return
 	}
 	logger.Infof(ctx, "FAQ import: handed %d orphaned vectors to the index delete task", len(chunkIDs))
@@ -3484,6 +3515,18 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 			payload.TaskID, len(payload.Entries))
 	}
 
+	// A replay of a completed record answers before this attempt writes
+	// anything: the record the initiator polls would otherwise flip back to
+	// "processing" with old counts, and the result the user already saw would
+	// disappear until the replay finishes again.
+	if existingProgress != nil && existingProgress.Status == types.FAQImportStatusCompleted {
+		logger.Infof(ctx, "FAQ import already completed, replay stops: %s", payload.TaskID)
+		if clearErr := s.clearRunningFAQImportInfoIfMatches(context.WithoutCancel(ctx), payload.KBID, payload.TaskID, payload.InstanceID, payload.EnqueuedAt); clearErr != nil {
+			logger.Warnf(ctx, "Failed to clear running FAQ import info for completed task: %v", clearErr)
+		}
+		return nil
+	}
+
 	progress := &types.FAQImportProgress{
 		TaskID:         payload.TaskID,
 		KBID:           payload.KBID,
@@ -3589,14 +3632,23 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 		// NextEntryIndex 是唯一的重试游标，记录 validEntries 中已完成到的位置。
 		// 不能用 Processed 反推——那是展示用计数，会被 skip/merge 污染；拿它
 		// 当切片偏移会静默跳过未处理的条目（重试后仍报 100% 完成）。
-		startIndex = existingProgress.NextEntryIndex
-		if startIndex < 0 {
-			startIndex = 0
+		//
+		// 只有验证结果被复用时游标才有意义：游标是旧 validEntries 里的位置，
+		// 重新验证得到的是另一组（通常更短的）有效条目，套用旧位置会从中间
+		// 开始处理，前面的条目永远不会导入。
+		if reusableValidation {
+			startIndex = existingProgress.NextEntryIndex
+			if startIndex < 0 {
+				startIndex = 0
+			}
+			if startIndex > len(validEntries) {
+				startIndex = len(validEntries)
+			}
+			logger.Infof(ctx, "Resuming FAQ import from cursor: %d/%d (valid entries)", startIndex, len(validEntries))
+		} else if existingProgress.NextEntryIndex > 0 {
+			logger.Warnf(ctx, "FAQ import %s: discarding stale cursor %d, the validation result was recomputed",
+				payload.TaskID, existingProgress.NextEntryIndex)
 		}
-		if startIndex > len(validEntries) {
-			startIndex = len(validEntries)
-		}
-		logger.Infof(ctx, "Resuming FAQ import from cursor: %d/%d (valid entries)", startIndex, len(validEntries))
 	}
 
 	// 幂等性处理：清理可能已部分处理的chunks和索引数据
