@@ -112,13 +112,23 @@ func (s *knowledgeService) faqTagNameMaps(
 	if s.tagRepo == nil {
 		return names, seqIDs, nil
 	}
-	tags, err := s.tagRepo.GetByIDs(ctx, tenantID, tagIDs)
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, tag := range tags {
-		names[tag.ID] = tag.Name
-		seqIDs[tag.ID] = tag.SeqID
+	// One statement per batch: the caller derives these ids from a chunk page
+	// whose size is client-controlled, so the id list is not bounded by
+	// anything this layer knows.
+	const batchSize = 500
+	for start := 0; start < len(tagIDs); start += batchSize {
+		end := start + batchSize
+		if end > len(tagIDs) {
+			end = len(tagIDs)
+		}
+		tags, err := s.tagRepo.GetByIDs(ctx, tenantID, tagIDs[start:end])
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, tag := range tags {
+			names[tag.ID] = tag.Name
+			seqIDs[tag.ID] = tag.SeqID
+		}
 	}
 	return names, seqIDs, nil
 }
