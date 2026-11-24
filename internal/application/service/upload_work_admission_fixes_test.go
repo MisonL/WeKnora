@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -190,6 +191,61 @@ func TestQueueProbeRunsOutsideTheReservationLock(t *testing.T) {
 
 	close(leave)
 	require.NoError(t, <-reserved)
+}
+
+// The probe runs without the lock, so a row collected as expired can be alive
+// again by the time its verdict lands: a new uploader claim refreshes the
+// deadline. Reclaiming it then would free budget for a job that just arrived.
+func TestSweepDoesNotReclaimARowAClaimRevivedDuringTheProbe(t *testing.T) {
+	withUploadBackgroundBudget(t, 30<<20)
+
+	releaseA, err := ReserveUploadWork("row-a", 1<<20, requestUploadWork)
+	require.NoError(t, err)
+	t.Cleanup(releaseA)
+
+	entered := make(chan struct{})
+	leave := make(chan struct{})
+	var probeCalls atomic.Int32
+	SetUploadWorkQueueProbe(func(context.Context) (map[string]bool, error) {
+		if probeCalls.Add(1) == 1 {
+			close(entered)
+			<-leave
+		}
+		return nil, nil // the queue says the job is gone
+	})
+	t.Cleanup(func() { SetUploadWorkQueueProbe(nil) })
+
+	raw, ok := uploadWorkIDs.Load("row-a")
+	require.True(t, ok)
+	raw.(*heldUploadWork).uploaderDeadline.Store(time.Now().Add(-time.Second).UnixNano())
+
+	swept := make(chan struct{})
+	go func() {
+		_, err := ReserveUploadWork("row-b", 1<<20, requestUploadWork)
+		require.NoError(t, err)
+		close(swept)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the sweep never reached the probe")
+	}
+	// While the probe reads, the same row gets a fresh upload claim.
+	releaseAgain, err := ReserveUploadWork("row-a", 1<<20, requestUploadWork)
+	require.NoError(t, err)
+	t.Cleanup(releaseAgain)
+
+	close(leave)
+	<-swept
+
+	// The stale charge was released (its own sweep saw the probe say "gone"),
+	// then the revived claim added its own; sweep #1 must not free that one.
+	require.Equal(t, int64(2<<20), uploadWorkHeld(),
+		"the revived claim survives the in-flight sweep's verdict")
+	held, ok := uploadWorkIDs.Load("row-a")
+	require.True(t, ok, "the revived row is still accounted for")
+	require.Positive(t, held.(*heldUploadWork).uploaderClaims.Load())
 }
 
 func setUploadWorkQueueProbeError(t *testing.T, failing bool) {

@@ -197,16 +197,24 @@ func sweepStaleUploaderClaims() {
 	queued, err := probe(ctx)
 	uploadWorkMu.Lock()
 	defer uploadWorkMu.Unlock()
-	for _, id := range expired {
+	for _, held := range expired {
 		// A confirmed-queued job keeps its charge; so does an unreadable
-		// queue -- a failed probe is not proof the job left. A row reclaimed or
-		// handed to a worker while the read ran is skipped by the claim check.
-		if err != nil || queued[id] {
+		// queue -- a failed probe is not proof the job left.
+		if err != nil || queued[held.id] {
 			continue
 		}
-		if raw, ok := uploadWorkIDs.Load(id); ok {
-			reclaimUploaderClaimLocked(raw.(*heldUploadWork))
+		// The probe ran without the lock, so the row may have moved since it
+		// was collected: a new uploader claim refreshes the deadline, a worker
+		// claim takes it over, and a release-then-reclaim replaces the object.
+		// Reclaiming anything but the exact row that was still expired would
+		// free budget for a job that is live right now.
+		if current, ok := uploadWorkIDs.Load(held.id); !ok || current != any(held) {
+			continue
 		}
+		if deadline := held.uploaderDeadline.Load(); deadline == 0 || time.Now().UnixNano() < deadline {
+			continue
+		}
+		reclaimUploaderClaimLocked(held)
 	}
 }
 
@@ -222,10 +230,10 @@ func sweepStaleUploaderClaims() {
 // arrives and settles the account; only a confirmed-departed job is reclaimed.
 // Without a probe the timestamp rule is the only evidence there is.
 //
-// The caller holds uploadWorkMu. It returns the expired row ids and the probe
-// that has to judge them; the caller runs the probe outside the lock and then
-// reclaims the confirmed-departed rows.
-func collectStaleUploaderClaimsLocked() (expired []string, probe func(context.Context) (map[string]bool, error)) {
+// The caller holds uploadWorkMu. It returns the rows that were expired at
+// collection time and the probe that has to judge them; the caller runs the
+// probe outside the lock and then re-checks each row before reclaiming it.
+func collectStaleUploaderClaimsLocked() (expired []*heldUploadWork, probe func(context.Context) (map[string]bool, error)) {
 	now := time.Now().UnixNano()
 	probe = uploadWorkQueueProbe
 	uploadWorkIDs.Range(func(_, value any) bool {
@@ -238,7 +246,7 @@ func collectStaleUploaderClaimsLocked() (expired []string, probe func(context.Co
 			return true
 		}
 		if probe != nil {
-			expired = append(expired, held.id)
+			expired = append(expired, held)
 			return true
 		}
 		reclaimUploaderClaimLocked(held)
