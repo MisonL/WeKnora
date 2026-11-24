@@ -1979,8 +1979,12 @@ func (s *knowledgeService) executeFAQImport(ctx context.Context, taskID string, 
 // changed between the identity check and the delete -- a live entry another
 // writer just reindexed -- which no retry restores. With this order a failed
 // vector delete leaves vectors behind for rows that are already unreachable;
-// that leaks storage but cannot corrupt a live entry, and the retry plan no
-// longer lists those rows.
+// that cannot corrupt a live entry, but it cannot be left to the import's own
+// retry either: the retried plan is recomputed from live rows and no longer
+// sees the soft-deleted ones, so the vectors would leak for good. They are
+// handed to the durable index-delete task instead (see
+// enqueueFAQIndexDeleteFallback); only the storage refund is skipped, which
+// errs toward not under-billing the tenant.
 func (s *knowledgeService) deleteReplacedFAQChunks(ctx context.Context, taskID string,
 	tenantID uint64, kb *types.KnowledgeBase, faqKnowledge *types.Knowledge, chunksToDelete []*types.Chunk,
 ) error {
@@ -2018,11 +2022,56 @@ func (s *knowledgeService) deleteReplacedFAQChunks(ctx context.Context, taskID s
 		}
 	}
 	if err := s.deleteFAQChunkVectors(ctx, kb, faqKnowledge, removedChunks); err != nil {
+		deletedChunkIDs := make([]string, 0, len(removedChunks))
+		for _, chunk := range removedChunks {
+			deletedChunkIDs = append(deletedChunkIDs, chunk.ID)
+		}
+		s.enqueueFAQIndexDeleteFallback(ctx, tenantID, kb, deletedChunkIDs)
 		return fmt.Errorf("failed to delete chunk vectors for %d deleted chunks: %w", len(removedChunks), err)
 	}
 	logger.Infof(ctx, "FAQ import task %s: deleted %d replaced chunks and their vectors (including updates)",
 		taskID, len(removedChunks))
 	return nil
+}
+
+// enqueueFAQIndexDeleteFallback hands chunk ids whose rows are already
+// soft-deleted to the durable index-delete task. The import's own retry cannot
+// finish the job: it recomputes its plan from live rows, and these rows are
+// gone. The async task deletes by chunk id, retries on its own, and is safe to
+// run against ids the synchronous attempt already removed.
+func (s *knowledgeService) enqueueFAQIndexDeleteFallback(
+	ctx context.Context, tenantID uint64, kb *types.KnowledgeBase, chunkIDs []string,
+) {
+	if len(chunkIDs) == 0 || s.task == nil {
+		return
+	}
+	tenantInfo, ok := types.TenantInfoFromContext(ctx)
+	if !ok {
+		logger.Warnf(ctx, "FAQ import: cannot hand %d orphaned vectors to the index delete task: tenant info missing", len(chunkIDs))
+		return
+	}
+	payload := types.IndexDeletePayload{
+		TenantID:         tenantID,
+		KnowledgeBaseID:  kb.ID,
+		EmbeddingModelID: kb.EmbeddingModelID,
+		KBType:           types.KnowledgeTypeFAQ,
+		ChunkIDs:         chunkIDs,
+		EffectiveEngines: tenantInfo.GetEffectiveEngines(),
+		VectorStoreID:    kb.VectorStoreID,
+	}
+	langfuse.InjectTracing(ctx, &payload)
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		logger.Errorf(ctx, "FAQ import: cannot marshal index delete fallback: %v", err)
+		return
+	}
+	task := asynq.NewTask(types.TypeIndexDelete, payloadBytes,
+		asynq.Queue(types.QueueMaintenance), asynq.MaxRetry(10), asynq.Timeout(time.Hour))
+	if _, err := s.task.Enqueue(task); err != nil {
+		logger.Errorf(ctx, "FAQ import: cannot enqueue index delete fallback for %d orphaned vectors: %v", len(chunkIDs), err)
+		return
+	}
+	logger.Infof(ctx, "FAQ import: handed %d orphaned vectors to the index delete task", len(chunkIDs))
 }
 
 // updateFAQImportProgressStatus updates the FAQ import progress in Redis
