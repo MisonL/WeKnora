@@ -9,6 +9,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -320,6 +321,15 @@ func (h *AuthHandler) GetOIDCAuthorizationURL(c *gin.Context) {
 		c.Error(appErr)
 		return
 	}
+	// The value is signed into the OIDC state and later sent to the IdP
+	// as redirect_uri, so it must not be an open redirect: only the
+	// configured frontend origin or a site-relative path is accepted.
+	if err := validateOIDCRedirectURI(h.configInfo, redirectURI); err != nil {
+		logger.Warnf(ctx, "Rejected OIDC redirect_uri %q: %v", redirectURI, err)
+		appErr := errors.NewValidationError("redirect_uri is not allowed").WithDetails(err.Error())
+		c.Error(appErr)
+		return
+	}
 
 	resp, err := h.userService.GetOIDCAuthorizationURL(ctx, redirectURI)
 	if err != nil {
@@ -335,6 +345,71 @@ func (h *AuthHandler) GetOIDCAuthorizationURL(c *gin.Context) {
 	setOIDCPKCECookie(c, resp.PKCEVerifier)
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// validateOIDCRedirectURI restricts the caller-supplied redirect_uri to
+// the frontend's own origin (scheme + host + port) or a site-relative
+// path ("/...", but not "//host" which browsers treat as another origin).
+// Anything else would turn /auth/oidc/url into an open-redirect helper
+// and feed an attacker-chosen redirect_uri to the IdP.
+func validateOIDCRedirectURI(cfg *config.Config, raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return stderrors.New("redirect_uri is required")
+	}
+	if strings.HasPrefix(raw, "/") {
+		if strings.HasPrefix(raw, "//") || strings.HasPrefix(raw, "/\\") ||
+			strings.ContainsAny(raw, "\\\r\n\t") {
+			return stderrors.New("redirect_uri must be a site-relative path")
+		}
+		return nil
+	}
+
+	target, err := url.Parse(raw)
+	if err != nil || !target.IsAbs() || target.Host == "" || target.User != nil {
+		return stderrors.New("redirect_uri must be an absolute URL or a site-relative path")
+	}
+
+	base := frontendBaseURLFor(cfg)
+	if base == "" {
+		return stderrors.New("absolute redirect_uri requires a configured frontend base URL")
+	}
+	baseURL, err := url.Parse(base)
+	if err != nil || baseURL.Host == "" {
+		return stderrors.New("configured frontend base URL is invalid")
+	}
+	if !sameOriginURL(baseURL, target) {
+		return stderrors.New("redirect_uri must share the frontend origin (scheme, host and port)")
+	}
+	return nil
+}
+
+// sameOriginURL compares scheme, hostname and effective port. Explicit
+// default ports (https://x:443) are equivalent to the implicit ones.
+func sameOriginURL(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if !strings.EqualFold(a.Scheme, b.Scheme) {
+		return false
+	}
+	if !strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	return effectiveURLPort(a) == effectiveURLPort(b)
+}
+
+func effectiveURLPort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	}
+	return ""
 }
 
 // setOIDCNonceCookie binds the OIDC state nonce to this browser so an

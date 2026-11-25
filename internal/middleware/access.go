@@ -60,14 +60,15 @@ func IsCrossTenantSuperuser(ctx context.Context, cfg *config.Config) bool {
 // IsTenantAccessible reports whether `user` is allowed to operate inside
 // `targetTenantID`. The decision order is:
 //
-//  1. Home tenant (user.TenantID == targetTenantID): always.
-//  2. Cross-tenant superuser: governed by IsCrossTenantSuperuser.
-//  3. Multi-tenant member: an active tenant_members row in the target
-//     tenant grants access (this is what makes cross-tenant browsing
-//     work for non-superusers added via PR 3's member management).
+//  1. Cross-tenant superuser: governed by the cluster flag + attribute.
+//  2. Active tenant_members row in the target tenant — including the
+//     caller's home tenant. A user removed from their home workspace
+//     (users.tenant_id still points at it) must not keep access just
+//     because the IDs match; the membership row is the authority.
 //
-// Lookup errors are treated as "not a member" — the safest fallback
-// that doesn't expose other tenants on a transient DB hiccup.
+// Lookup errors, a nil member service, and missing rows are all treated
+// as "not a member" — fail closed rather than expose a tenant on a
+// transient DB hiccup or a partially wired dependency graph.
 func IsTenantAccessible(
 	ctx context.Context,
 	user *types.User,
@@ -77,9 +78,6 @@ func IsTenantAccessible(
 ) bool {
 	if user == nil || targetTenantID == 0 {
 		return false
-	}
-	if user.TenantID == targetTenantID {
-		return true
 	}
 	if cfg != nil && cfg.Tenant != nil && cfg.Tenant.EnableCrossTenantAccess && user.CanAccessAllTenants {
 		return true

@@ -28,6 +28,11 @@ type stubAuthTokenRepo struct {
 	// succeeds", so a test can fail only the refresh-token write.
 	createErrs  []error
 	createCalls int
+	// revokeIfActiveFails makes RevokeTokenIfActive report "already
+	// revoked" without mutating the stored row, simulating a concurrent
+	// rotation that consumed the token between GetTokenByValue and the
+	// conditional update.
+	revokeIfActiveFails bool
 }
 
 func (s *stubAuthTokenRepo) CreateToken(_ context.Context, token *types.AuthToken) error {
@@ -66,8 +71,19 @@ func (s *stubAuthTokenRepo) GetTokensByUserID(context.Context, string) ([]*types
 	return nil, nil
 }
 func (s *stubAuthTokenRepo) UpdateToken(context.Context, *types.AuthToken) error { return nil }
-func (s *stubAuthTokenRepo) DeleteToken(context.Context, string) error           { return nil }
-func (s *stubAuthTokenRepo) DeleteExpiredTokens(context.Context) error           { return nil }
+func (s *stubAuthTokenRepo) RevokeTokenIfActive(_ context.Context, tokenValue string) (bool, error) {
+	if s.revokeIfActiveFails {
+		return false, nil
+	}
+	token, ok := s.tokens[tokenValue]
+	if !ok || token == nil || token.IsRevoked {
+		return false, nil
+	}
+	token.IsRevoked = true
+	return true, nil
+}
+func (s *stubAuthTokenRepo) DeleteToken(context.Context, string) error { return nil }
+func (s *stubAuthTokenRepo) DeleteExpiredTokens(context.Context) error { return nil }
 func (s *stubAuthTokenRepo) RevokeTokensByUserID(_ context.Context, userID string) error {
 	s.revokedUserIDs = append(s.revokedUserIDs, userID)
 	return nil
@@ -92,6 +108,15 @@ func (s *stubUserRepoForAuth) GetUsersByIDs(context.Context, []string) (map[stri
 func (s *stubUserRepoForAuth) GetUserByEmail(_ context.Context, email string) (*types.User, error) {
 	for _, user := range s.users {
 		if user != nil && user.Email == email {
+			return user, nil
+		}
+	}
+	return nil, errors.New("user not found")
+}
+func (s *stubUserRepoForAuth) GetUserByOIDCIdentity(_ context.Context, issuer, subject string) (*types.User, error) {
+	for _, user := range s.users {
+		if user != nil && user.OIDCIssuer != nil && user.OIDCSubject != nil &&
+			*user.OIDCIssuer == issuer && *user.OIDCSubject == subject {
 			return user, nil
 		}
 	}

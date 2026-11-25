@@ -64,7 +64,7 @@ func ParseSandboxTerminalTicket(raw string) (*SandboxTerminalTicketClaims, error
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return []byte(getJwtSecret()), nil
-	})
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 	if err != nil || token == nil || !token.Valid {
 		return nil, errors.New("invalid or expired terminal ticket")
 	}

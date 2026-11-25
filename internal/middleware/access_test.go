@@ -76,13 +76,26 @@ func TestIsCrossTenantSuperuser_NoUserInCtxRejects(t *testing.T) {
 
 // ---------- IsTenantAccessible ----------
 
-func TestIsTenantAccessible_HomeTenantAlwaysAllows(t *testing.T) {
+func TestIsTenantAccessible_HomeTenantRequiresActiveMembership(t *testing.T) {
 	user := &types.User{ID: "u1", TenantID: 1}
-	// Even with no member service and the cross-tenant flag off, a user
-	// reaching their own tenant is fine. Home tenant is the cheapest
-	// fast path.
-	if !IsTenantAccessible(context.Background(), user, 1, nil, cfgCrossTenant(false)) {
-		t.Fatalf("home tenant must allow regardless of other inputs")
+	// Matching IDs are not enough: a user removed from their home
+	// workspace still has users.tenant_id pointing at it.
+	if IsTenantAccessible(context.Background(), user, 1, newFakeMemberService(), cfgCrossTenant(false)) {
+		t.Fatalf("home tenant without an active membership must reject")
+	}
+	ms := newFakeMemberService()
+	ms.seedActive("u1", 1, types.TenantRoleViewer)
+	if !IsTenantAccessible(context.Background(), user, 1, ms, cfgCrossTenant(false)) {
+		t.Fatalf("home tenant with an active membership must allow")
+	}
+}
+
+func TestIsTenantAccessible_HomeTenantSuspendedMembershipRejects(t *testing.T) {
+	user := &types.User{ID: "u1", TenantID: 1}
+	ms := newFakeMemberService()
+	ms.seedStatus("u1", 1, types.TenantRoleOwner, types.TenantMemberStatusSuspended)
+	if IsTenantAccessible(context.Background(), user, 1, ms, cfgCrossTenant(false)) {
+		t.Fatalf("suspended home membership must reject")
 	}
 }
 
@@ -144,10 +157,15 @@ func TestIsTenantAccessible_LookupErrorRejects(t *testing.T) {
 	}
 }
 
-func TestIsTenantAccessible_NilMemberServiceRejectsNonHome(t *testing.T) {
+func TestIsTenantAccessible_NilMemberServiceRejects(t *testing.T) {
 	user := &types.User{ID: "u1", TenantID: 1}
 	if IsTenantAccessible(context.Background(), user, 99, nil, cfgCrossTenant(false)) {
 		t.Fatalf("no member service + non-home tenant must reject")
+	}
+	// Home tenant is not special-cased any more: without a member
+	// service the membership cannot be verified, so fail closed.
+	if IsTenantAccessible(context.Background(), user, 1, nil, cfgCrossTenant(false)) {
+		t.Fatalf("no member service + home tenant must reject (fail closed)")
 	}
 }
 

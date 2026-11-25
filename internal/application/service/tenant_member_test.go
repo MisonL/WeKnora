@@ -281,6 +281,9 @@ func (r *cleanupUserRepo) GetUsersByIDs(context.Context, []string) (map[string]*
 func (r *cleanupUserRepo) GetUserByEmail(context.Context, string) (*types.User, error) {
 	return nil, nil
 }
+func (r *cleanupUserRepo) GetUserByOIDCIdentity(context.Context, string, string) (*types.User, error) {
+	return nil, nil
+}
 func (r *cleanupUserRepo) GetUserByUsername(context.Context, string) (*types.User, error) {
 	return nil, nil
 }
@@ -321,8 +324,11 @@ func (r *cleanupTokenRepo) GetTokensByUserID(context.Context, string) ([]*types.
 	return nil, nil
 }
 func (r *cleanupTokenRepo) UpdateToken(context.Context, *types.AuthToken) error { return nil }
-func (r *cleanupTokenRepo) DeleteToken(context.Context, string) error           { return nil }
-func (r *cleanupTokenRepo) DeleteExpiredTokens(context.Context) error           { return nil }
+func (r *cleanupTokenRepo) RevokeTokenIfActive(context.Context, string) (bool, error) {
+	return true, nil
+}
+func (r *cleanupTokenRepo) DeleteToken(context.Context, string) error { return nil }
+func (r *cleanupTokenRepo) DeleteExpiredTokens(context.Context) error { return nil }
 func (r *cleanupTokenRepo) RevokeTokensByUserID(_ context.Context, userID string) error {
 	r.revoked = append(r.revoked, userID)
 	return nil

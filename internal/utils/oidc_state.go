@@ -28,21 +28,48 @@ type OIDCStatePayload struct {
 var (
 	oidcStateSecretOnce sync.Once
 	oidcStateSecret     string
+	oidcStateSecretErr  error
 )
 
-func oidcStateSigningKey() string {
+// placeholderJWTSecrets are the shipped sample values. Signing state with
+// one of them is equivalent to having no secret at all: the value is in
+// the repository, so anyone can forge state. service.getJwtSecret ignores
+// the same values (falling back to a random key); OIDC state cannot do
+// that safely across instances, so it refuses instead.
+var placeholderJWTSecrets = map[string]struct{}{
+	"weknora-jwt-secret":   {},
+	"CHANGE-ME-jwt-secret": {},
+	"change-me-jwt-secret": {},
+	"your-jwt-secret":      {},
+	"your_secret_key_here": {},
+}
+
+// oidcStateSigningKey returns the HMAC key for OIDC state. A configured
+// JWT_SECRET is used as-is; a placeholder secret is refused rather than
+// silently replaced, because state is verified by every instance behind
+// the load balancer and a per-process random key would fail validation
+// across instances. An unset secret keeps the historical per-process
+// random fallback.
+func oidcStateSigningKey() (string, error) {
 	oidcStateSecretOnce.Do(func() {
-		if envSecret := strings.TrimSpace(os.Getenv("JWT_SECRET")); envSecret != "" {
+		envSecret := strings.TrimSpace(os.Getenv("JWT_SECRET"))
+		if _, placeholder := placeholderJWTSecrets[envSecret]; placeholder {
+			oidcStateSecretErr = errors.New(
+				"JWT_SECRET is set to a published placeholder value; set a real secret before enabling OIDC")
+			return
+		}
+		if envSecret != "" {
 			oidcStateSecret = envSecret
 			return
 		}
 		randomBytes := make([]byte, 32)
 		if _, err := rand.Read(randomBytes); err != nil {
-			panic(fmt.Sprintf("failed to generate OIDC state signing key: %v", err))
+			oidcStateSecretErr = fmt.Errorf("failed to generate OIDC state signing key: %w", err)
+			return
 		}
 		oidcStateSecret = base64.StdEncoding.EncodeToString(randomBytes)
 	})
-	return oidcStateSecret
+	return oidcStateSecret, oidcStateSecretErr
 }
 
 // SignOIDCState returns a tamper-evident state token: base64url(payload).base64url(hmac).
@@ -63,7 +90,11 @@ func SignOIDCState(payload *OIDCStatePayload) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal oidc state: %w", err)
 	}
-	mac := hmac.New(sha256.New, []byte(oidcStateSigningKey()))
+	key, err := oidcStateSigningKey()
+	if err != nil {
+		return "", err
+	}
+	mac := hmac.New(sha256.New, []byte(key))
 	mac.Write(raw)
 	sig := mac.Sum(nil)
 	return base64.RawURLEncoding.EncodeToString(raw) + "." + base64.RawURLEncoding.EncodeToString(sig), nil
@@ -84,7 +115,11 @@ func VerifyOIDCState(raw string) (*OIDCStatePayload, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode oidc state signature: %w", err)
 	}
-	mac := hmac.New(sha256.New, []byte(oidcStateSigningKey()))
+	key, err := oidcStateSigningKey()
+	if err != nil {
+		return nil, err
+	}
+	mac := hmac.New(sha256.New, []byte(key))
 	mac.Write(payloadBytes)
 	if !hmac.Equal(mac.Sum(nil), sigBytes) {
 		return nil, errors.New("oidc state signature mismatch")
