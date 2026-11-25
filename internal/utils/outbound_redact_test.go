@@ -116,3 +116,20 @@ func TestSummarizeUpstreamBodyNonJSONKeepsLengthOnly(t *testing.T) {
 		t.Fatalf("summary lost the body length: %q", got)
 	}
 }
+
+// Presigned download URLs carry the HMAC signature and its expiry in the
+// query string; both must be masked before the access logger copies the URL.
+func TestSanitizeQueryRedactsPresignedParameters(t *testing.T) {
+	got := SanitizeQuery("file_path=local%3A%2F%2F1%2Fa.png&tenant_id=1&expires=1700000000&sig=deadbeef01&signature=deadbeef02")
+	for _, leaked := range []string{"deadbeef01", "deadbeef02", "1700000000"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("SanitizeQuery() leaked %q: %q", leaked, got)
+		}
+	}
+	if !strings.Contains(got, "file_path=") || !strings.Contains(got, "tenant_id=1") {
+		t.Fatalf("SanitizeQuery() dropped non-sensitive parameters: %q", got)
+	}
+	if !strings.Contains(got, "sig=%2A%2A%2A") || !strings.Contains(got, "signature=%2A%2A%2A") {
+		t.Fatalf("SanitizeQuery() did not mask sig/signature: %q", got)
+	}
+}

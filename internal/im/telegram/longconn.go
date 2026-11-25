@@ -80,7 +80,7 @@ func (c *LongConnClient) Start(ctx context.Context) error {
 }
 
 func (c *LongConnClient) getUpdates(ctx context.Context) ([]telegramUpdate, error) {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates", c.botToken)
+	endpoint := botAPIURL(c.botToken, "getUpdates")
 
 	body := map[string]interface{}{
 		"offset":          c.offset,
@@ -92,15 +92,15 @@ func (c *LongConnClient) getUpdates(ctx context.Context) ([]telegramUpdate, erro
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(jsonBody))
 	if err != nil {
-		return nil, err
+		return nil, redactTelegramError(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, redactTelegramError(err)
 	}
 	defer resp.Body.Close()
 

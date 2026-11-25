@@ -277,15 +277,26 @@ func (m *MCPService) BeforeCreate(tx *gorm.DB) error {
 	return nil
 }
 
-// Value implements driver.Valuer interface for MCPHeaders
+// Value implements driver.Valuer interface for MCPHeaders.
+//
+// Static headers routinely carry credentials (Authorization, X-API-Key,
+// *-token, *-secret). Sensitive values are encrypted with SYSTEM_AES_KEY into a
+// copy of the map so the live request path keeps plaintext.
 func (h MCPHeaders) Value() (driver.Value, error) {
 	if h == nil {
 		return nil, nil
 	}
-	return json.Marshal(h)
+	stored, err := encryptSecretMapValues(h, isSensitiveMCPHeader)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(stored)
 }
 
-// Scan implements sql.Scanner interface for MCPHeaders
+// Scan implements sql.Scanner interface for MCPHeaders.
+//
+// Encrypted values are decrypted; legacy plaintext headers pass through.
+// Unreadable ciphertext is kept so a later write does not destroy it.
 func (h *MCPHeaders) Scan(value interface{}) error {
 	if value == nil {
 		*h = nil
@@ -295,7 +306,11 @@ func (h *MCPHeaders) Scan(value interface{}) error {
 	if !ok {
 		return nil
 	}
-	return json.Unmarshal(b, h)
+	if err := json.Unmarshal(b, h); err != nil {
+		return err
+	}
+	decryptSecretMapValues(*h, isSensitiveMCPHeader, "mcp headers")
+	return nil
 }
 
 // Value implements driver.Valuer for MCPAuthConfig.
@@ -336,6 +351,15 @@ func (c *MCPAuthConfig) Value() (driver.Value, error) {
 				out.ClientSecret = encrypted
 			}
 		}
+	}
+	// CustomHeaders can carry the same authentication material as the
+	// top-level headers; encrypt sensitive names into a copy.
+	if out.CustomHeaders != nil {
+		custom, err := encryptSecretMapValues(out.CustomHeaders, isSensitiveMCPHeader)
+		if err != nil {
+			return nil, err
+		}
+		out.CustomHeaders = custom
 	}
 	return json.Marshal(&out)
 }
@@ -382,6 +406,7 @@ func (c *MCPAuthConfig) Scan(value interface{}) error {
 		c.clientSecretStored = c.ClientSecret
 		c.ClientSecret = ""
 	}
+	decryptSecretMapValues(c.CustomHeaders, isSensitiveMCPHeader, "mcp auth_config custom_headers")
 	return nil
 }
 
