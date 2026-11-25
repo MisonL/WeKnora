@@ -23,6 +23,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/embedding"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/utils"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -668,4 +669,44 @@ func indexOf(values []string, want string) int {
 		}
 	}
 	return -1
+}
+
+// A shared-KB import runs as the KB owner, but its task id embeds the
+// initiator's tenant and the initiator polls from that tenant. The progress
+// key must be the same on both sides, and a third tenant must still be
+// refused even though it knows the task id.
+func TestFAQProgressOfASharedKBImportIsPollableByTheInitiator(t *testing.T) {
+	taskID := utils.GenerateTaskID("faq_import", 8, "kb")
+	ownerCtx := types.WithExecutionTenant(context.Background(), 7)
+	initiatorCtx := types.WithExecutionTenant(context.Background(), 8)
+	foreignCtx := types.WithExecutionTenant(context.Background(), 9)
+
+	build := func(t *testing.T) *knowledgeService {
+		f := newFAQWriteFixture(t)
+		f.svc.redisClient = redis.NewClient(&redis.Options{Addr: miniredis.RunT(t).Addr()})
+		t.Cleanup(func() { _ = f.svc.redisClient.Close() })
+		return f.svc
+	}
+	t.Run("redis", func(t *testing.T) {
+		svc := build(t)
+		require.NoError(t, svc.writeFAQImportProgress(ownerCtx, &types.FAQImportProgress{
+			TaskID: taskID, TenantID: 7, Status: types.FAQImportStatusProcessing, Message: "owner-written",
+		}))
+		got, err := svc.GetFAQImportProgress(initiatorCtx, taskID)
+		require.NoError(t, err, "the initiator must find the record the owner wrote")
+		require.Equal(t, "owner-written", got.Message)
+		_, err = svc.GetFAQImportProgress(foreignCtx, taskID)
+		require.Error(t, err, "a tenant outside the import must not read the record")
+	})
+	t.Run("in-memory", func(t *testing.T) {
+		svc := newFAQWriteFixture(t).svc
+		require.NoError(t, svc.writeFAQImportProgress(ownerCtx, &types.FAQImportProgress{
+			TaskID: taskID, TenantID: 7, Status: types.FAQImportStatusProcessing, Message: "owner-written",
+		}))
+		got, err := svc.GetFAQImportProgress(initiatorCtx, taskID)
+		require.NoError(t, err)
+		require.Equal(t, "owner-written", got.Message)
+		_, err = svc.GetFAQImportProgress(foreignCtx, taskID)
+		require.Error(t, err)
+	})
 }

@@ -4275,12 +4275,48 @@ var faqImportLeaseHeartbeatInterval = faqImportLeaseTTL / 3
 
 // getFAQImportProgressKey returns the Redis key for storing FAQ import
 // progress. The tenant is part of the key: a client-chosen task id must not
-// address (read or overwrite) another tenant's record. Callers read and write
-// under the same execution tenant -- the KB owner for a shared knowledge base,
-// which is also what the poll route runs as.
+// address (read or overwrite) another tenant's record.
+//
+// The key tenant is the one embedded in the task id when the id carries it
+// (generated ids embed the caller's tenant). A shared-KB import runs as the
+// KB owner, but the initiator polls from its own tenant, so deriving the
+// tenant from the task id is what keeps both sides on one key. The progress
+// routes reject ids without an embedded tenant (utils.TaskTenantID fails), so
+// every pollable task resolves its key this way; ids that do not parse fall
+// back to the caller's execution tenant for internal callers.
 func getFAQImportProgressKey(ctx context.Context, taskID string) string {
-	tenantID, _ := types.TenantIDFromContext(ctx)
+	return faqProgressKey(getFAQImportKeyTenant(ctx, taskID), taskID)
+}
+
+func faqProgressKey(tenantID uint64, taskID string) string {
 	return fmt.Sprintf("%s%d:%s", faqImportProgressKeyPrefix, tenantID, taskID)
+}
+
+// getFAQImportKeyTenant resolves which tenant segment the progress record of
+// taskID lives under. Generated task ids carry the submitting tenant; a
+// client-supplied id that does not parse falls back to the execution tenant.
+func getFAQImportKeyTenant(ctx context.Context, taskID string) uint64 {
+	if tenantID, err := secutils.TaskTenantID(taskID); err == nil && tenantID != 0 {
+		return tenantID
+	}
+	tenantID, _ := types.TenantIDFromContext(ctx)
+	return tenantID
+}
+
+// faqProgressReadableBy limits a read to the two parties that own the import:
+// the executing tenant (the KB owner, for internal reads) and the tenant
+// embedded in the task id (the initiator, which is what the poll route
+// authorizes). Anyone else sees not-found, matching the cross-tenant hiding
+// the route applies.
+func faqProgressReadableBy(ctx context.Context, taskID string, progress *types.FAQImportProgress) bool {
+	callerTenant, _ := types.TenantIDFromContext(ctx)
+	if progress != nil && progress.TenantID != 0 && progress.TenantID == callerTenant {
+		return true
+	}
+	if taskTenant, err := secutils.TaskTenantID(taskID); err == nil && taskTenant != 0 && taskTenant == callerTenant {
+		return true
+	}
+	return false
 }
 
 // getFAQImportRunningKey returns the Redis key for storing running task ID by KB ID
@@ -4576,6 +4612,9 @@ func (s *knowledgeService) GetFAQImportProgress(ctx context.Context, taskID stri
 			} else {
 				// Hand out a copy: the poller's mutations (and the JSON encoder
 				// reading while the worker writes) must not touch the record.
+				if !faqProgressReadableBy(ctx, taskID, progress) {
+					return nil, werrors.NewNotFoundError("FAQ import task not found")
+				}
 				return cloneFAQImportProgress(progress), nil
 			}
 		}
@@ -4592,6 +4631,9 @@ func (s *knowledgeService) GetFAQImportProgress(ctx context.Context, taskID stri
 	var progress types.FAQImportProgress
 	if err := json.Unmarshal(data, &progress); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal FAQ import progress: %w", err)
+	}
+	if !faqProgressReadableBy(ctx, taskID, &progress) {
+		return nil, werrors.NewNotFoundError("FAQ import task not found")
 	}
 
 	// If task is completed, enrich with persisted result fields from database.
