@@ -329,13 +329,13 @@ func (a *WebhookAdapter) sendToAppChat(ctx context.Context, accessToken, chatID 
 	sendURL := fmt.Sprintf("%s/cgi-bin/appchat/send?access_token=%s", a.apiBaseURL, accessToken)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, sendURL, bytes.NewReader(payloadBytes))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return fmt.Errorf("create request: %w", secutils.RedactRequestError(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send appchat message: %w", err)
+		return fmt.Errorf("send appchat message: %w", secutils.RedactRequestError(err))
 	}
 	defer resp.Body.Close()
 
@@ -373,13 +373,13 @@ func (a *WebhookAdapter) sendToUser(ctx context.Context, accessToken, userID str
 	sendURL := fmt.Sprintf("%s/cgi-bin/message/send?access_token=%s", a.apiBaseURL, accessToken)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, sendURL, bytes.NewReader(payloadBytes))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return fmt.Errorf("create request: %w", secutils.RedactRequestError(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send message: %w", err)
+		return fmt.Errorf("send message: %w", secutils.RedactRequestError(err))
 	}
 	defer resp.Body.Close()
 
@@ -412,12 +412,12 @@ func (a *WebhookAdapter) getAccessToken(ctx context.Context) (string, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
+		return "", fmt.Errorf("create request: %w", secutils.RedactRequestError(err))
 	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("request access token: %w", err)
+		return "", fmt.Errorf("request access token: %w", secutils.RedactRequestError(err))
 	}
 	defer resp.Body.Close()
 
@@ -583,18 +583,18 @@ func downloadFromURL(ctx context.Context, rawURL, fileName string, extraAllowedH
 	// SSRF protection: reject internal/private URLs unless on the WeCom API allowlist.
 	if !isAllowedIMAPIHost(rawURL, extraAllowedHost) {
 		if err := secutils.ValidateURLForSSRF(rawURL); err != nil {
-			return nil, "", fmt.Errorf("URL rejected for security reasons: %v", err)
+			return nil, "", fmt.Errorf("URL rejected for security reasons: %v", secutils.RedactRequestError(err))
 		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("create request: %w", err)
+		return nil, "", fmt.Errorf("create request: %w", secutils.RedactRequestError(err))
 	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("download: %w", err)
+		return nil, "", fmt.Errorf("download: %w", secutils.RedactRequestError(err))
 	}
 
 	if resp.StatusCode != http.StatusOK {

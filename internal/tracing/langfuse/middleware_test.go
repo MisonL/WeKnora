@@ -161,6 +161,40 @@ func TestGinMiddlewareMergesMetadataHeader(t *testing.T) {
 	}
 }
 
+func TestGinMiddlewareRedactsQueryInTraceMetadata(t *testing.T) {
+	_, exp := newTestManager(t)
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(GinMiddleware())
+	var observed map[string]interface{}
+	r.GET("/api/v1/knowledge-chat/:id", func(c *gin.Context) {
+		if tr, ok := TraceFromContext(c.Request.Context()); ok {
+			observed = tr.metadata
+		}
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/knowledge-chat/sess-1?token=SUPERSECRET&next=%2Fhome", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	query, _ := observed["http.query"].(string)
+	if strings.Contains(query, "SUPERSECRET") {
+		t.Fatalf("trace metadata leaked the query credential: %q", query)
+	}
+	if !strings.Contains(query, "next=%2Fhome") {
+		t.Fatalf("trace metadata lost non-sensitive query parameters: %q", query)
+	}
+	if len(exp.GetSpans()) == 0 {
+		t.Fatal("no span exported")
+	}
+}
+
 func TestGinMiddlewareIgnoresMalformedMetadataHeader(t *testing.T) {
 	_, exp := newTestManager(t)
 

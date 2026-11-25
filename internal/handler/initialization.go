@@ -237,6 +237,37 @@ type InitializationRequest struct {
 	} `json:"questionGeneration"`
 }
 
+// logInitializationRequestSummary records that an initialization request
+// arrived without copying the request body into the log. The body carries
+// plaintext model keys plus COS secretId/secretKey; log only whether each
+// credential was supplied (the values live in the model table / KB config,
+// and SanitizeForLog only strips control characters — it does not redact).
+func logInitializationRequestSummary(ctx context.Context, kbID string, req *InitializationRequest) {
+	vlmConfigured := false
+	if req.Multimodal.VLM != nil {
+		vlmConfigured = strings.TrimSpace(req.Multimodal.VLM.APIKey) != ""
+	}
+	cosSecretIDConfigured := false
+	cosSecretKeyConfigured := false
+	if req.Multimodal.COS != nil {
+		cosSecretIDConfigured = strings.TrimSpace(req.Multimodal.COS.SecretID) != ""
+		cosSecretKeyConfigured = strings.TrimSpace(req.Multimodal.COS.SecretKey) != ""
+	}
+	logger.Infof(
+		ctx,
+		"Starting knowledge base configuration update, kbId: %s, llmApiKeyConfigured: %t, "+
+			"embeddingApiKeyConfigured: %t, rerankApiKeyConfigured: %t, vlmApiKeyConfigured: %t, "+
+			"cosSecretIdConfigured: %t, cosSecretKeyConfigured: %t",
+		kbID,
+		strings.TrimSpace(req.LLM.APIKey) != "",
+		strings.TrimSpace(req.Embedding.APIKey) != "",
+		strings.TrimSpace(req.Rerank.APIKey) != "",
+		vlmConfigured,
+		cosSecretIDConfigured,
+		cosSecretKeyConfigured,
+	)
+}
+
 // UpdateKBConfig godoc
 // @Summary      更新知识库配置
 // @Description  根据知识库ID更新模型和分块配置
@@ -667,12 +698,7 @@ func (h *InitializationHandler) InitializeByKB(c *gin.Context) {
 		return
 	}
 
-	logger.Infof(
-		ctx,
-		"Starting knowledge base configuration update, kbId: %s, request: %s",
-		utils.SanitizeForLog(kbIdStr),
-		utils.SanitizeForLog(utils.ToJSON(req)),
-	)
+	logInitializationRequestSummary(ctx, utils.SanitizeForLog(kbIdStr), req)
 
 	kb, err := h.getKnowledgeBaseForInitialization(ctx, kbIdStr)
 	if err != nil {

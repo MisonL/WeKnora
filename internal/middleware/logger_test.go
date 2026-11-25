@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -12,6 +13,36 @@ import (
 )
 
 func TestSanitizeBody(t *testing.T) {
+	// JSON bodies go through the structured redactor, which re-marshals the
+	// document (map keys are ordered), so those cases are compared
+	// semantically. Anything that is not valid JSON falls back to the regex
+	// path and is compared byte for byte.
+	assertSanitized := func(t *testing.T, in, want string) {
+		t.Helper()
+		got := sanitizeBody(in)
+		if json.Valid([]byte(in)) {
+			if !json.Valid([]byte(got)) {
+				t.Fatalf("sanitizeBody(%q) produced invalid JSON: %s", in, got)
+			}
+			var gotV, wantV any
+			if err := json.Unmarshal([]byte(got), &gotV); err != nil {
+				t.Fatalf("unmarshal got: %v", err)
+			}
+			if err := json.Unmarshal([]byte(want), &wantV); err != nil {
+				t.Fatalf("unmarshal want: %v", err)
+			}
+			gb, _ := json.Marshal(gotV)
+			wb, _ := json.Marshal(wantV)
+			if string(gb) != string(wb) {
+				t.Errorf("sanitizeBody(%q)\n got: %s\nwant: %s", in, got, want)
+			}
+			return
+		}
+		if got != want {
+			t.Errorf("sanitizeBody(%q)\n got: %s\nwant: %s", in, got, want)
+		}
+	}
+
 	cases := []struct {
 		name string
 		in   string
@@ -41,7 +72,7 @@ func TestSanitizeBody(t *testing.T) {
 		{
 			name: "secretKey camelCase",
 			in:   `{"secretKey":"abc","accessKeyId":"id"}`,
-			want: `{"secretKey":"***","accessKeyId":"id"}`,
+			want: `{"secretKey":"***","accessKeyId":"***"}`,
 		},
 		{
 			name: "refreshToken / accessToken camelCase",
@@ -74,9 +105,8 @@ func TestSanitizeBody(t *testing.T) {
 			want: `{"assertion":"***","redirect_uri":"https://example.com/cb"}`,
 		},
 		{
-			name: "IM channel credentials",
-			in:   `{"platform":"wecom","credentials":{"bot_id":"aib-1","bot_secret":"s3","bot_name":"小科"},"name":"x"}`,
-			want: `{"platform":"wecom","credentials":{"bot_id":"aib-1","bot_secret":"***","bot_name":"小科"},"name":"x"}`,
+			name: "IM channel credentials", in: `{"platform":"wecom","credentials":{"bot_id":"aib-1","bot_secret":"s3","bot_name":"小科"},"name":"x"}`,
+			want: `{"platform":"wecom","credentials":"***","name":"x"}`,
 		},
 		{
 			name: "other IM platform secrets",
@@ -103,14 +133,104 @@ func TestSanitizeBody(t *testing.T) {
 			in:   `{"apiKey":"data:image/png;base64,AAAA"}`,
 			want: `{"apiKey":"***"}`,
 		},
+		{
+			name: "app_password",
+			in:   `{"app_password":"S3CRET"}`,
+			want: `{"app_password":"***"}`,
+		},
+		{
+			name: "secret_access_key",
+			in:   `{"secret_access_key":"S3CRET"}`,
+			want: `{"secret_access_key":"***"}`,
+		},
+		{
+			name: "access_key_id",
+			in:   `{"access_key_id":"AKID-S3CRET"}`,
+			want: `{"access_key_id":"***"}`,
+		},
+		{
+			name: "camelCase accessKey",
+			in:   `{"accessKey":"S3CRET"}`,
+			want: `{"accessKey":"***"}`,
+		},
+		{
+			name: "api_token",
+			in:   `{"api_token":"S3CRET"}`,
+			want: `{"api_token":"***"}`,
+		},
+		{
+			name: "mineru keys and paddleocr token",
+			in:   `{"mineru_api_key":"a","mineru_server_api_key":"b","paddleocr_vl_cloud_token":"c"}`,
+			want: `{"mineru_api_key":"***","mineru_server_api_key":"***","paddleocr_vl_cloud_token":"***"}`,
+		},
+		{
+			name: "cos secretId and secretKey",
+			in:   `{"secretId":"cos-id","secretKey":"cos-key","region":"ap-guangzhou"}`,
+			want: `{"secretId":"***","secretKey":"***","region":"ap-guangzhou"}`,
+		},
+		{
+			name: "invite and registration urls",
+			in:   `{"invite_url":"https://x/register?token=SECRET","registration_url":"https://x/register?token=SECRET"}`,
+			want: `{"invite_url":"***","registration_url":"***"}`,
+		},
+		{
+			name: "nested maps are redacted at any depth",
+			in: `{"multimodal":{"vlm":{"apiKey":"sk-vlm"},"cos":{"secretId":"cos-id","secretKey":"cos-key",` +
+				`"region":"ap-x"}}}`,
+			want: `{"multimodal":{"vlm":{"apiKey":"***"},"cos":{"secretId":"***","secretKey":"***",` +
+				`"region":"ap-x"}}}`,
+		},
+		{
+			name: "objects inside arrays are redacted",
+			in:   `{"models":[{"apiKey":"a"},{"name":"n","apiToken":"b"}]}`,
+			want: `{"models":[{"apiKey":"***"},{"name":"n","apiToken":"***"}]}`,
+		},
+		{
+			name: "credentials subtree is replaced whole",
+			in:   `{"platform":"wecom","credentials":{"bot_id":"aib-1","bot_secret":"s3","bot_name":"小科"},"name":"x"}`,
+			want: `{"platform":"wecom","credentials":"***","name":"x"}`,
+		},
+		{
+			name: "headers subtree is replaced whole",
+			in:   `{"headers":{"Authorization":"Bearer abc","X-Trace-Id":"t"}}`,
+			want: `{"headers":"***"}`,
+		},
+		{
+			name: "escaped quote inside a JSON secret value",
+			in:   `{"password":"x\"y"}`,
+			want: `{"password":"***"}`,
+		},
+		{
+			name: "escaped unicode inside a JSON secret value",
+			in:   "{\"password\":\"p\\u0022q\"}",
+			want: `{"password":"***"}`,
+		},
+		{
+			name: "wechat qrcode response credentials",
+			in: `{"data":{"status":"confirmed","credentials":{"bot_token":"wx-secret",` +
+				`"ilink_bot_id":"bot-1","ilink_user_id":"u-1"},"baseurl":"https://x"}}`,
+			want: `{"data":{"status":"confirmed","credentials":"***","baseurl":"https://x"}}`,
+		},
+		{
+			name: "non-JSON fallback keeps escaped value quoting intact",
+			in:   `upstream error: {"password":"x\"y"} (status 400)`,
+			want: `upstream error: {"password":"***"} (status 400)`,
+		},
+		{
+			name: "non-JSON fallback redacts numeric and null values",
+			in:   `body {"api_key":12345,"token":null}`,
+			want: `body {"api_key":"***","token":"***"}`,
+		},
+		{
+			name: "truncated JSON tail is still redacted",
+			in:   `{"llm":{"apiKey":"sk-trunc`,
+			want: `{"llm":{"apiKey":"***"`,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := sanitizeBody(tc.in)
-			if got != tc.want {
-				t.Errorf("sanitizeBody(%q)\n got: %s\nwant: %s", tc.in, got, tc.want)
-			}
+			assertSanitized(t, tc.in, tc.want)
 		})
 	}
 }
@@ -155,7 +275,7 @@ func TestReadRequestBodyKeepsShortBodyIntact(t *testing.T) {
 	c, _ := newJSONContext(t, "/api/v1/knowledge-search", payload)
 	got := readRequestBody(c)
 
-	want := `{"query":"refund policy","apiKey":"***"}`
+	want := `{"apiKey":"***","query":"refund policy"}`
 	if got != want {
 		t.Fatalf("readRequestBody() = %q, want %q", got, want)
 	}

@@ -142,7 +142,14 @@ func (h *IMHandler) CreateIMChannel(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": channel})
+	c.JSON(http.StatusOK, gin.H{"data": imChannelResponse(channel)})
+}
+
+// imChannelResponse is the HTTP-safe view of a channel mutation. The stored
+// credentials document (plaintext bot tokens / app secrets) must not be echoed
+// back: the console only needs to know whether credentials are configured.
+func imChannelResponse(channel *im.IMChannel) im.IMChannelSummary {
+	return im.SummarizeIMChannel(*channel)
 }
 
 // ListIMChannels lists all IM channels for an agent.
@@ -302,7 +309,7 @@ func (h *IMHandler) UpdateIMChannel(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": channel})
+	c.JSON(http.StatusOK, gin.H{"data": imChannelResponse(channel)})
 }
 
 func normalizeIMLocale(locale string) (string, error) {
@@ -384,7 +391,7 @@ func (h *IMHandler) ToggleIMChannel(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": channel})
+	c.JSON(http.StatusOK, gin.H{"data": imChannelResponse(channel)})
 }
 
 func writeIMCallbackACK(c *gin.Context, platform string) {

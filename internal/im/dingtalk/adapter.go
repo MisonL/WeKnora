@@ -308,11 +308,11 @@ func (a *Adapter) DownloadFile(ctx context.Context, msg *im.IncomingMessage) (io
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("create download request: %w", err)
+		return nil, "", fmt.Errorf("create download request: %w", secutils.RedactRequestError(err))
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("download file: %w", err)
+		return nil, "", fmt.Errorf("download file: %w", secutils.RedactRequestError(err))
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, err := im.ReadIMResponse(resp.Body)
@@ -320,7 +320,7 @@ func (a *Adapter) DownloadFile(ctx context.Context, msg *im.IncomingMessage) (io
 		if err != nil {
 			return nil, "", fmt.Errorf("read dingtalk download file response: %w", err)
 		}
-		return nil, "", fmt.Errorf("download file returned %d: %s", resp.StatusCode, string(body))
+		return nil, "", fmt.Errorf("download file returned %d: %s", resp.StatusCode, secutils.SummarizeUpstreamBody(body))
 	}
 	return resp.Body, msg.FileName, nil
 }
@@ -548,13 +548,13 @@ func (a *Adapter) replyViaSessionWebhook(ctx context.Context, webhookURL, conten
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(jsonBody))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return fmt.Errorf("create request: %w", secutils.RedactRequestError(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send reply: %w", err)
+		return fmt.Errorf("send reply: %w", secutils.RedactRequestError(err))
 	}
 	defer resp.Body.Close()
 
@@ -563,7 +563,7 @@ func (a *Adapter) replyViaSessionWebhook(ctx context.Context, webhookURL, conten
 		if err != nil {
 			return fmt.Errorf("read dingtalk sessionWebhook response: %w", err)
 		}
-		return fmt.Errorf("dingtalk sessionWebhook returned %d: %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("dingtalk sessionWebhook returned %d: %s", resp.StatusCode, secutils.SummarizeUpstreamBody(respBody))
 	}
 	return nil
 }
@@ -608,7 +608,7 @@ func (a *Adapter) replyViaOpenAPI(ctx context.Context, incoming *im.IncomingMess
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send reply: %w", err)
+		return fmt.Errorf("send reply: %w", secutils.RedactRequestError(err))
 	}
 	defer resp.Body.Close()
 
@@ -617,7 +617,7 @@ func (a *Adapter) replyViaOpenAPI(ctx context.Context, incoming *im.IncomingMess
 		if err != nil {
 			return fmt.Errorf("read dingtalk OpenAPI response: %w", err)
 		}
-		return fmt.Errorf("dingtalk OpenAPI returned %d: %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("dingtalk OpenAPI returned %d: %s", resp.StatusCode, secutils.SummarizeUpstreamBody(respBody))
 	}
 	return nil
 }
@@ -655,7 +655,7 @@ func (a *Adapter) getAccessToken(ctx context.Context) (string, error) {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("request access token: %w", secutils.RedactRequestError(err))
 	}
 	defer resp.Body.Close()
 
@@ -664,7 +664,7 @@ func (a *Adapter) getAccessToken(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("read dingtalk accessToken response: %w", err)
 		}
-		return "", fmt.Errorf("dingtalk accessToken returned %d: %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("dingtalk accessToken returned %d: %s", resp.StatusCode, secutils.SummarizeUpstreamBody(respBody))
 	}
 
 	var result struct {
@@ -707,7 +707,7 @@ func (a *Adapter) dingtalkAPI(ctx context.Context, method, path string, body int
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("do request: %w", err)
+		return nil, fmt.Errorf("do request: %w", secutils.RedactRequestError(err))
 	}
 	defer resp.Body.Close()
 
@@ -716,7 +716,7 @@ func (a *Adapter) dingtalkAPI(ctx context.Context, method, path string, body int
 		return nil, fmt.Errorf("read dingtalk API %s response: %w", path, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("dingtalk API %s returned %d: %s", path, resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("dingtalk API %s returned %d: %s", path, resp.StatusCode, secutils.SummarizeUpstreamBody(respBody))
 	}
 	return respBody, nil
 }
