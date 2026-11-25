@@ -164,14 +164,19 @@ func TestUserUpdatePreservesAccountStatus(t *testing.T) {
 						instructions := "updated preference"
 						stale.Preferences.BrowserSearchInstructions = &instructions
 						stale.PasswordHash = "updated hash"
+						stale.IsSystemAdmin = true
 						require.NoError(t, repo.UpdateUser(ctx, stale))
 
 						stored, err := repo.GetUserByID(ctx, "user")
 						require.NoError(t, err)
 						require.Equal(t, change.active, stored.IsActive,
 							"ordinary updates must preserve account status")
-						require.Equal(t, scope.tenantID, stored.TenantID)
-						require.Equal(t, "updated hash", stored.PasswordHash)
+						require.Equal(t, scope.tenantID, stored.TenantID,
+							"ordinary updates must preserve the tenant pointer")
+						require.Equal(t, "hash", stored.PasswordHash,
+							"ordinary updates must not rewrite credentials")
+						require.False(t, stored.IsSystemAdmin,
+							"ordinary updates must not rewrite the admin flag")
 						require.Equal(t, &instructions, stored.Preferences.BrowserSearchInstructions)
 					})
 				})

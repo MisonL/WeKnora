@@ -182,6 +182,12 @@ func (h *MCPServiceHandler) CreateMCPService(c *gin.Context) {
 		return
 	}
 	service.TenantID = tenantID
+	// IsBuiltin marks a service as platform-owned and globally visible: the
+	// repository lookup (List/GetByID) returns builtin rows to every
+	// workspace, so a tenant Admin setting this flag would inject an entry
+	// into other tenants' agent catalogs. Builtin rows are seeded out of
+	// band; no request path may create one.
+	service.IsBuiltin = false
 
 	// SSRF validation for MCP service URL
 	if service.URL != nil && *service.URL != "" {
@@ -384,6 +390,9 @@ func (h *MCPServiceHandler) UpdateMCPService(c *gin.Context) {
 	var service types.MCPService
 	service.ID = serviceID
 	service.TenantID = tenantID
+	// is_builtin in the update body is ignored, like in Create: builtin rows
+	// are platform-owned and only the seeding path may produce one.
+	service.IsBuiltin = false
 
 	// Track which fields are being updated
 	updateFields := make(map[string]bool)

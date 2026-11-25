@@ -29,3 +29,16 @@ type FileService interface {
 	// when srcPath belongs to a different storage provider than this service.
 	CopyFile(ctx context.Context, srcPath string, tenantID uint64, knowledgeID string) (string, error)
 }
+
+// TenantScopedFileService is the optional half of FileService implemented by
+// drivers whose physical layout is tenant-prefixed (local://{tenant}/...).
+// DeleteFileForTenant refuses a path whose first storage segment does not
+// equal tenantID, so a reference that slipped through a domain-level ownership
+// check still cannot delete another workspace's bytes.
+//
+// Wrappers (resource catalog, storage-backend scope) forward this method so
+// the guard keeps working on chained file services; callers fall back to
+// DeleteFile when a driver does not implement it.
+type TenantScopedFileService interface {
+	DeleteFileForTenant(ctx context.Context, tenantID uint64, filePath string) error
+}

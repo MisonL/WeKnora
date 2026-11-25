@@ -3,6 +3,7 @@ package file
 import (
 	"context"
 	"net/url"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -84,4 +85,41 @@ func TestNormalizePathForBase_StripsStorageBackendScope(t *testing.T) {
 			assert.Equal(t, tc.want, filepath.ToSlash(svc.normalizePathForBase(tc.in)))
 		})
 	}
+}
+
+// DeleteFileForTenant is the storage-layer defense for the chunk-image edit
+// chain: a local:// reference forged to point at another tenant's object must
+// not delete those bytes even if it reached the driver.
+func TestLocalDeleteFileForTenantRejectsOtherTenant(t *testing.T) {
+	base := t.TempDir()
+	svc := NewLocalFileService(base, "").(*localFileService)
+	ctx := context.Background()
+
+	saved, err := svc.SaveBytes(ctx, []byte("bytes"), 7, "image.png", false)
+	require.NoError(t, err)
+	require.Error(t, svc.DeleteFileForTenant(ctx, 99, saved),
+		"other-tenant delete must be refused")
+	// The fatal property is that the file still exists.
+	_, statErr := os.Stat(filepath.Join(base, "7", "exports"))
+	require.NoError(t, statErr, "tenant directory must survive a refused cross-tenant delete")
+	files, err := os.ReadDir(filepath.Join(base, "7", "exports"))
+	require.NoError(t, err)
+	require.Len(t, files, 1, "the file must not be deleted for the wrong tenant")
+
+	require.NoError(t, svc.DeleteFileForTenant(ctx, 7, saved))
+	_, err = os.Stat(filepath.Join(base, "7", "exports", files[0].Name()))
+	require.True(t, os.IsNotExist(err), "the owning tenant may delete its own file")
+}
+
+// Storage-backend scoped paths keep working through the tenant guard.
+func TestLocalDeleteFileForTenantAcceptsStorageScopedPath(t *testing.T) {
+	base := t.TempDir()
+	svc := NewLocalFileService(base, "").(*localFileService)
+	ctx := context.Background()
+
+	saved, err := svc.SaveBytes(ctx, []byte("bytes"), 7, "image.png", false)
+	require.NoError(t, err)
+	scoped := "storage://backend-a/" + saved
+	require.Error(t, svc.DeleteFileForTenant(ctx, 99, scoped))
+	require.NoError(t, svc.DeleteFileForTenant(ctx, 7, scoped))
 }

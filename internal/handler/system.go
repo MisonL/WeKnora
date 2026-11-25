@@ -458,6 +458,21 @@ func (h *SystemHandler) ListParserEngines(c *gin.Context) {
 // @Success      200
 // @Router       /system/docreader/reconnect [post]
 func (h *SystemHandler) ReconnectDocReader(c *gin.Context) {
+	// Defense in depth: the route is registered under the SystemAdmin guard,
+	// but Reconnect swaps the process-wide DocReader for every tenant, so the
+	// handler repeats the check. Without this, moving the route back under a
+	// tenant-role group would silently let a workspace Admin redirect all
+	// tenants' parsing traffic (file bytes and parser credentials included).
+	if !types.IsSystemAdminFromContext(c.Request.Context()) {
+		logger.Warnf(c.Request.Context(),
+			"[system] docreader reconnect denied: system administrator required")
+		c.JSON(http.StatusForbidden, gin.H{
+			"code": 1,
+			"msg":  "仅系统管理员可以重新连接 DocReader",
+		})
+		return
+	}
+
 	var req struct {
 		Addr string `json:"addr" binding:"required"`
 	}
@@ -1402,7 +1417,7 @@ func (h *SystemHandler) PromoteUserToSystemAdmin(c *gin.Context) {
 		return
 	}
 	user.IsSystemAdmin = true
-	if err := h.userSvc.UpdateUser(ctx, user); err != nil {
+	if err := h.userSvc.SetUserSystemAdmin(ctx, user.ID, true); err != nil {
 		logger.Errorf(ctx, "Error promoting user %s to system admin: %v", req.UserID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to promote user"})
 		return

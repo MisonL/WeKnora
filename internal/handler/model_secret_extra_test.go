@@ -36,6 +36,7 @@ func (s *stubUpdateModelService) UpdateModel(_ context.Context, m *types.Model) 
 }
 
 const (
+	rerankOrigin        = "https://rerank.example.com/v1"
 	secretExtraProvider = "handler-secret-extra-vendor"
 	// plainExtraProvider declares no secret extra field at all — the vendor a
 	// row is switched *to* in the provider-change tests below.
@@ -62,12 +63,14 @@ func registerSecretExtraVendor(t *testing.T) {
 
 func storedSecretExtraModel() *types.Model {
 	return &types.Model{
-		ID:     "m-rerank",
-		Name:   "rerank-v1",
-		Type:   types.ModelTypeRerank,
-		Source: types.ModelSourceRemote,
+		ID:       "m-rerank",
+		Name:     "rerank-v1",
+		Type:     types.ModelTypeRerank,
+		Source:   types.ModelSourceRemote,
+		TenantID: testTenantID,
 		Parameters: types.ModelParameters{
 			Provider: secretExtraProvider,
+			BaseURL:  rerankOrigin,
 			APIKey:   "AKID-public-id",
 			ExtraConfig: map[string]string{
 				"secret_key": "cam-secret-stored",
@@ -198,12 +201,13 @@ func TestFillSecretsFromStoredModel_FillsRedactedSecretExtra(t *testing.T) {
 	req := &ModelTestRequest{
 		ModelID:     "m-rerank",
 		Provider:    secretExtraProvider,
+		BaseURL:     rerankOrigin,
 		APIKey:      "AKID-typed-by-user",
 		AppSecret:   "unused",
 		ExtraConfig: map[string]string{"region": "ap-beijing"},
 	}
 
-	h.fillSecretsFromStoredModel(context.Background(), req)
+	h.fillSecretsFromStoredModel(tenantCtx(testTenantID), req)
 
 	assert.Equal(t, "cam-secret-stored", req.ExtraConfig["secret_key"])
 	assert.Equal(t, "ap-beijing", req.ExtraConfig["region"])
@@ -223,11 +227,13 @@ func TestFillSecretsFromStoredModel_SkipsSecretExtraOfAnotherVendor(t *testing.T
 	req := &ModelTestRequest{
 		ModelID:     "m-rerank",
 		Provider:    plainExtraProvider,
+		BaseURL:     "https://plain.example.com/v1",
 		ExtraConfig: map[string]string{"api": "openai_completions"},
 	}
 
-	h.fillSecretsFromStoredModel(context.Background(), req)
+	h.fillSecretsFromStoredModel(tenantCtx(testTenantID), req)
 
 	assert.NotContains(t, req.ExtraConfig, "secret_key")
-	assert.Equal(t, "AKID-public-id", req.APIKey, "the api_key still comes from the stored row")
+	assert.Empty(t, req.APIKey,
+		"the stored key belongs to the integration being replaced and must not follow a different origin")
 }

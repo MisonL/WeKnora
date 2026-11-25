@@ -151,6 +151,27 @@ func cfgWithRBAC(enabled bool) *config.Config {
 	return &config.Config{Tenant: &config.TenantConfig{EnableRBAC: &enabled}}
 }
 
+// cfgWithRBACAndCross also sets the deployment cross-tenant switch, which
+// gates whether CanAccessAllTenants grants a visitor role.
+func cfgWithRBACAndCross(rbac, cross bool) *config.Config {
+	return &config.Config{Tenant: &config.TenantConfig{
+		EnableRBAC: &rbac, EnableCrossTenantAccess: cross,
+	}}
+}
+
+// A lingering CanAccessAllTenants attribute must not grant Admin in a
+// foreign workspace once the deployment switch is closed.
+func TestResolveTenantRole_CrossTenantSuperuserDeniedWhenSwitchOff(t *testing.T) {
+	svc := newFakeMemberService()
+	user := &types.User{ID: "super", TenantID: 1, CanAccessAllTenants: true}
+
+	got, ok := resolveTenantRole(context.Background(), svc, user, 99, true,
+		cfgWithRBACAndCross(true, false))
+	if ok {
+		t.Fatalf("cross-tenant superuser must be denied when EnableCrossTenantAccess=false, got role=%v", got)
+	}
+}
+
 func TestResolveTenantRole_ActiveMembershipWins(t *testing.T) {
 	svc := newFakeMemberService()
 	svc.seedActive("u1", 10, types.TenantRoleContributor)
@@ -170,7 +191,7 @@ func TestResolveTenantRole_CrossTenantSuperuserGetsAdmin_NoAutoPromote(t *testin
 	svc := newFakeMemberService()
 	user := &types.User{ID: "super", TenantID: 1, CanAccessAllTenants: true}
 
-	got, ok := resolveTenantRole(context.Background(), svc, user, 99, true, cfgWithRBAC(true))
+	got, ok := resolveTenantRole(context.Background(), svc, user, 99, true, cfgWithRBACAndCross(true, true))
 	if !ok || got != types.TenantRoleAdmin {
 		t.Fatalf("got (%v, %v), want (admin, true)", got, ok)
 	}
@@ -185,7 +206,7 @@ func TestResolveTenantRole_AutoPromoteRequiresHomeTenant(t *testing.T) {
 	svc := newFakeMemberService() // 空 — 任何空间都是孤儿
 	user := &types.User{ID: "u1", TenantID: 1, CanAccessAllTenants: true}
 
-	got, ok := resolveTenantRole(context.Background(), svc, user, 42, true, cfgWithRBAC(true))
+	got, ok := resolveTenantRole(context.Background(), svc, user, 42, true, cfgWithRBACAndCross(true, true))
 	if !ok || got != types.TenantRoleAdmin {
 		t.Fatalf("cross-tenant superuser should still get visitor Admin, got (%v, %v)", got, ok)
 	}

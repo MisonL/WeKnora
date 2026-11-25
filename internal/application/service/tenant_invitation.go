@@ -196,17 +196,18 @@ func (s *tenantInvitationService) Create(
 	return inv, nil
 }
 
-// Accept transitions a pending invitation into accepted AND creates
-// the active tenant_members row in the same flow. We do NOT wrap both
-// writes in a single DB transaction because TenantMemberService.AddMember
-// owns its own write + audit emit and reaching across services here
-// would force the audit-log writes to commit/rollback in lockstep.
-// Instead, we order operations so the user-visible failure mode is
-// "you couldn't accept the invitation"; if the membership insert fails
-// AFTER the invitation transition committed (rare; collision on the
-// tenant_members unique index would be the only realistic case), the
-// row already in tenant_members wins and a subsequent Accept call sees
-// ErrInvitationNotPending which the handler renders as 409.
+// Accept creates the active tenant_members row and transitions a pending
+// invitation into accepted. We do NOT wrap both writes in a single DB
+// transaction because TenantMemberService.AddMember owns its own write + audit
+// emit and reaching across services here would force the audit-log writes to
+// commit/rollback in lockstep. Instead the operations are ordered so a failure
+// stays retryable: the membership (idempotent upsert) is written FIRST and the
+// invitation is consumed only after it succeeds. A transient AddMember failure
+// therefore leaves the invitation pending and a retry can complete the join.
+//
+// The previous ordering marked the invitation accepted before AddMember, so a
+// failure consumed the invitation while the user never joined: every retry
+// returned ErrInvitationNotPending and the invitee was stuck.
 func (s *tenantInvitationService) Accept(
 	ctx context.Context,
 	invID uint64,
@@ -235,37 +236,51 @@ func (s *tenantInvitationService) Accept(
 	}
 
 	now := s.now()
-	if err := s.repo.MarkStatusIfPending(ctx, invID, types.TenantInvitationStatusAccepted, now); err != nil {
-		// Another goroutine (concurrent click) won the race. Honour
-		// the state machine.
-		return nil, ErrInvitationNotPending
-	}
 
-	// Create the actual tenant_members row. Cross-service hop: the
-	// member service handles its own audit (rbac.member_added) and
-	// also enforces the (user, tenant) uniqueness invariant via the
-	// repo. If it fails here the invitation is already accepted —
-	// see comment above for why we don't rollback the invitation.
+	// Create the actual tenant_members row FIRST. Cross-service hop: the
+	// member service handles its own audit (rbac.member_added) and also
+	// enforces the (user, tenant) uniqueness invariant via the repo, so the
+	// call is idempotent on an existing membership. On failure the invitation
+	// is still pending and a retry is possible.
 	member, err := s.memberSvc.AddMember(ctx, inv.InviteeUserID, inv.TenantID, inv.Role, inv.InvitedBy)
 	if err != nil {
-		// Special-case "already a member": that's the idempotent
-		// outcome we want. Return the existing membership instead of
-		// bubbling the error up to the invitee.
+		// Special-case "already a member": that's the idempotent outcome we
+		// want. Return the existing membership instead of bubbling the error
+		// up to the invitee.
 		if errors.Is(err, ErrMembershipAlreadyExists) {
 			existing, getErr := s.memberSvc.GetMembership(ctx, inv.InviteeUserID, inv.TenantID)
 			if getErr == nil && existing != nil {
-				s.emitInvitationAccepted(ctx, inv)
+				s.finishAcceptedInvitation(ctx, invID, inv, now)
 				return existing, nil
 			}
 		}
 		logger.Errorf(ctx,
-			"invitation %d accepted but tenant_members insert failed: %v",
+			"invitation %d accept failed before the membership was created; invitation stays pending: %v",
 			invID, err)
 		return nil, err
 	}
 
-	s.emitInvitationAccepted(ctx, inv)
+	// The user is now a member; consume the invitation. A concurrent accept
+	// may have claimed the transition first, which is harmless — the
+	// membership exists either way, so this remains a success.
+	s.finishAcceptedInvitation(ctx, invID, inv, now)
 	return member, nil
+}
+
+// finishAcceptedInvitation flips a pending row to accepted and emits the
+// audit event. It runs only after the membership row exists; a failed CAS is
+// logged rather than surfaced because the user-visible join already happened.
+func (s *tenantInvitationService) finishAcceptedInvitation(
+	ctx context.Context,
+	invID uint64,
+	inv *types.TenantInvitation,
+	now time.Time,
+) {
+	if err := s.repo.MarkStatusIfPending(ctx, invID, types.TenantInvitationStatusAccepted, now); err != nil {
+		logger.Warnf(ctx,
+			"invitation %d accepted but status transition failed (membership exists): %v", invID, err)
+	}
+	s.emitInvitationAccepted(ctx, inv)
 }
 
 // MarkPendingAcceptedIfExists reconciles a stale per-user pending row when

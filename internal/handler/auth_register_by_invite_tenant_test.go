@@ -36,6 +36,14 @@ func (s *invitedRegistrationUserService) UpdateUser(_ context.Context, user *typ
 	return nil
 }
 
+func (s *invitedRegistrationUserService) SetUserTenantID(
+	_ context.Context, _ string, tenantID uint64,
+) error {
+	s.updatedTenant = tenantID
+	s.updateCalls = append(s.updateCalls, tenantID)
+	return nil
+}
+
 func (s *invitedRegistrationUserService) GenerateTokens(context.Context, *types.User) (string, string, error) {
 	return "access", "refresh", nil
 }

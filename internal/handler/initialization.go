@@ -1925,6 +1925,13 @@ type ModelTestRequest struct {
 // actively typing a new key they want to verify. Missing or inaccessible
 // model is treated as a no-op (the connection test will fail downstream
 // with a clearer "missing apiKey" error than we could produce here).
+//
+// Credentials are lent only under two conditions: the stored row is owned by
+// the caller's tenant (or is a platform builtin), and the request BaseURL has
+// the same scheme+host+port origin as the stored BaseURL. Both guards exist
+// because req.BaseURL is caller-controlled — without them a tenant Admin
+// could point a test at their own server and harvest a builtin model's key
+// (or another workspace's key).
 func (h *InitializationHandler) fillSecretsFromStoredModel(ctx context.Context, req *ModelTestRequest) {
 	if req == nil || req.ModelID == "" {
 		return
@@ -1937,30 +1944,72 @@ func (h *InitializationHandler) fillSecretsFromStoredModel(ctx context.Context, 
 		dto.HasAllSecretExtras(req.Provider, req.BaseURL, req.ExtraConfig) {
 		return
 	}
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || tenantID == 0 {
+		// Every test-connection route is tenant-scoped. Without a resolved
+		// workspace there is no safe owner to compare the stored row's
+		// tenant against, so fail closed instead of leaking a credential.
+		logger.Warnf(ctx, "test-connection: no tenant in context, leaving secrets empty")
+		return
+	}
 	stored, err := h.modelService.GetModelByID(ctx, req.ModelID)
 	if err != nil || stored == nil {
 		logger.Warnf(ctx, "test-connection: stored model %s not found, leaving secrets empty: %v",
 			utils.SanitizeForLog(req.ModelID), err)
 		return
 	}
+	// GetModelByID already scopes to (tenant_id = caller OR is_builtin), but
+	// the check is repeated here so a future lookup change cannot turn this
+	// convenience into a cross-tenant credential oracle. Builtin models are
+	// platform-owned shared rows, not another tenant's data.
+	if stored.TenantID != tenantID && !stored.IsBuiltin {
+		logger.Warnf(ctx,
+			"test-connection: stored model %s belongs to tenant %d (caller %d), leaving secrets empty",
+			utils.SanitizeForLog(req.ModelID), stored.TenantID, tenantID)
+		return
+	}
 	if req.Spec == nil && req.Provider == stored.Parameters.Provider {
 		req.Spec = stored.Parameters.Spec
 	}
-	if req.APIKey == "" {
-		req.APIKey = stored.Parameters.APIKey
+	// The BaseURL comes from the request, so a stored key may only be attached
+	// when the request still points at the origin the key was issued for.
+	// Otherwise "test connection" would ship a platform (or workspace) secret
+	// to any host the caller names.
+	sameOrigin := dto.SameOrigin(req.BaseURL, stored.Parameters.BaseURL)
+	if sameOrigin {
+		if req.APIKey == "" {
+			req.APIKey = stored.Parameters.APIKey
+		}
+		if req.AppSecret == "" {
+			req.AppSecret = stored.Parameters.AppSecret
+		}
+		// Same contract as PUT /models/{id}: an absent or masked secret extra
+		// falls back to the stored value, a real one the user just typed wins —
+		// and a test against a different vendor gets no stored credential, which
+		// belongs to the integration the row is being moved away from.
+		req.ExtraConfig = dto.PreserveStoredSecretExtras(
+			stored.Parameters.ExtraConfig, req.ExtraConfig,
+			dto.VendorRef{Provider: stored.Parameters.Provider, BaseURL: stored.Parameters.BaseURL},
+			dto.VendorRef{Provider: req.Provider, BaseURL: req.BaseURL},
+		)
+		return
 	}
-	if req.AppSecret == "" {
-		req.AppSecret = stored.Parameters.AppSecret
+	// Different origin: fill only non-secret provider settings (extra_config
+	// values the vendor does not declare secret), never api_key, app_secret or
+	// a secret extra. Non-secret settings are what make the test meaningful;
+	// the credentials stay bound to their origin.
+	if req.ExtraConfig == nil && len(stored.Parameters.ExtraConfig) > 0 {
+		secretKeys := dto.SecretExtraConfigKeys(stored.Parameters.Provider, stored.Parameters.BaseURL)
+		nonSecret := make(map[string]string, len(stored.Parameters.ExtraConfig))
+		for key, value := range stored.Parameters.ExtraConfig {
+			if !secretKeys[key] {
+				nonSecret[key] = value
+			}
+		}
+		if len(nonSecret) > 0 {
+			req.ExtraConfig = nonSecret
+		}
 	}
-	// Same contract as PUT /models/{id}: an absent or masked secret extra
-	// falls back to the stored value, a real one the user just typed wins —
-	// and a test against a different vendor gets no stored credential, which
-	// belongs to the integration the row is being moved away from.
-	req.ExtraConfig = dto.PreserveStoredSecretExtras(
-		stored.Parameters.ExtraConfig, req.ExtraConfig,
-		dto.VendorRef{Provider: stored.Parameters.Provider, BaseURL: stored.Parameters.BaseURL},
-		dto.VendorRef{Provider: req.Provider, BaseURL: req.BaseURL},
-	)
 }
 
 // RemoteModelCheckRequest 兼容旧 swagger 定义。

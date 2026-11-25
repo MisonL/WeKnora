@@ -1251,7 +1251,7 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 			}
 			storageAdjust -= knowledge.StorageSize
 		}
-		deleteExtractedImages(ctx, s.fileSvc, knowledgeResourceOwners(s.resourceCatalog, knowledgeIDs...), imageURLs)
+		deleteExtractedImages(ctx, s.fileSvc, knowledgeResourceOwners(s.resourceCatalog, knowledgeIDs...), tenantID, imageURLs)
 		if storageAdjust != 0 {
 			if err := s.tenantRepo.AdjustStorageUsed(ctx, tenantID, storageAdjust); err != nil {
 				logger.Warnf(ctx, "Failed to adjust tenant storage: %v", err)

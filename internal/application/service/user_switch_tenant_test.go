@@ -37,6 +37,41 @@ func (r *switchTenantUserRepo) UpdateUser(_ context.Context, user *types.User) e
 	return nil
 }
 
+// UpdateUserPreferencesOnly mirrors a column-scoped UPDATE: it never touches
+// account status or the admin flag.
+func (r *switchTenantUserRepo) UpdateUserPreferencesOnly(
+	_ context.Context, userID string, prefs types.UserPreferences,
+) error {
+	r.updateCalls++
+	if r.failUpdates {
+		return errors.New("simulated update failure")
+	}
+	stored, ok := r.users[userID]
+	if !ok {
+		return errors.New("user not found")
+	}
+	stored.Preferences = prefs
+	r.users[userID] = stored
+	return nil
+}
+
+// UpdateUserTenantID mirrors the dedicated tenant setter.
+func (r *switchTenantUserRepo) UpdateUserTenantID(
+	_ context.Context, userID string, tenantID uint64,
+) error {
+	r.updateCalls++
+	if r.failUpdates {
+		return errors.New("simulated update failure")
+	}
+	stored, ok := r.users[userID]
+	if !ok {
+		return errors.New("user not found")
+	}
+	stored.TenantID = tenantID
+	r.users[userID] = stored
+	return nil
+}
+
 type countingAuthTokenRepo struct {
 	stubAuthTokenRepo
 	createCalls int
@@ -170,6 +205,7 @@ func TestSwitchTenantSuperuserRecordsPreferenceWithoutMembership(t *testing.T) {
 		"alice": {ID: "alice", TenantID: 7, CanAccessAllTenants: true},
 	}}
 	svc := newSwitchTenantTestService(repo, &membershipLookupService{byTenant: map[uint64]*types.TenantMember{}})
+	svc.config = crossTenantConfig(true)
 	user, _ := repo.GetUserByID(ctx, "alice")
 
 	resp, err := svc.SwitchTenant(ctx, user, 42, "")

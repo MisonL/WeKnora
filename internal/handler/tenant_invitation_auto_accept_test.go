@@ -73,6 +73,12 @@ func (s *autoAcceptUserSvc) UpdateUser(_ context.Context, user *types.User) erro
 	return nil
 }
 
+func (s *autoAcceptUserSvc) SetUserTenantID(_ context.Context, _ string, tenantID uint64) error {
+	s.updateCalled = true
+	s.updatedTenant = tenantID
+	return nil
+}
+
 // autoAcceptInvitationSvc records whether the classic pending-invitation
 // flow was reached (it must NOT run when auto-accept is on).
 type autoAcceptInvitationSvc struct {

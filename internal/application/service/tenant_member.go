@@ -447,10 +447,16 @@ func (s *tenantMemberService) cleanupRemovedMemberState(ctx context.Context, use
 				changed = true
 			}
 			if changed {
-				user.UpdatedAt = time.Now()
-				if err := s.userRepo.UpdateUser(ctx, user); err != nil {
+				// Column-scoped writes: this cleanup must never replay the
+				// stale snapshot onto status/admin/password columns.
+				if err := s.userRepo.UpdateUserTenantID(ctx, userID, user.TenantID); err != nil {
 					logger.Warnf(ctx,
-						"RemoveMember cleanup: failed to clear stale tenant pointers for user %s tenant %d: %v",
+						"RemoveMember cleanup: failed to clear stale tenant pointer for user %s tenant %d: %v",
+						userID, tenantID, err)
+				}
+				if err := s.userRepo.UpdateUserPreferencesOnly(ctx, userID, user.Preferences); err != nil {
+					logger.Warnf(ctx,
+						"RemoveMember cleanup: failed to clear stale preferences for user %s tenant %d: %v",
 						userID, tenantID, err)
 				}
 			}

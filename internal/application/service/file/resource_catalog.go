@@ -228,6 +228,33 @@ func (s *resourceCatalogFileService) DeleteFile(ctx context.Context, filePath st
 	return nil
 }
 
+// DeleteFileForTenant forwards the tenant guard to the provider driver (when it
+// implements one) and additionally rejects a catalog resource owned by a
+// different tenant before any bytes are touched.
+func (s *resourceCatalogFileService) DeleteFileForTenant(
+	ctx context.Context, tenantID uint64, filePath string,
+) error {
+	physical, resource, err := s.catalog.ResolvePath(ctx, filePath)
+	if err != nil {
+		return err
+	}
+	if resource != nil && resource.TenantID != tenantID {
+		return fmt.Errorf("file does not belong to tenant %d", tenantID)
+	}
+	if scoped, ok := s.inner.(interfaces.TenantScopedFileService); ok {
+		err = scoped.DeleteFileForTenant(ctx, tenantID, physical)
+	} else {
+		err = s.inner.DeleteFile(ctx, physical)
+	}
+	if err != nil {
+		return err
+	}
+	if resource != nil {
+		return s.catalog.MarkDeleted(ctx, filePath)
+	}
+	return nil
+}
+
 func (s *resourceCatalogFileService) CopyFile(
 	ctx context.Context,
 	filePath string,

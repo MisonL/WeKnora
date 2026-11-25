@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -152,6 +153,41 @@ func (s *localFileService) DeleteFile(ctx context.Context, filePath string) erro
 
 	logger.Info(ctx, "File deleted successfully")
 	return nil
+}
+
+// DeleteFileForTenant deletes a file only when the storage path's first
+// segment — the tenant directory written by SaveFile / SaveBytes / CopyFile —
+// equals tenantID. It is a defense-in-depth guard for callers that already
+// authorized the operation at the domain level: a reference forged to point at
+// another workspace's object must not be able to remove those bytes here.
+func (s *localFileService) DeleteFileForTenant(ctx context.Context, tenantID uint64, filePath string) error {
+	if tenantID == 0 {
+		return fmt.Errorf("tenant-scoped delete requires a tenant id")
+	}
+	pathTenant, ok := s.pathTenantID(filePath)
+	if !ok || pathTenant != tenantID {
+		logger.Warnf(ctx, "Refusing tenant-scoped delete of %s for tenant %d", filePath, tenantID)
+		return fmt.Errorf("file does not belong to tenant %d", tenantID)
+	}
+	return s.DeleteFile(ctx, filePath)
+}
+
+// pathTenantID extracts the leading tenant segment from a storage path. It
+// accepts every form normalizePathForBase understands (storage:// scope,
+// local:// scheme, absolute or baseDir-relative paths) and reports false when
+// the path escapes baseDir or has no numeric first segment.
+func (s *localFileService) pathTenantID(filePath string) (uint64, bool) {
+	candidate := s.normalizePathForBase(filePath)
+	rel, err := filepath.Rel(filepath.Clean(s.baseDir), filepath.Clean(candidate))
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return 0, false
+	}
+	first, _, _ := strings.Cut(filepath.ToSlash(rel), "/")
+	tenantID, err := strconv.ParseUint(first, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return tenantID, true
 }
 
 // CopyFile copies an existing local object to a new knowledge-owned object.
