@@ -12,6 +12,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var ErrChunkRevisionConflict = errors.New("chunk revision conflict")
@@ -782,11 +783,14 @@ func (r *chunkRepository) answerStrategySQL() string {
 // soft-deleted. Rows a concurrent write changed since the plan are left
 // untouched and are not in the result.
 //
-// The ids are read back after each batch rather than assumed from the plan: the
-// row can change between the statement's check and its execution, and the caller
-// deletes vectors with them. The read-back is by tenant and id, so a row another
-// writer soft-deleted in the same window is reported too; that row is dead
-// either way, and deleting dead vectors twice is harmless.
+// Each batch runs as one transaction: it selects the still-live ids under the
+// same identity predicate, deletes exactly those ids, and commits. On Postgres
+// and MySQL the select takes row locks, so the identity cannot move between the
+// select and the delete. The result is therefore exactly the rows this batch
+// deleted -- a row another writer soft-deleted before the select is not live
+// and is never reported, and a read-back failure rolls the batch back instead
+// of losing ids the caller needs to delete vectors for. Earlier committed
+// batches stay in the result alongside the error.
 func (r *chunkRepository) DeleteChunksIfUnchanged(
 	ctx context.Context, tenantID uint64, chunks []*types.Chunk,
 ) ([]string, error) {
@@ -802,7 +806,6 @@ func (r *chunkRepository) DeleteChunksIfUnchanged(
 		batch := chunks[i:end]
 		var conds []string
 		var args []interface{}
-		batchIDs := make([]string, 0, len(batch))
 		strategySQL := r.answerStrategySQL()
 		for _, c := range batch {
 			// COALESCE: a row whose seq id was never assigned (lite/SQLite, no
@@ -817,36 +820,78 @@ func (r *chunkRepository) DeleteChunksIfUnchanged(
 				" AND "+strategySQL+" = ?)")
 			args = append(args, c.ID, c.SeqID, c.ContentHash, c.TagID, c.IsEnabled, int(c.Flags),
 				chunkAnswerStrategy(c))
-			batchIDs = append(batchIDs, c.ID)
 		}
-		res := r.db.WithContext(ctx).
-			Where("tenant_id = ?", tenantID).
-			Where(strings.Join(conds, " OR "), args...).
-			Delete(&types.Chunk{})
-		if res.Error != nil {
-			return deleted, res.Error
+		var batchDeleted []string
+		txErr := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			// The model's soft-delete scope adds deleted_at IS NULL, so only
+			// rows still in the world are selected.
+			selectQuery := tx.Model(&types.Chunk{}).
+				Where("tenant_id = ?", tenantID).
+				Where(strings.Join(conds, " OR "), args...)
+			// SQLite has no row-level locking; its transaction already holds
+			// the write lock by the time the delete runs.
+			if tx.Dialector.Name() != "sqlite" {
+				selectQuery = selectQuery.Clauses(clause.Locking{Strength: "UPDATE"})
+			}
+			var ids []string
+			if err := selectQuery.Pluck("id", &ids).Error; err != nil {
+				return err
+			}
+			if len(ids) == 0 {
+				return nil
+			}
+			res := tx.Where("tenant_id = ? AND id IN ?", tenantID, ids).Delete(&types.Chunk{})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 0 {
+				return nil
+			}
+			// With row locks the delete reached every selected id. Without them
+			// (SQLite) a row can vanish between the select and the delete, and
+			// nothing in the row can prove whether this statement or another
+			// writer removed it. Reporting none of the batch keeps ids another
+			// writer already claimed out of the caller's refund; the vectors of
+			// any row this statement did reach are covered by the flagged
+			// index-delete task the caller queues before deleting.
+			if int(res.RowsAffected) < len(ids) {
+				return nil
+			}
+			batchDeleted = ids
+			return nil
+		})
+		if txErr != nil {
+			return deleted, txErr
 		}
-		if res.RowsAffected == 0 {
-			continue
-		}
-		// The read-back is scoped by tenant and id, so a row another writer
-		// soft-deleted in this batch's window is already at deleted_at and is
-		// reported too. That is deliberate: such a row is dead either way, the
-		// writer that deleted it removes its vectors on the same path, and no
-		// code path restores a soft-deleted chunk (SeqIDsInUse reads them with
-		// Unscoped only to keep the unique index honest). A row that was
-		// rewritten and then deleted by another writer is likewise not ours to
-		// index, and removing dead vectors twice is harmless.
-		var gone []string
-		if err := r.db.WithContext(ctx).Unscoped().
-			Model(&types.Chunk{}).
-			Where("tenant_id = ? AND id IN ? AND deleted_at IS NOT NULL", tenantID, batchIDs).
-			Pluck("id", &gone).Error; err != nil {
-			return deleted, err
-		}
-		deleted = append(deleted, gone...)
+		deleted = append(deleted, batchDeleted...)
 	}
 	return deleted, nil
+}
+
+// SoftDeletedChunkIDs returns the subset of ids whose chunk row of the tenant
+// is soft-deleted. Batched to stay under the dialects' bind-parameter limits.
+func (r *chunkRepository) SoftDeletedChunkIDs(
+	ctx context.Context, tenantID uint64, ids []string,
+) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(ids))
+	for i := 0; i < len(ids); i += chunkFenceBatchSize {
+		end := i + chunkFenceBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		var batch []string
+		if err := r.db.WithContext(ctx).Unscoped().
+			Model(&types.Chunk{}).
+			Where("tenant_id = ? AND id IN ? AND deleted_at IS NOT NULL", tenantID, ids[i:end]).
+			Pluck("id", &batch).Error; err != nil {
+			return out, err
+		}
+		out = append(out, batch...)
+	}
+	return out, nil
 }
 
 // DeleteChunks deletes chunks by IDs in batch.

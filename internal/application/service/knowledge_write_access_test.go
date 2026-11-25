@@ -100,6 +100,9 @@ type faqWriteFixture struct {
 	deletes *writeChunkDeleter
 	index   *writeIndexSpy
 	kb      *types.KnowledgeBase
+	creator *recordingChunkCreator
+	files   *recordingFileService
+	queue   *recordingEnqueuer
 }
 
 func newFAQWriteFixture(t *testing.T) *faqWriteFixture {
@@ -113,11 +116,18 @@ func newFAQWriteFixture(t *testing.T) *faqWriteFixture {
 	chunks := &writeChunkSpy{ChunkRepository: repository.NewChunkRepository(db)}
 	deletes := &writeChunkDeleter{}
 	index := &writeIndexSpy{}
+	creator := &recordingChunkCreator{inner: deletes, repo: chunks}
+	files := &recordingFileService{}
+	queue := &recordingEnqueuer{}
 	svc := &knowledgeService{
-		kbService: lookup, chunkRepo: chunks, chunkService: deletes,
+		kbService: lookup, chunkRepo: chunks, chunkService: creator,
 		tagRepo: repository.NewKnowledgeTagRepository(db), repo: repository.NewKnowledgeRepository(db),
 		retrieveEngine: &fakeFanoutRegistry{byStore: map[string]interfaces.RetrieveEngineService{store: index}},
 		ownership:      &fakeOwnership{owned: map[string]uint64{store: 7}},
+		modelService:   faqVectorEmbeddings{embedding: &faqVectorEmbedder{}},
+		fileSvc:        files,
+		task:           queue,
+		tenantRepo:     &faqImportTenantLookup{},
 	}
 	base := types.WithCaller(
 		context.Background(),
@@ -178,6 +188,9 @@ func newFAQWriteFixture(t *testing.T) *faqWriteFixture {
 		deletes: deletes,
 		index:   index,
 		kb:      kb,
+		creator: creator,
+		files:   files,
+		queue:   queue,
 	}
 }
 

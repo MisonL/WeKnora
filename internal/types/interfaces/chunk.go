@@ -118,10 +118,18 @@ type ChunkRepository interface {
 	// DeleteChunksIfUnchanged deletes each listed chunk only while its row still
 	// carries that planned identity, and returns the ids it left soft-deleted --
 	// including the ids of batches that already succeeded when a later batch
-	// fails, which come back alongside the error. Rows that changed since the
-	// plan are left alone and absent from the result, so a caller can scope
-	// follow-up work (vector deletion) to exactly the rows it removed.
+	// fails, which come back alongside the error. Each batch selects the still
+	// live ids under the same identity predicate (row-locked where the dialect
+	// supports it), deletes exactly those ids and commits as one transaction, so
+	// a read-back failure cannot lose a committed batch and a row another writer
+	// already soft-deleted is never reported as deleted here. Rows that changed
+	// since the plan are left alone and absent from the result, so a caller can
+	// scope follow-up work (vector deletion) to exactly the rows it removed.
 	DeleteChunksIfUnchanged(ctx context.Context, tenantID uint64, chunks []*types.Chunk) ([]string, error)
+	// SoftDeletedChunkIDs returns the subset of ids whose chunk row of the
+	// tenant is soft-deleted. The index-delete worker uses it to touch vectors
+	// only for rows a fenced delete actually reached.
+	SoftDeletedChunkIDs(ctx context.Context, tenantID uint64, ids []string) ([]string, error)
 	// DeleteChunksByKnowledgeID deletes chunks by knowledge id
 	DeleteChunksByKnowledgeID(ctx context.Context, tenantID uint64, knowledgeID string) error
 	// DeleteByKnowledgeList deletes all chunks for a knowledge list

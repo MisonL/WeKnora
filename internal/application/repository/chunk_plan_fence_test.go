@@ -248,13 +248,11 @@ func TestDeleteChunksIfUnchangedLeavesRowsWhoseTagEnabledOrFlagsMoved(t *testing
 	}
 }
 
-// The read-back after the delete is scoped by tenant and id, so it also sees a
-// row another writer soft-deleted in the same window. That is the intended
-// behaviour, not a leak: the row is dead either way, the writer that deleted it
-// removes its vectors on its own path, and deleting already-dead vectors twice
-// is harmless. This test pins that reading so a future change to the read-back
-// is a deliberate decision rather than an accident.
-func TestDeleteChunksIfUnchangedReadBackCoversRowsAnotherWriterDeleted(t *testing.T) {
+// A row another writer soft-deleted before this delete runs is not live, so the
+// select never sees it and the result must not name it: the caller would
+// otherwise clear vectors for a row it did not delete here, and a tenant's
+// storage refund would be applied twice for the same row.
+func TestDeleteChunksIfUnchangedDoesNotClaimRowsAnotherWriterDeleted(t *testing.T) {
 	db := setupChunkTestDB(t)
 	repo := NewChunkRepository(db)
 	ctx := context.Background()
@@ -275,8 +273,55 @@ func TestDeleteChunksIfUnchangedReadBackCoversRowsAnotherWriterDeleted(t *testin
 
 	removed, err := repo.DeleteChunksIfUnchanged(ctx, 7, planned)
 	require.NoError(t, err)
-	require.ElementsMatch(t, []string{"ours", "theirs"}, removed,
-		"both rows are unreachable afterwards; the caller may clear vectors for either")
+	require.Equal(t, []string{"ours"}, removed,
+		"only the row this call deleted; the other writer owns the refund for theirs")
 	_, err = repo.GetChunkByID(ctx, 7, "theirs")
 	require.Error(t, err, "neither row is live")
+}
+
+// When a later batch fails, the ids of batches that already committed are the
+// only record of the rows they removed: the import's retry replans from live
+// rows and cannot see them again. They must come back with the error.
+func TestDeleteChunksIfUnchangedKeepsCommittedBatchesWhenALaterReadFails(t *testing.T) {
+	db := setupChunkTestDB(t)
+	repo := NewChunkRepository(db)
+	ctx := context.Background()
+
+	const total = chunkFenceBatchSize + 5
+	rows := make([]*types.Chunk, 0, total)
+	for i := 0; i < total; i++ {
+		rows = append(rows, &types.Chunk{
+			ID: fmt.Sprintf("c%03d", i), TenantID: 7, KnowledgeBaseID: "kb",
+			ChunkType: types.ChunkTypeFAQ, ContentHash: "h",
+		})
+	}
+	require.NoError(t, db.CreateInBatches(rows, 100).Error)
+	planned := make([]*types.Chunk, 0, total)
+	for _, row := range rows {
+		planned = append(planned, plannedFromDB(t, db, row.ID))
+	}
+
+	// Fail the second batch's SELECT, the read-back whose failure used to drop
+	// the first batch's ids from the result.
+	var selects int
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("r23_fail_second_batch",
+		func(tx *gorm.DB) {
+			selects++
+			if selects == 2 {
+				tx.AddError(fmt.Errorf("read-back failed"))
+			}
+		}))
+
+	removed, err := repo.DeleteChunksIfUnchanged(ctx, 7, planned)
+	require.Error(t, err, "the failure is still reported")
+	require.Len(t, removed, chunkFenceBatchSize,
+		"the batch that committed before the failure must not lose its ids")
+
+	// The first batch really is gone; the second batch rolled back.
+	for i := 0; i < chunkFenceBatchSize; i++ {
+		_, getErr := repo.GetChunkByID(ctx, 7, planned[i].ID)
+		require.Error(t, getErr, "committed rows stay deleted")
+	}
+	_, getErr := repo.GetChunkByID(ctx, 7, planned[chunkFenceBatchSize].ID)
+	require.NoError(t, getErr, "the failed batch's transaction rolled back")
 }

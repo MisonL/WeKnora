@@ -59,38 +59,55 @@ func TestCompletedFAQImportReplayLeavesTheRecordAloneWhileAnotherImportRuns(t *t
 // persists only the index list. Reusing that list on a retry that re-decodes
 // the original payload therefore imports entries the first pass had cleaned.
 func TestFAQValidationIsNotReusedAfterTheFirstPassSanitizedEntries(t *testing.T) {
+	payload := &types.FAQImportPayload{TaskID: "task", InstanceID: "inst-a", Entries: make([]types.FAQEntryPayload, 2)}
+
 	require.False(t,
-		faqValidationReusable(&types.FAQImportProgress{ValidEntryIndices: []int{0, 1}, PartialFailedCount: 1}, 2, false),
+		faqValidationReusable(&types.FAQImportProgress{
+			InstanceID: "inst-a", ValidEntryIndices: []int{0, 1}, PartialFailedCount: 1,
+		}, payload),
 		"an attempt whose validation edited entries must re-validate, so the edits are made again")
 
 	require.True(t,
-		faqValidationReusable(&types.FAQImportProgress{ValidEntryIndices: []int{0, 1}}, 2, false),
+		faqValidationReusable(&types.FAQImportProgress{
+			InstanceID: "inst-a", ValidEntryIndices: []int{0, 1},
+		}, payload),
 		"a pass that only dropped whole entries left the kept entries untouched")
 
-	require.False(t,
-		faqValidationReusable(&types.FAQImportProgress{ValidEntryIndices: []int{0, 1}, DryRun: true}, 2, false),
+	dryRun := &types.FAQImportProgress{InstanceID: "inst-a", ValidEntryIndices: []int{0, 1}, DryRun: true}
+	require.False(t, faqValidationReusable(dryRun, payload),
 		"a dry run's validation result answers a different question")
 
 	require.False(t,
-		faqValidationReusable(&types.FAQImportProgress{ValidEntryIndices: []int{0, 5}}, 2, false),
+		faqValidationReusable(&types.FAQImportProgress{
+			InstanceID: "inst-a", ValidEntryIndices: []int{0, 5},
+		}, payload),
 		"an index past the payload cannot be reused")
-	require.False(t, faqValidationReusable(nil, 2, false))
+	require.False(t, faqValidationReusable(nil, payload))
 }
 
 // A record written by a later submission that reused this task id describes a
 // different payload. Treating it as this run's own completed result would
-// acknowledge a task whose entries were never imported.
+// acknowledge a task whose entries were never imported. The same holds for a
+// cached validation result: only the run that produced it may reuse it.
 func TestFAQProgressOwnershipFollowsTheInstanceID(t *testing.T) {
 	payload := &types.FAQImportPayload{TaskID: "task", InstanceID: "inst-a"}
 
 	require.True(t, faqProgressOwnedByInstance(&types.FAQImportProgress{InstanceID: "inst-a"}, payload))
 	require.False(t, faqProgressOwnedByInstance(&types.FAQImportProgress{InstanceID: "inst-b"}, payload),
 		"another instance's record is not this run's result")
-	require.True(t, faqProgressOwnedByInstance(&types.FAQImportProgress{}, payload),
-		"a legacy record carries no instance id and is matched on the task id alone")
-	require.True(t, faqProgressOwnedByInstance(
+	// A record and a payload that each lack an instance id are both legacy
+	// enqueues and still match on the task id alone.
+	require.True(t, faqProgressOwnedByInstance(&types.FAQImportProgress{}, &types.FAQImportPayload{TaskID: "task"}),
+		"two legacy records are the same run")
+	// A mixed pair has no identity to compare: a legacy payload must not claim
+	// a modern record (its validation indices address a different payload), and
+	// neither may a modern payload claim a legacy record.
+	require.False(t, faqProgressOwnedByInstance(
 		&types.FAQImportProgress{InstanceID: "inst-a"}, &types.FAQImportPayload{TaskID: "task"}),
-		"a legacy payload is matched the same way")
+		"a legacy payload does not own a modern record")
+	require.False(t, faqProgressOwnedByInstance(
+		&types.FAQImportProgress{}, &types.FAQImportPayload{TaskID: "task", InstanceID: "inst-a"}),
+		"a modern payload does not own a legacy record")
 }
 
 // partialDeleteChunkRepo deletes part of the plan and then fails, the way the
@@ -139,11 +156,24 @@ func TestDeleteReplacedFAQChunksHandsOverRowsDeletedBeforeAFailedBatch(t *testin
 	err := s.deleteReplacedFAQChunks(ctx, "task-1", 1, kb, &types.Knowledge{ID: "knowledge"}, planned)
 	require.Error(t, err, "the import still reports the failed delete")
 
-	require.Len(t, enqueuer.tasks, 1, "the rows already deleted by an earlier batch have no other recovery path")
-	task := enqueuer.tasks[0]
-	require.Equal(t, types.TypeIndexDelete, task.Type())
-	var payload types.IndexDeletePayload
-	require.NoError(t, json.Unmarshal(task.Payload(), &payload))
-	require.ElementsMatch(t, []string{"c1", "c2"}, payload.ChunkIDs,
-		"only rows this call actually deleted; c3 is still live and keeps its vectors")
+	// The first task covers the whole plan and is queued before the rows go.
+	// The failed batch sequence then reports the ids it already committed, and
+	// the vector backend failure hands the same ids over once more; every task
+	// is idempotent.
+	require.Len(t, enqueuer.tasks, 3,
+		"the rows already deleted by an earlier batch have no other recovery path")
+	var taskIDs [][]string
+	for _, task := range enqueuer.tasks {
+		require.Equal(t, types.TypeIndexDelete, task.Type())
+		var payload types.IndexDeletePayload
+		require.NoError(t, json.Unmarshal(task.Payload(), &payload))
+		require.True(t, payload.OnlyIfDeleted, "only rows that are actually soft-deleted may lose their vectors")
+		taskIDs = append(taskIDs, payload.ChunkIDs)
+	}
+	require.ElementsMatch(t, []string{"c1", "c2", "c3"}, taskIDs[0],
+		"the pre-delete task covers the whole plan")
+	for _, ids := range taskIDs[1:] {
+		require.ElementsMatch(t, []string{"c1", "c2"}, ids,
+			"only rows this call actually deleted; c3 is still live and keeps its vectors")
+	}
 }

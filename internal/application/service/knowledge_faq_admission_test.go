@@ -179,7 +179,7 @@ func TestFAQImportAdmissionRejectsUnreadableMarker(t *testing.T) {
 			case "empty_identity":
 				require.NoError(t, f.mini.Set(markerKey, "{}"))
 			}
-			before, err := f.mini.Get(getFAQImportProgressKey(taskID))
+			before, err := f.mini.Get(getFAQImportProgressKey(f.ctx, taskID))
 			require.NoError(t, err)
 			markerBefore, err := f.mini.Get(markerKey)
 			require.NoError(t, err)
@@ -193,7 +193,7 @@ func TestFAQImportAdmissionRejectsUnreadableMarker(t *testing.T) {
 			require.Error(t, processErr)
 			require.NotErrorIs(t, processErr, asynq.SkipRetry)
 			f.mini.SetError("")
-			after, err := f.mini.Get(getFAQImportProgressKey(taskID))
+			after, err := f.mini.Get(getFAQImportProgressKey(f.ctx, taskID))
 			require.NoError(t, err)
 			require.Equal(t, before, after)
 			markerAfter, err := f.mini.Get(markerKey)
@@ -251,7 +251,7 @@ func TestFAQImportStaleInstanceLeavesTheNewerRecordAlone(t *testing.T) {
 	}
 	raw, err := json.Marshal(newer)
 	require.NoError(t, err)
-	require.NoError(t, f.mini.Set(getFAQImportProgressKey(taskID), string(raw)))
+	require.NoError(t, f.mini.Set(getFAQImportProgressKey(f.ctx, taskID), string(raw)))
 
 	require.ErrorIs(t, f.svc.ProcessFAQImport(f.ctx, task), asynq.SkipRetry)
 

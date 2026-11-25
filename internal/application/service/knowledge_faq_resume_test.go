@@ -63,7 +63,7 @@ func TestFAQIndexDeleteFallbackSplitsThePayload(t *testing.T) {
 	for i := 0; i < 450; i++ {
 		ids = append(ids, fmt.Sprintf("c%03d", i))
 	}
-	s.enqueueFAQIndexDeleteFallback(ctx, 1, kb, ids)
+	s.enqueueFAQIndexDeleteFallback(ctx, 1, kb, ids, true)
 
 	require.Len(t, enqueuer.tasks, 3, "one task per batch, so no single message can be too large")
 	var seen []string
@@ -83,5 +83,5 @@ func TestFAQIndexDeleteFallbackSplitsThePayload(t *testing.T) {
 func TestFAQIndexDeleteFallbackWithoutAnEnqueuerIsANoOp(t *testing.T) {
 	s := &knowledgeService{}
 	s.enqueueFAQIndexDeleteFallback(faqVectorFallbackContext(), 1,
-		&types.KnowledgeBase{ID: "kb"}, []string{"c1"})
+		&types.KnowledgeBase{ID: "kb"}, []string{"c1"}, true)
 }

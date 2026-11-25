@@ -44,6 +44,11 @@ import (
 )
 
 func main() {
+	// Build-identity queries are answered before anything else runs: without
+	// this, `server --version` started a second server instance.
+	if handleVersionArg(os.Args[1:], os.Stdout) {
+		return
+	}
 	// Load dotenv configuration before any container provider reads it.
 	// Explicit ENV_FILE is honored on every build; automatic .env.lite
 	// discovery is scoped to Lite builds (internal/handler.Edition is
