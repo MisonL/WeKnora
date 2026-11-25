@@ -76,8 +76,9 @@ func (s *sessionService) AgentQA(
 
 	// Resolve retrieval tenant using shared helper
 	agentTenantID := s.resolveRetrievalTenantID(ctx, req)
-	logger.Infof(ctx, "Start agent-based question answering, session ID: %s, agent tenant ID: %d, query: %s, session: %s",
-		sessionID, agentTenantID, req.Query, string(sessionJSON))
+	// INFO must not carry the user's question or the serialized session.
+	logger.Infof(ctx, "Start agent-based question answering, session ID: %s, agent tenant ID: %d, query_len: %d, session_bytes: %d",
+		sessionID, agentTenantID, len(req.Query), len(sessionJSON))
 
 	var tenantInfo *types.Tenant
 	if v := ctx.Value(types.TenantInfoContextKey); v != nil {

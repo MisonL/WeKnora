@@ -270,22 +270,22 @@ func (a *Adapter) callAPI(ctx context.Context, method string, body interface{}) 
 
 // callAPIWithResult calls the Telegram Bot API and optionally decodes the result field.
 func (a *Adapter) callAPIWithResult(ctx context.Context, method string, body interface{}, result interface{}) error {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/%s", a.botToken, method)
+	endpoint := botAPIURL(a.botToken, method)
 
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("marshal body: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(jsonBody))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return fmt.Errorf("create request: %w", redactTelegramError(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("do request: %w", err)
+		return fmt.Errorf("do request: %w", redactTelegramError(err))
 	}
 	defer resp.Body.Close()
 
@@ -487,15 +487,15 @@ func (a *Adapter) DownloadFile(ctx context.Context, msg *im.IncomingMessage) (io
 	}
 
 	// Download the file
-	downloadURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", a.botToken, fileInfo.FilePath)
+	downloadURL := botFileURL(a.botToken, fileInfo.FilePath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("create download request: %w", err)
+		return nil, "", fmt.Errorf("create download request: %w", redactTelegramError(err))
 	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("download file: %w", err)
+		return nil, "", fmt.Errorf("download file: %w", redactTelegramError(err))
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -133,6 +134,34 @@ func buildSensitiveFieldRegex() *regexp.Regexp {
 // are capped at 10KB, and an image upload still fills that cap with file bytes.
 var dataURIRegex = regexp.MustCompile(`(?i)\bdata:[^\s"'<>]{0,128};base64,[A-Za-z0-9+/=\r\n]*`)
 
+// resourceTokenPathRegex matches the /r/<token> capability URL used for
+// short-lived resource grants. The token alone authorizes the download, so it
+// must not survive in the access log. The leading group keeps the separator
+// (and does not match an "r/" inside a longer segment such as "user/").
+var resourceTokenPathRegex = regexp.MustCompile(`(^|/)r/[A-Za-z0-9_-]+`)
+
+// redactResourcePath masks a /r/<token> path segment.
+func redactResourcePath(path string) string {
+	return resourceTokenPathRegex.ReplaceAllString(path, "${1}r/***")
+}
+
+// envVarValueSensitiveKeys are the extra keys that carry a personal secret
+// only on the /me/env-vars surface. Elsewhere "value" is an ordinary field.
+var envVarValueSensitiveKeys = map[string]struct{}{"value": {}}
+
+// envVarValueFieldRegex is the fallback redactor for path-specific keys; it
+// mirrors sensitiveFieldRegex's quote-aware value shapes.
+var envVarValueFieldRegex = buildExtraFieldRegex(envVarValueSensitiveKeys)
+
+// extraSensitiveKeysForPath returns path-specific sensitive keys on top of
+// the shared set.
+func extraSensitiveKeysForPath(path string) map[string]struct{} {
+	if path == "/api/v1/me/env-vars" || strings.HasPrefix(path, "/api/v1/me/env-vars/") {
+		return envVarValueSensitiveKeys
+	}
+	return nil
+}
+
 // sanitizeBody 清理敏感信息，并把 data URI 的 base64 载荷换成长度标记。
 //
 // JSON documents take the structured path: keys are matched after
@@ -141,18 +170,113 @@ var dataURIRegex = regexp.MustCompile(`(?i)\bdata:[^\s"'<>]{0,128};base64,[A-Za-
 // truncated previews, plain-text errors, form bodies — falls back to the
 // token regex, which is quote-aware.
 func sanitizeBody(body string) string {
+	return sanitizeBodyForPath(body, "")
+}
+
+// sanitizeBodyForPath is sanitizeBody with path-aware extra keys (see
+// extraSensitiveKeysForPath).
+func sanitizeBodyForPath(body, path string) string {
 	redacted := dataURIRegex.ReplaceAllStringFunc(body, redactDataURI)
-	if out, ok := sanitizeJSONBody(redacted); ok {
+	extra := extraSensitiveKeysForPath(path)
+	if out, ok := sanitizeJSONBody(redacted, extra); ok {
 		return out
 	}
-	return sensitiveFieldRegex.ReplaceAllString(redacted, `$1:"***"`)
+	out := sensitiveFieldRegex.ReplaceAllString(redacted, `$1:"***"`)
+	return redactExtraJSONFields(out, extra)
+}
+
+// redactExtraJSONFields applies the path-specific keys to a body that failed
+// JSON parsing (typically a truncated preview), using the same quote-aware
+// value shapes as the shared regex.
+func redactExtraJSONFields(body string, extra map[string]struct{}) string {
+	if len(extra) == 0 {
+		return body
+	}
+	return envVarValueFieldRegex.ReplaceAllString(body, `$1:"***"`)
+}
+
+// buildExtraFieldRegex compiles the fallback redactor for a path-specific key
+// set.
+func buildExtraFieldRegex(extra map[string]struct{}) *regexp.Regexp {
+	names := make([]string, 0, len(extra))
+	for name := range extra {
+		names = append(names, regexp.QuoteMeta(name))
+	}
+	pattern := `(?i)("(?:` + strings.Join(names, "|") + `)")\s*:\s*(?:` +
+		`"(?:[^"\\]|\\.)*"` +
+		`|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?` +
+		`|null|true|false` +
+		`|"(?:[^"\\]|\\.)*\z` +
+		`)`
+	return regexp.MustCompile(pattern)
+}
+
+// sanitizeFormBody redacts an application/x-www-form-urlencoded body. Keys are
+// compared against the same normalized sensitive set as JSON bodies, so
+// token/api_key/corpsecret-style fields are masked while ordinary fields keep
+// their value.
+func sanitizeFormBody(body string, extra map[string]struct{}) string {
+	body = dataURIRegex.ReplaceAllStringFunc(body, redactDataURI)
+	suffix := ""
+	if strings.HasSuffix(body, bodyTruncatedMarker) {
+		body = strings.TrimSuffix(body, bodyTruncatedMarker)
+		suffix = bodyTruncatedMarker
+	}
+
+	values, err := url.ParseQuery(body)
+	if err != nil {
+		return sanitizeFormBodyFallback(body, extra) + suffix
+	}
+
+	masked := false
+	for key := range values {
+		if isSensitiveLogKey(key, extra) {
+			values[key] = []string{"***"}
+			masked = true
+		}
+	}
+	if !masked {
+		return body + suffix
+	}
+	return values.Encode() + suffix
+}
+
+// sanitizeFormBodyFallback handles a form body that url.ParseQuery rejected
+// (typically a truncated body ending inside a percent escape).
+func sanitizeFormBodyFallback(body string, extra map[string]struct{}) string {
+	parts := strings.Split(body, "&")
+	for i, part := range parts {
+		key, _, found := strings.Cut(part, "=")
+		if !found {
+			continue
+		}
+		decoded := key
+		if unescaped, err := url.QueryUnescape(key); err == nil {
+			decoded = unescaped
+		}
+		if isSensitiveLogKey(decoded, extra) {
+			parts[i] = key + "=***"
+		}
+	}
+	return strings.Join(parts, "&")
+}
+
+// isSensitiveLogKey reports whether a (decoded) key name belongs to the shared
+// sensitive set or the path-specific extra set.
+func isSensitiveLogKey(key string, extra map[string]struct{}) bool {
+	normalized := normalizeSensitiveKey(key)
+	if _, sensitive := sensitiveJSONFields[normalized]; sensitive {
+		return true
+	}
+	_, sensitive := extra[normalized]
+	return sensitive
 }
 
 // sanitizeJSONBody redacts a valid JSON document and re-encodes it. Numbers
 // are decoded as json.Number so large ids keep their exact spelling. The
 // second Decode guards against a valid prefix followed by garbage, which must
 // not be silently dropped from the log.
-func sanitizeJSONBody(body string) (string, bool) {
+func sanitizeJSONBody(body string, extra map[string]struct{}) (string, bool) {
 	dec := json.NewDecoder(strings.NewReader(body))
 	dec.UseNumber()
 	var value any
@@ -163,14 +287,14 @@ func sanitizeJSONBody(body string) (string, bool) {
 	if err := dec.Decode(&trailing); err != io.EOF {
 		return "", false
 	}
-	encoded, err := json.Marshal(redactJSONValue(value))
+	encoded, err := json.Marshal(redactJSONValue(value, extra))
 	if err != nil {
 		return "", false
 	}
 	return string(encoded), true
 }
 
-func redactJSONValue(value any) any {
+func redactJSONValue(value any, extra map[string]struct{}) any {
 	switch typed := value.(type) {
 	case map[string]any:
 		for key, child := range typed {
@@ -179,16 +303,16 @@ func redactJSONValue(value any) any {
 				typed[key] = "***"
 				continue
 			}
-			if _, sensitive := sensitiveJSONFields[normalized]; sensitive {
+			if isSensitiveLogKey(key, extra) {
 				typed[key] = "***"
 				continue
 			}
-			typed[key] = redactJSONValue(child)
+			typed[key] = redactJSONValue(child, extra)
 		}
 		return typed
 	case []any:
 		for i := range typed {
-			typed[i] = redactJSONValue(typed[i])
+			typed[i] = redactJSONValue(typed[i], extra)
 		}
 		return typed
 	default:
@@ -258,7 +382,10 @@ func readRequestBody(c *gin.Context) string {
 		bodyStr += bodyTruncatedMarker
 	}
 
-	return sanitizeBody(bodyStr)
+	if strings.Contains(contentType, "application/x-www-form-urlencoded") {
+		return sanitizeFormBody(bodyStr, extraSensitiveKeysForPath(c.Request.URL.Path))
+	}
+	return sanitizeBodyForPath(bodyStr, c.Request.URL.Path)
 }
 
 // RequestID middleware adds a unique request ID to the context
@@ -357,7 +484,9 @@ func Logger() gin.HandlerFunc {
 		method := c.Request.Method
 
 		if raw != "" {
-			path = path + "?" + sanitizeQuery(raw)
+			path = redactResourcePath(path) + "?" + sanitizeQuery(raw)
+		} else {
+			path = redactResourcePath(path)
 		}
 
 		// 读取响应体

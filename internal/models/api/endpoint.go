@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -258,14 +259,32 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 	return 0
 }
 
-// LogRequest emits the standard request log line with image payloads
-// compacted so data URIs do not flood the log.
+// LogRequest emits the standard request log line. The body carries the full
+// prompt (user content, retrieved context), so INFO records its length and a
+// structural summary (top-level keys, message count) instead of the body.
 func LogRequest(ctx context.Context, url, model string, body []byte, stream bool) {
-	pretty := body
-	var buf bytes.Buffer
-	if err := json.Indent(&buf, body, "", "  "); err == nil {
-		pretty = buf.Bytes()
+	logger.Infof(ctx, "[LLM Request] endpoint=%s, model=%s, stream=%v, body_len=%d, body_summary=%s",
+		url, model, stream, len(body), summarizeLLMRequestBody(body))
+}
+
+// summarizeLLMRequestBody names the top-level JSON keys and the message count
+// without exposing any value.
+func summarizeLLMRequestBody(body []byte) string {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return "unparsed"
 	}
-	logger.Infof(ctx, "[LLM Request] endpoint=%s, model=%s, stream=%v, request:\n%s",
-		url, model, stream, secutils.CompactImageDataURLForLog(string(pretty)))
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	summary := "keys=" + strings.Join(keys, ",")
+	if raw, ok := fields["messages"]; ok {
+		var messages []json.RawMessage
+		if json.Unmarshal(raw, &messages) == nil && len(messages) > 0 {
+			summary += fmt.Sprintf(" messages=%d", len(messages))
+		}
+	}
+	return summary
 }

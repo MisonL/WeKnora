@@ -302,6 +302,16 @@ func (c ModelParameters) Value() (driver.Value, error) {
 			}
 		}
 	}
+	// ExtraConfig carries credentials too (LKEAP / Volcengine secret_key,
+	// provider api_key/token/password). Encrypt the sensitive values into a
+	// copy of the map so the caller's parameters stay plaintext.
+	if c.ExtraConfig != nil {
+		extra, err := encryptSecretMapValues(c.ExtraConfig, isSensitiveExtraConfigKey)
+		if err != nil {
+			return nil, err
+		}
+		c.ExtraConfig = extra
+	}
 	return json.Marshal(c)
 }
 
@@ -337,6 +347,10 @@ func (c *ModelParameters) Scan(value interface{}) error {
 		c.appSecretStored = c.AppSecret
 		c.AppSecret = ""
 	}
+	// ExtraConfig credentials follow the same gradual migration: legacy
+	// plaintext rows pass through, encrypted values are decrypted, and an
+	// unreadable value keeps its ciphertext for write-back.
+	decryptSecretMapValues(c.ExtraConfig, isSensitiveExtraConfigKey, "model parameters extra_config")
 	return nil
 }
 

@@ -1,14 +1,17 @@
 package middleware
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/gin-gonic/gin"
 )
 
@@ -410,5 +413,49 @@ func TestSkipsBodyLoggingForSecretRoutes(t *testing.T) {
 		if skipsBodyLogging(p) {
 			t.Errorf("%s keeps its body log", p)
 		}
+	}
+}
+
+// /r/<token> is a short-lived capability URL. The token identifies the grant
+// on its own, so the access log must not retain it.
+func TestRedactResourcePathToken(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/r/abcDEF123_-", "/r/***"},
+		{"/api/v1/r/abcDEF123_-", "/api/v1/r/***"},
+		{"/r/", "/r/"},
+		{"/api/v1/user/profile", "/api/v1/user/profile"},
+		{"/api/v1/resources/list", "/api/v1/resources/list"},
+	}
+	for _, tc := range cases {
+		if got := redactResourcePath(tc.in); got != tc.want {
+			t.Errorf("redactResourcePath(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// End-to-end check that the access log line itself, not just the helpers,
+// masks the /r/<token> capability and the presigned signature parameters.
+func TestLoggerRedactsResourceTokenAndPresignedSignature(t *testing.T) {
+	var buf bytes.Buffer
+	logger.SetOutput(&buf)
+	defer logger.SetOutput(os.Stdout)
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(Logger())
+	r.GET("/r/:token", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/r/capability-token-123?sig=presign-signature&expires=1700000000&file_path=local%3A%2F%2F1%2Fa.png", nil)
+	r.ServeHTTP(httptest.NewRecorder(), req)
+
+	out := buf.String()
+	for _, leaked := range []string{"capability-token-123", "presign-signature", "1700000000"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("access log leaked %q: %s", leaked, out)
+		}
+	}
+	if !strings.Contains(out, "/r/***") {
+		t.Fatalf("access log lost the resource path: %s", out)
 	}
 }

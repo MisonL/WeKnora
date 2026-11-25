@@ -3,9 +3,11 @@ package types
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"log"
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/utils"
 	"gorm.io/gorm"
 )
 
@@ -416,10 +418,36 @@ type StorageConfig struct {
 	ForcePathStyle bool `yaml:"force_path_style" json:"force_path_style,omitempty"`
 }
 
+// Value implements driver.Valuer. The cos_config column is not covered by the
+// column-level encryption used elsewhere, so the COS credentials are encrypted
+// here before marshaling. The receiver is a value, so the caller's in-memory
+// config keeps the plaintext used by the storage clients.
 func (c StorageConfig) Value() (driver.Value, error) {
+	if key := utils.GetAESKey(); key != nil {
+		if c.SecretID != "" {
+			encrypted, err := utils.EncryptAESGCM(c.SecretID, key)
+			if err != nil {
+				return nil, err
+			}
+			c.SecretID = encrypted
+		}
+		if c.SecretKey != "" {
+			encrypted, err := utils.EncryptAESGCM(c.SecretKey, key)
+			if err != nil {
+				return nil, err
+			}
+			c.SecretKey = encrypted
+		}
+	}
 	return json.Marshal(c)
 }
 
+// Scan implements sql.Scanner. Encrypted values are decrypted; legacy rows
+// written before encryption (no enc:v1: prefix) pass through unchanged, so the
+// migration is gradual. A value that cannot be decrypted (rotated or missing
+// SYSTEM_AES_KEY) is kept as ciphertext rather than blanked: a later Value
+// writes it back unchanged, preserving a credential the original key may still
+// recover.
 func (c *StorageConfig) Scan(value interface{}) error {
 	if value == nil {
 		return nil
@@ -428,7 +456,20 @@ func (c *StorageConfig) Scan(value interface{}) error {
 	if !ok {
 		return nil
 	}
-	return json.Unmarshal(b, c)
+	if err := json.Unmarshal(b, c); err != nil {
+		return err
+	}
+	if plain, ok := utils.DecryptStoredSecretLenient(c.SecretID); ok {
+		c.SecretID = plain
+	} else {
+		log.Printf("[crypto] storage config secret_id: decrypt failed (SYSTEM_AES_KEY missing/rotated?), keeping ciphertext for write-back")
+	}
+	if plain, ok := utils.DecryptStoredSecretLenient(c.SecretKey); ok {
+		c.SecretKey = plain
+	} else {
+		log.Printf("[crypto] storage config secret_key: decrypt failed (SYSTEM_AES_KEY missing/rotated?), keeping ciphertext for write-back")
+	}
+	return nil
 }
 
 // UnmarshalJSON keeps backward compatibility for legacy clients that still send
