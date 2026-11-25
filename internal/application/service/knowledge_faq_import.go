@@ -4308,12 +4308,26 @@ func getFAQImportKeyTenant(ctx context.Context, taskID string) uint64 {
 // embedded in the task id (the initiator, which is what the poll route
 // authorizes). Anyone else sees not-found, matching the cross-tenant hiding
 // the route applies.
+//
+// A record that carries no tenant and a task id with none either is read by
+// whoever asked: its key is already scoped by that caller's tenant, so the
+// scoping itself is the isolation.
 func faqProgressReadableBy(ctx context.Context, taskID string, progress *types.FAQImportProgress) bool {
 	callerTenant, _ := types.TenantIDFromContext(ctx)
-	if progress != nil && progress.TenantID != 0 && progress.TenantID == callerTenant {
-		return true
+	recordTenant := uint64(0)
+	if progress != nil {
+		recordTenant = progress.TenantID
 	}
-	if taskTenant, err := secutils.TaskTenantID(taskID); err == nil && taskTenant != 0 && taskTenant == callerTenant {
+	taskTenant, taskErr := secutils.TaskTenantID(taskID)
+	if taskErr != nil {
+		taskTenant = 0
+	}
+	switch {
+	case recordTenant != 0 && recordTenant == callerTenant:
+		return true
+	case taskTenant != 0 && taskTenant == callerTenant:
+		return true
+	case recordTenant == 0 && taskTenant == 0:
 		return true
 	}
 	return false
