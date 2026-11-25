@@ -55,9 +55,13 @@ type faqVectorEngine struct {
 	err error
 }
 
-func (*faqVectorEngine) EngineType() types.RetrieverEngineType { return types.SQLiteRetrieverEngineType }
+func (*faqVectorEngine) EngineType() types.RetrieverEngineType {
+	return types.SQLiteRetrieverEngineType
+}
 
-func (*faqVectorEngine) Support() []types.RetrieverType { return []types.RetrieverType{types.VectorRetrieverType} }
+func (*faqVectorEngine) Support() []types.RetrieverType {
+	return []types.RetrieverType{types.VectorRetrieverType}
+}
 
 func (*faqVectorEngine) EstimateStorageSize(context.Context, embedding.Embedder, []*types.IndexInfo, []types.RetrieverType) int64 {
 	return 0
@@ -149,25 +153,35 @@ func TestDeleteReplacedFAQChunksHandsOrphanedVectorsToTheIndexTask(t *testing.T)
 	require.Error(t, err, "the import still reports the failed vector delete")
 	require.Contains(t, err.Error(), "failed to delete chunk vectors")
 
-	require.Len(t, enqueuer.tasks, 1, "the orphaned vectors must not be left for a plan that cannot see them")
-	task := enqueuer.tasks[0]
-	require.Equal(t, types.TypeIndexDelete, task.Type())
-	var payload types.IndexDeletePayload
-	require.NoError(t, json.Unmarshal(task.Payload(), &payload))
-	require.Equal(t, uint64(1), payload.TenantID, "the fallback runs under the tenant that owns the rows")
-	require.Equal(t, "kb", payload.KnowledgeBaseID)
-	require.Equal(t, "model", payload.EmbeddingModelID, "the worker needs the dimensions of the model that indexed them")
-	require.Equal(t, types.KnowledgeTypeFAQ, payload.KBType)
-	require.ElementsMatch(t, []string{"c1", "c2"}, payload.ChunkIDs,
-		"exactly the rows this call soft-deleted")
+	// The first task was queued before the row delete to cover a crash in the
+	// window; the second carries the same ids for the vector backend failure.
+	require.Len(t, enqueuer.tasks, 2, "the orphaned vectors must not be left for a plan that cannot see them")
+	for _, task := range enqueuer.tasks {
+		require.Equal(t, types.TypeIndexDelete, task.Type())
+		var payload types.IndexDeletePayload
+		require.NoError(t, json.Unmarshal(task.Payload(), &payload))
+		require.True(t, payload.OnlyIfDeleted,
+			"the worker may only touch rows whose chunk row is already soft-deleted")
+		require.Equal(t, uint64(1), payload.TenantID, "the fallback runs under the tenant that owns the rows")
+		require.Equal(t, "kb", payload.KnowledgeBaseID)
+		require.Equal(t, "model", payload.EmbeddingModelID, "the worker needs the dimensions of the model that indexed them")
+		require.Equal(t, types.KnowledgeTypeFAQ, payload.KBType)
+		require.ElementsMatch(t, []string{"c1", "c2"}, payload.ChunkIDs,
+			"exactly the rows this call soft-deleted")
+	}
 }
 
-func TestDeleteReplacedFAQChunksSkipsTheFallbackWhenVectorsDeleteCleanly(t *testing.T) {
+func TestDeleteReplacedFAQChunksQueuesIndexDeleteCoverageEvenWhenVectorsDeleteCleanly(t *testing.T) {
 	s, enqueuer, planned := setupFAQVectorFallback(t, nil)
 	ctx := faqVectorFallbackContext()
 	kb := &types.KnowledgeBase{ID: "kb", TenantID: 1, EmbeddingModelID: "model", Type: types.KnowledgeBaseTypeFAQ}
 	faqKnowledge := &types.Knowledge{ID: "knowledge", TenantID: 1, KnowledgeBaseID: "kb"}
 
 	require.NoError(t, s.deleteReplacedFAQChunks(ctx, "task-1", 1, kb, faqKnowledge, planned))
-	require.Empty(t, enqueuer.tasks, "nothing to hand over when the vectors are already gone")
+	require.Len(t, enqueuer.tasks, 1,
+		"a successful synchronous delete does not cancel the crash-window coverage task: it is idempotent")
+	var payload types.IndexDeletePayload
+	require.NoError(t, json.Unmarshal(enqueuer.tasks[0].Payload(), &payload))
+	require.True(t, payload.OnlyIfDeleted)
+	require.ElementsMatch(t, []string{"c1", "c2"}, payload.ChunkIDs)
 }

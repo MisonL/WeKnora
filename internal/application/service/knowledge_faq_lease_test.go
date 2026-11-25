@@ -424,18 +424,20 @@ func TestMemoryProgressExpiresAndIsSwept(t *testing.T) {
 	svc := &knowledgeService{}
 	ctx := context.Background()
 	expiredAt := time.Now().Add(-faqImportProgressTTL - time.Second).Unix()
-	svc.memFAQProgress.Store("old", &types.FAQImportProgress{TaskID: "old", UpdatedAt: expiredAt})
+	oldKey := getFAQImportProgressKey(ctx, "old")
+	svc.memFAQProgress.Store(oldKey, &types.FAQImportProgress{TaskID: "old", UpdatedAt: expiredAt})
 
 	_, err := svc.GetFAQImportProgress(ctx, "old")
 	require.Error(t, err, "an expired record must look missing")
-	_, loaded := svc.memFAQProgress.Load("old")
+	_, loaded := svc.memFAQProgress.Load(oldKey)
 	require.False(t, loaded)
 
-	svc.memFAQProgress.Store("stale", &types.FAQImportProgress{TaskID: "stale", UpdatedAt: expiredAt})
+	staleKey := getFAQImportProgressKey(ctx, "stale")
+	svc.memFAQProgress.Store(staleKey, &types.FAQImportProgress{TaskID: "stale", UpdatedAt: expiredAt})
 	require.NoError(t, svc.writeFAQImportProgress(ctx, &types.FAQImportProgress{TaskID: "new"}))
-	_, loaded = svc.memFAQProgress.Load("stale")
+	_, loaded = svc.memFAQProgress.Load(staleKey)
 	require.False(t, loaded, "a write has to sweep records nobody reads")
-	_, loaded = svc.memFAQProgress.Load("new")
+	_, loaded = svc.memFAQProgress.Load(getFAQImportProgressKey(ctx, "new"))
 	require.True(t, loaded)
 }
 

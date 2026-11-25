@@ -138,7 +138,11 @@ func TestCompletedRecordIsEnrichedForAPollingMemberOfAnotherTenant(t *testing.T)
 		CreatedAt: 1,
 	}))
 
-	memberCtx := types.WithExecutionTenant(f.ctx, 99)
+	// A member of another tenant polls a task their (shared) knowledge base
+	// ran. The KB access guard executes the handler under the owner's tenant,
+	// so the record is read under tenant 7 even though the caller is tenant 99.
+	memberBase := types.WithCaller(f.ctx, types.Caller{TenantID: 99, UserID: "member", Role: types.TenantRoleViewer})
+	memberCtx := types.WithExecutionTenant(memberBase, 7)
 	got, err := f.svc.GetFAQImportProgress(memberCtx, "shared")
 	require.NoError(t, err)
 	require.Equal(t, 50, got.SuccessCount, "the owner tenant's persisted result must be applied")

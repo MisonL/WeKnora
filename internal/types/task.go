@@ -433,6 +433,12 @@ type IndexDeletePayload struct {
 	// async worker can resolve the same store the KB was bound to.
 	// nil means the KB had no binding — falls back to EffectiveEngines.
 	VectorStoreID *string `json:"vector_store_id,omitempty"`
+	// OnlyIfDeleted restricts the delete to ids whose chunk row is already
+	// soft-deleted when the task runs. A replace import enqueues this task
+	// before its row DELETE so a crash between the two cannot leak vectors: the
+	// task is queued either way, and only the rows the delete actually reached
+	// are touched. Set by producers whose ids are expected to be dead.
+	OnlyIfDeleted bool `json:"only_if_deleted,omitempty"`
 }
 
 // KBDeletePayload represents the knowledge base delete task payload

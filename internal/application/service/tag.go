@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -421,6 +422,29 @@ func (s *knowledgeTagService) ProcessIndexDelete(ctx context.Context, t *asynq.T
 
 	logger.Infof(ctx, "Processing index delete task for %d chunks in KB %s", len(payload.ChunkIDs), payload.KnowledgeBaseID)
 
+	chunkIDs := payload.ChunkIDs
+	if payload.OnlyIfDeleted {
+		// A producer may enqueue this task before its row DELETE to cover a
+		// crash between the two. The ids are only known to be dead once their
+		// rows are actually soft-deleted: a row the delete never reached is
+		// still live and owns its vectors, so it must keep them.
+		if s.chunkRepo == nil {
+			return fmt.Errorf("cannot verify chunk deletion for index cleanup: chunk repository unavailable")
+		}
+		softDeleted, err := s.chunkRepo.SoftDeletedChunkIDs(ctx, payload.TenantID, chunkIDs)
+		if err != nil {
+			logger.Warnf(ctx, "Failed to check which chunks are deleted for index cleanup: %v", err)
+			return err
+		}
+		chunkIDs = softDeleted
+		logger.Infof(ctx, "Index delete task restricted to %d of %d already-deleted chunks",
+			len(chunkIDs), len(payload.ChunkIDs))
+		if len(chunkIDs) == 0 {
+			logger.Infof(ctx, "Index delete task: none of the listed chunks is deleted; nothing to remove")
+			return nil
+		}
+	}
+
 	// Create retrieve engine.
 	// The factory verifies the payload's tenant owns the bound store, so a
 	// tampered queue entry cannot reach a cross-tenant store.
@@ -451,7 +475,6 @@ func (s *knowledgeTagService) ProcessIndexDelete(ctx context.Context, t *asynq.T
 
 	// Delete indices in batches to avoid overwhelming the backend
 	const batchSize = 100
-	chunkIDs := payload.ChunkIDs
 	dimension := embeddingModel.GetDimensions()
 
 	for i := 0; i < len(chunkIDs); i += batchSize {
