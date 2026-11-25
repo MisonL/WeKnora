@@ -678,11 +678,11 @@ func (r *chunkRepository) DeleteChunk(ctx context.Context, tenantID uint64, id s
 
 // UnchangedChunks returns the planned chunks whose rows still hold the same
 // identity the plan selected them by (seq id, content hash, tag, enabled and
-// recommended flags). A replace-mode import plans its deletions from a snapshot
-// taken before it re-checks ownership, so between the two a concurrent writer
-// can rewrite a row the plan had picked; deleting that row would discard the
-// newer content. The comparison is on the identity the plan selected the row by,
-// which is exactly what makes it a valid target.
+// recommended flags, answer strategy). A replace-mode import plans its
+// deletions from a snapshot taken before it re-checks ownership, so between the
+// two a concurrent writer can rewrite a row the plan had picked; deleting that
+// row would discard the newer content. The comparison is on the identity the
+// plan selected the row by, which is exactly what makes it a valid target.
 func (r *chunkRepository) UnchangedChunks(
 	ctx context.Context, tenantID uint64, chunks []*types.Chunk,
 ) ([]*types.Chunk, error) {
@@ -705,8 +705,8 @@ func (r *chunkRepository) UnchangedChunks(
 		}
 		var rows []*types.Chunk
 		if err := r.db.WithContext(ctx).
-			Select("id, seq_id, COALESCE(content_hash, '') AS content_hash, COALESCE(tag_id, '') AS tag_id, " +
-				"COALESCE(is_enabled, false) AS is_enabled, COALESCE(flags, 0) AS flags").
+			Select("id, seq_id, COALESCE(content_hash, '') AS content_hash, COALESCE(tag_id, '') AS tag_id, "+
+				"COALESCE(is_enabled, false) AS is_enabled, COALESCE(flags, 0) AS flags, metadata").
 			Where("tenant_id = ? AND id IN ?", tenantID, ids).
 			Find(&rows).Error; err != nil {
 			return nil, err
@@ -733,7 +733,10 @@ const chunkFenceBatchSize = 200
 // plan selected it by. Content hash covers the question and answers only, so a
 // concurrent edit that changes nothing but the tag, the enabled flag or the
 // recommended flag leaves it identical -- and that edit is exactly what a
-// replace import must not discard. A nil row (the id vanished) is never a match.
+// replace import must not discard. The answer strategy lives in the metadata
+// JSON, outside the hash, and a replace plan inherits it for entries that omit
+// it: a row whose strategy moved must be left alone too, or the plan's stale
+// copy replaces the edit. A nil row (the id vanished) is never a match.
 func sameChunkIdentity(row, planned *types.Chunk) bool {
 	if row == nil || planned == nil {
 		return false
@@ -742,7 +745,36 @@ func sameChunkIdentity(row, planned *types.Chunk) bool {
 		row.ContentHash == planned.ContentHash &&
 		row.TagID == planned.TagID &&
 		row.IsEnabled == planned.IsEnabled &&
-		row.Flags == planned.Flags
+		row.Flags == planned.Flags &&
+		chunkAnswerStrategy(row) == chunkAnswerStrategy(planned)
+}
+
+// chunkAnswerStrategy reads the strategy a row carries, with an absent field or
+// absent metadata reading as the empty string -- which is how a plan taken
+// before the field existed reads it.
+func chunkAnswerStrategy(chunk *types.Chunk) string {
+	if chunk == nil {
+		return ""
+	}
+	meta, err := chunk.FAQMetadata()
+	if err != nil || meta == nil {
+		return ""
+	}
+	return string(meta.AnswerStrategy)
+}
+
+// answerStrategySQL returns the dialect expression for the strategy a row's
+// metadata carries. It must agree with chunkAnswerStrategy: NULL metadata and a
+// missing field both read as the empty string.
+func (r *chunkRepository) answerStrategySQL() string {
+	switch r.db.Dialector.Name() {
+	case "postgres":
+		return "COALESCE(metadata->>'answer_strategy', '')"
+	case "mysql":
+		return "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.answer_strategy')), '')"
+	default: // sqlite
+		return "COALESCE(json_extract(metadata, '$.answer_strategy'), '')"
+	}
 }
 
 // DeleteChunksIfUnchanged deletes each chunk only while its row still carries
@@ -771,16 +803,20 @@ func (r *chunkRepository) DeleteChunksIfUnchanged(
 		var conds []string
 		var args []interface{}
 		batchIDs := make([]string, 0, len(batch))
+		strategySQL := r.answerStrategySQL()
 		for _, c := range batch {
 			// COALESCE: a row whose seq id was never assigned (lite/SQLite, no
 			// sequence) holds NULL, which `= 0` would not match even though the
 			// planned chunk reads back as 0. The same holds for the columns of
-			// an FAQ row written before they existed. The last three predicates
-			// are what plugin edits touch without moving the content hash; the
-			// re-read above and this statement must agree on the identity.
+			// an FAQ row written before they existed. The tag, enabled, flags
+			// and strategy predicates are what plugin edits touch without moving
+			// the content hash; the re-read above and this statement must agree
+			// on the identity.
 			conds = append(conds, "(id = ? AND COALESCE(seq_id, 0) = ? AND COALESCE(content_hash, '') = ?"+
-				" AND COALESCE(tag_id, '') = ? AND COALESCE(is_enabled, false) = ? AND COALESCE(flags, 0) = ?)")
-			args = append(args, c.ID, c.SeqID, c.ContentHash, c.TagID, c.IsEnabled, int(c.Flags))
+				" AND COALESCE(tag_id, '') = ? AND COALESCE(is_enabled, false) = ? AND COALESCE(flags, 0) = ?"+
+				" AND "+strategySQL+" = ?)")
+			args = append(args, c.ID, c.SeqID, c.ContentHash, c.TagID, c.IsEnabled, int(c.Flags),
+				chunkAnswerStrategy(c))
 			batchIDs = append(batchIDs, c.ID)
 		}
 		res := r.db.WithContext(ctx).

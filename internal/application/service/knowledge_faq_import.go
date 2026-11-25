@@ -2003,11 +2003,12 @@ func (s *knowledgeService) deleteReplacedFAQChunks(ctx context.Context, taskID s
 	if len(unchanged) == 0 {
 		return nil
 	}
-	deletedIDs, err := s.chunkRepo.DeleteChunksIfUnchanged(ctx, tenantID, unchanged)
-	if err != nil {
-		return fmt.Errorf("failed to delete chunks: %w", err)
-	}
-	if len(deletedIDs) == 0 {
+	deletedIDs, deleteErr := s.chunkRepo.DeleteChunksIfUnchanged(ctx, tenantID, unchanged)
+	// The conditional delete runs in batches. When a later batch fails, the rows
+	// the earlier ones soft-deleted are already gone from every future plan, so
+	// the ids returned alongside the error are the only record of them; their
+	// vectors are cleaned below before the error is reported.
+	if len(deletedIDs) == 0 && deleteErr == nil {
 		logger.Infof(ctx, "FAQ import task %s: every replaced chunk changed before the delete; nothing to remove", taskID)
 		return nil
 	}
@@ -2021,17 +2022,29 @@ func (s *knowledgeService) deleteReplacedFAQChunks(ctx context.Context, taskID s
 			removedChunks = append(removedChunks, chunk)
 		}
 	}
-	if err := s.deleteFAQChunkVectors(ctx, kb, faqKnowledge, removedChunks); err != nil {
-		deletedChunkIDs := make([]string, 0, len(removedChunks))
-		for _, chunk := range removedChunks {
-			deletedChunkIDs = append(deletedChunkIDs, chunk.ID)
+	var vectorErr error
+	if len(removedChunks) > 0 {
+		if vectorErr = s.deleteFAQChunkVectors(ctx, kb, faqKnowledge, removedChunks); vectorErr != nil {
+			deletedChunkIDs := make([]string, 0, len(removedChunks))
+			for _, chunk := range removedChunks {
+				deletedChunkIDs = append(deletedChunkIDs, chunk.ID)
+			}
+			// Every one of these paths ends with the vectors still in place:
+			// deleteFAQChunkVectors returns before its own delete when the engine or
+			// the index list cannot be built, so the ids must be handed over here
+			// rather than only around the engine call.
+			s.enqueueFAQIndexDeleteFallback(ctx, tenantID, kb, deletedChunkIDs)
 		}
-		// Every one of these paths ends with the vectors still in place:
-		// deleteFAQChunkVectors returns before its own delete when the engine or
-		// the index list cannot be built, so the ids must be handed over here
-		// rather than only around the engine call.
-		s.enqueueFAQIndexDeleteFallback(ctx, tenantID, kb, deletedChunkIDs)
-		return fmt.Errorf("failed to delete chunk vectors for %d deleted chunks: %w", len(removedChunks), err)
+	}
+	if deleteErr != nil {
+		if vectorErr != nil {
+			logger.Errorf(ctx, "FAQ import task %s: vector delete for the %d chunks deleted before the failed batch also failed: %v",
+				taskID, len(removedChunks), vectorErr)
+		}
+		return fmt.Errorf("failed to delete chunks: %w", deleteErr)
+	}
+	if vectorErr != nil {
+		return fmt.Errorf("failed to delete chunk vectors for %d deleted chunks: %w", len(removedChunks), vectorErr)
 	}
 	logger.Infof(ctx, "FAQ import task %s: deleted %d replaced chunks and their vectors (including updates)",
 		taskID, len(removedChunks))
@@ -2756,6 +2769,49 @@ func runningFAQImportInfoMatches(info *runningFAQImportInfo, taskID, instanceID 
 	return enqueuedAt == 0 || info.EnqueuedAt == 0 || info.EnqueuedAt == enqueuedAt
 }
 
+// faqValidationReusable reports whether a retry may skip validation and resume
+// from the cached result.
+//
+// Beyond the indices addressing positions in this payload, the cached result
+// must also describe entries the retry is about to import unchanged. Validation
+// edits entries in place: a conflicting similar or negative question is removed
+// from the entry before it is imported. Only the index list is persisted, so a
+// retry re-decodes or re-downloads the original payload and, skipping
+// validation, would import the very questions the first pass removed -- while
+// the completed counts still describe the cleaned set. A run that recorded a
+// partial failure therefore re-validates.
+//
+// A cached result from a dry run answers what would happen, not what was
+// written, so a real import does not resume from it (nor the reverse).
+func faqValidationReusable(existing *types.FAQImportProgress, entries int, dryRun bool) bool {
+	if existing == nil || len(existing.ValidEntryIndices) == 0 {
+		return false
+	}
+	if existing.DryRun != dryRun {
+		return false
+	}
+	if existing.PartialFailedCount > 0 {
+		return false
+	}
+	return faqEntryIndicesInRange(existing.ValidEntryIndices, entries)
+}
+
+// faqProgressOwnedByInstance reports whether a stored progress record belongs to
+// the run described by the payload. A task id may be reused by a later
+// submission, and that submission's record describes a different payload: this
+// run must neither resume from it nor report it as its own result. A payload
+// without an instance id is a legacy enqueue that predates the field; it is
+// matched on the task id alone, as it was before.
+func faqProgressOwnedByInstance(progress *types.FAQImportProgress, payload *types.FAQImportPayload) bool {
+	if progress == nil || payload == nil {
+		return false
+	}
+	if progress.InstanceID != "" && payload.InstanceID != "" {
+		return progress.InstanceID == payload.InstanceID
+	}
+	return true
+}
+
 // faqEntryIndicesInRange reports whether every cached entry index addresses a
 // position in a payload of the given length, and that the indices are strictly
 // increasing as verification produced them.
@@ -3343,6 +3399,23 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 		return s.refuseStaleFAQImport(ctx, &payload, result)
 	}
 
+	// A replay of a record this instance already completed answers here, before
+	// anything that writes. The checks below are not read-only: the running
+	// marker check can rewrite our own record to "failed" (markFAQImportStopped)
+	// when another import now holds the knowledge base, and the lease re-assert
+	// plus the entries-file download would re-claim a lease and fail on the file
+	// the completion path already deleted -- both after the record the initiator
+	// polls has been disturbed. A record owned by a different instance falls
+	// through to the superseded-instance handling below.
+	if existing, progressErr := s.GetFAQImportProgress(ctx, payload.TaskID); progressErr == nil && existing != nil &&
+		existing.Status == types.FAQImportStatusCompleted && faqProgressOwnedByInstance(existing, &payload) {
+		logger.Infof(ctx, "FAQ import already completed, replay stops: %s", payload.TaskID)
+		if clearErr := s.clearRunningFAQImportInfoIfMatches(context.WithoutCancel(ctx), payload.KBID, payload.TaskID, payload.InstanceID, payload.EnqueuedAt); clearErr != nil {
+			logger.Warnf(ctx, "Failed to clear running FAQ import info for completed task: %v", clearErr)
+		}
+		return nil
+	}
+
 	// A replay must not start writing progress for another accepted import.
 	// Missing markers can expire before a manual retry; retain that recovery
 	// path and the existing timestamp fallback for legacy task instances.
@@ -3506,20 +3579,24 @@ func (s *knowledgeService) ProcessFAQImport(ctx context.Context, t *asynq.Task) 
 
 	// 缓存的索引只对同一份 payload 有效：同一 task id 的旧记录可能带着超出
 	// 当前条目数的索引，直接拿来遍历 payload.Entries 会越界。
-	reusableValidation := existingProgress != nil &&
-		len(existingProgress.ValidEntryIndices) > 0 &&
-		faqEntryIndicesInRange(existingProgress.ValidEntryIndices, len(payload.Entries))
+	reusableValidation := faqValidationReusable(existingProgress, len(payload.Entries), payload.DryRun)
 	if existingProgress != nil && len(existingProgress.ValidEntryIndices) > 0 && !reusableValidation {
 		logger.Warnf(ctx,
-			"FAQ import: cached validation indices for task %s do not fit %d entries; re-validating",
-			payload.TaskID, len(payload.Entries))
+			"FAQ import: cached validation result for task %s cannot be reused for %d entries "+
+				"(dry_run=%v, partial_failed=%d); re-validating",
+			payload.TaskID, len(payload.Entries), existingProgress.DryRun, existingProgress.PartialFailedCount)
 	}
 
 	// A replay of a completed record answers before this attempt writes
 	// anything: the record the initiator polls would otherwise flip back to
 	// "processing" with old counts, and the result the user already saw would
 	// disappear until the replay finishes again.
-	if existingProgress != nil && existingProgress.Status == types.FAQImportStatusCompleted {
+	//
+	// The early check near the top of this function handles the common case; by
+	// here the record may have completed while this attempt waited for a worker
+	// slot, so the check is repeated with the same ownership rule.
+	if existingProgress != nil && existingProgress.Status == types.FAQImportStatusCompleted &&
+		faqProgressOwnedByInstance(existingProgress, &payload) {
 		logger.Infof(ctx, "FAQ import already completed, replay stops: %s", payload.TaskID)
 		if clearErr := s.clearRunningFAQImportInfoIfMatches(context.WithoutCancel(ctx), payload.KBID, payload.TaskID, payload.InstanceID, payload.EnqueuedAt); clearErr != nil {
 			logger.Warnf(ctx, "Failed to clear running FAQ import info for completed task: %v", clearErr)

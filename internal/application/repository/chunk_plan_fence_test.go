@@ -163,7 +163,43 @@ func plannedFromDB(t *testing.T, db *gorm.DB, id string) *types.Chunk {
 		TagID:       chunk.TagID,
 		IsEnabled:   chunk.IsEnabled,
 		Flags:       chunk.Flags,
+		Metadata:    chunk.Metadata,
 	}
+}
+
+// The answer strategy lives in the metadata JSON, which the content hash does
+// not cover. A replace plan inherits it for entries that omit it, so a row whose
+// strategy changed after the plan was taken must be left alone -- otherwise the
+// plan's stale copy overwrites the edit when the entry is re-created.
+func TestDeleteChunksIfUnchangedLeavesRowsWhoseAnswerStrategyMoved(t *testing.T) {
+	db := setupChunkTestDB(t)
+	repo := NewChunkRepository(db)
+	ctx := context.Background()
+
+	meta := func(strategy string) types.JSON {
+		return types.JSON(fmt.Sprintf(`{"standard_question":"q","answers":["a"],"answer_strategy":%q}`, strategy))
+	}
+	for _, chunk := range []*types.Chunk{
+		{ID: "same", TenantID: 7, KnowledgeBaseID: "kb", ChunkType: types.ChunkTypeFAQ, ContentHash: "h", Metadata: meta("all")},
+		{ID: "restrategised", TenantID: 7, KnowledgeBaseID: "kb", ChunkType: types.ChunkTypeFAQ, ContentHash: "h", Metadata: meta("all")},
+	} {
+		require.NoError(t, db.Create(chunk).Error)
+	}
+	planned := []*types.Chunk{plannedFromDB(t, db, "same"), plannedFromDB(t, db, "restrategised")}
+	require.NoError(t, db.Model(&types.Chunk{}).Where("id = ?", "restrategised").
+		Update("metadata", meta("random")).Error)
+
+	unchanged, err := repo.UnchangedChunks(ctx, 7, planned)
+	require.NoError(t, err)
+	require.Len(t, unchanged, 1)
+	require.Equal(t, "same", unchanged[0].ID)
+
+	removed, err := repo.DeleteChunksIfUnchanged(ctx, 7, planned)
+	require.NoError(t, err)
+	require.Equal(t, []string{"same"}, removed,
+		"the row whose answer strategy changed is not ours to replace")
+	_, err = repo.GetChunkByID(ctx, 7, "restrategised")
+	require.NoError(t, err, "and it survives the delete")
 }
 
 // A plugin edit that only moves a tag (or flips enabled / recommended) leaves

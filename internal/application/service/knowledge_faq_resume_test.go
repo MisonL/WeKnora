@@ -70,13 +70,16 @@ func TestFAQIndexDeleteFallbackSplitsThePayload(t *testing.T) {
 	for _, task := range enqueuer.tasks {
 		var payload types.IndexDeletePayload
 		require.NoError(t, json.Unmarshal(task.Payload(), &payload))
+		require.LessOrEqual(t, len(payload.ChunkIDs), 200,
+			"the batch bound is the point: 201/201/48 would also pass an id-count check")
 		seen = append(seen, payload.ChunkIDs...)
 	}
 	require.ElementsMatch(t, ids, seen, "every id is handed over exactly once")
 }
 
-// No enqueuer (Lite without a registered handler) must not panic: the ids go to
-// the log for an operator instead.
+// No enqueuer (Lite without a registered handler) must not panic. Nothing can
+// be handed over in that case, so this only pins that the import does not fail
+// on it.
 func TestFAQIndexDeleteFallbackWithoutAnEnqueuerIsANoOp(t *testing.T) {
 	s := &knowledgeService{}
 	s.enqueueFAQIndexDeleteFallback(faqVectorFallbackContext(), 1,
