@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -89,6 +90,29 @@ func (r *userRepository) GetUsersByIDs(ctx context.Context, ids []string) (map[s
 func (r *userRepository) GetUserByEmail(ctx context.Context, email string) (*types.User, error) {
 	var user types.User
 	if err := r.db.WithContext(ctx).Where("email = ?", email).First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+	return &user, nil
+}
+
+// GetUserByOIDCIdentity finds the account bound to (issuer, subject).
+// Empty inputs never match: a local account stores NULL/empty in both
+// columns and must not be claimed by an OIDC provider that omitted one
+// of the two claims.
+func (r *userRepository) GetUserByOIDCIdentity(ctx context.Context, issuer, subject string) (*types.User, error) {
+	issuer = strings.TrimSpace(issuer)
+	subject = strings.TrimSpace(subject)
+	if issuer == "" || subject == "" {
+		return nil, ErrUserNotFound
+	}
+	var user types.User
+	err := r.db.WithContext(ctx).
+		Where("oidc_issuer = ? AND oidc_subject = ?", issuer, subject).
+		First(&user).Error
+	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrUserNotFound
 		}
@@ -454,6 +478,21 @@ func (r *authTokenRepository) DeleteToken(ctx context.Context, id string) error 
 // DeleteExpiredTokens deletes all expired tokens
 func (r *authTokenRepository) DeleteExpiredTokens(ctx context.Context) error {
 	return r.db.WithContext(ctx).Where("expires_at < NOW()").Delete(&types.AuthToken{}).Error
+}
+
+// RevokeTokenIfActive flips is_revoked only when the row is currently
+// active. The conditional UPDATE is the atomic compare-and-swap behind
+// refresh-token rotation: of two concurrent refreshes holding the same
+// token, exactly one observes RowsAffected == 1 and proceeds; the other
+// observes 0 and is treated as token reuse.
+func (r *authTokenRepository) RevokeTokenIfActive(ctx context.Context, tokenValue string) (bool, error) {
+	res := r.db.WithContext(ctx).Model(&types.AuthToken{}).
+		Where("token = ? AND is_revoked = ?", tokenValue, false).
+		UpdateColumn("is_revoked", true)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
 }
 
 // RevokeTokensByUserID revokes all tokens for a user

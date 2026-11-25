@@ -281,8 +281,8 @@ func authenticateJWTUser(
 	// 解析当前空间内的角色 (issue #1303)
 	role, ok := resolveTenantRole(ctx, memberService, user, targetTenantID, crossTenantSwitch, cfg)
 	if !ok {
-		// 强制 RBAC 时，缺少 active membership 即拒绝；fail-open 路径已在
-		// resolveTenantRole 内部处理。
+		// 没有 active membership（含已移除成员）即拒绝；resolveTenantRole
+		// 不再有 fail-open 分支。
 		logger.Warnf(ctx, "User %s has no active membership in tenant %d", user.ID, targetTenantID)
 		c.JSON(http.StatusForbidden, gin.H{
 			"error": "Forbidden: not a member of the target workspace",
@@ -783,15 +783,15 @@ func principalTenantIDFromClaims(claims jwt.MapClaims) uint64 {
 //     points to. Any other path (cross-tenant switch, JWT minted for a
 //     foreign tenant, etc.) is intentionally excluded to avoid silent
 //     ownership grabs.
-//  4. Otherwise → return ok=false. Caller decides:
-//     - When EnableRBAC=true (or cfg unavailable): treat as 403.
-//     - When EnableRBAC=false: fail open with Admin so existing deployments
-//     don't break in the rollout window where memberships might lag user
-//     records.
+//  4. Otherwise → deny. There is no fail-open path: a caller with no
+//     membership in the target tenant (including a removed member whose
+//     users.tenant_id still points at it) gets 403. EnableRBAC only
+//     controls downstream role-gate strictness, never identity
+//     resolution — a request must belong to the tenant before any role
+//     can be inferred, otherwise "no role" silently becomes Admin.
 //
-// The boolean second return value reports whether enforcement should reject
-// the request. It is true whenever a usable role was found OR fail-open
-// applies; false only when we want callers to abort with 403.
+// The boolean second return value reports whether a usable role was
+// found. False always means the caller should abort with 403.
 func resolveTenantRole(
 	ctx context.Context,
 	memberService interfaces.TenantMemberService,
@@ -857,16 +857,11 @@ func resolveTenantRole(
 		}
 	}
 
-	// 4. 兜底：根据 EnableRBAC 决定 fail-closed 还是 fail-open
-	if cfg != nil && cfg.Tenant.IsRBACEnforced() {
-		logger.Warnf(ctx,
-			"[auth] resolveTenantRole step4 fail-closed (EnableRBAC=true): user=%s tenant=%d",
-			user.ID, targetTenantID)
-		return "", false
-	}
+	// 4. 兜底：一律拒绝。RBAC 开关只影响角色门禁的严格程度，不影响
+	//    "这个人是否属于这个空间" 的判定；这里 fail-open 会把已移除成员
+	//    重新当成 Admin。
 	logger.Warnf(ctx,
-		"[auth] resolveTenantRole step4 fail-open (EnableRBAC=false) -> Admin: user=%s tenant=%d",
-		user.ID, targetTenantID)
-	// fail-open 期间保持现有行为（每个登录用户在自己空间里都是"管理员"）。
-	return types.TenantRoleAdmin, true
+		"[auth] resolveTenantRole step4 fail-closed: user=%s tenant=%d (rbac_enforced=%v)",
+		user.ID, targetTenantID, cfg != nil && cfg.Tenant.IsRBACEnforced())
+	return "", false
 }

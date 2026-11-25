@@ -24,7 +24,10 @@ func TestOIDCPKCEProofCookie(t *testing.T) {
 				}, nil
 			}
 			us := &stubOIDCStartUserService{getOIDCAuthorizationURL: buildAuthURL}
-			h := NewAuthHandler(&config.Config{}, us, nil, nil, nil)
+			// /auth/oidc/url now only accepts a redirect_uri on the
+			// configured frontend origin.
+			h := NewAuthHandler(
+				&config.Config{FrontendBaseURL: "https://app.example"}, us, nil, nil, nil)
 			gin.SetMode(gin.TestMode)
 			router := gin.New()
 			router.GET("/auth/oidc/start", h.OIDCStart)

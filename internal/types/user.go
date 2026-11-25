@@ -125,6 +125,16 @@ type User struct {
 	CanAccessAllTenants bool `json:"can_access_all_tenants" gorm:"default:false"`
 	// Whether the user is a system administrator (independent of workspace roles)
 	IsSystemAdmin bool `json:"is_system_admin" gorm:"default:false;index"`
+	// OIDCIssuer / OIDCSubject bind this account to exactly one external
+	// OIDC identity. They are nullable: locally-registered accounts and
+	// accounts provisioned before OIDC binding existed have no binding.
+	// Login resolves the identity pair FIRST; an email match alone is
+	// never trusted without email_verified. The composite unique index
+	// prevents two local accounts from claiming the same external
+	// identity. Never serialise this pair to API responses — the subject
+	// is an external stable identifier and is not needed by clients.
+	OIDCIssuer  *string `json:"-" gorm:"type:varchar(255);uniqueIndex:uq_users_oidc_identity,priority:1"`
+	OIDCSubject *string `json:"-" gorm:"type:varchar(255);uniqueIndex:uq_users_oidc_identity,priority:2"`
 	// Per-user UI/feature preferences.
 	// Stored as JSON (jsonb on Postgres, TEXT on SQLite) via the
 	// driver.Valuer / sql.Scanner methods on UserPreferences.
@@ -207,10 +217,19 @@ type OIDCCallbackResponse struct {
 }
 
 type OIDCUserInfo struct {
-	Subject  string                 `json:"subject,omitempty"`
-	Username string                 `json:"username,omitempty"`
-	Email    string                 `json:"email,omitempty"`
-	Claims   map[string]interface{} `json:"claims,omitempty"`
+	Subject string `json:"subject,omitempty"`
+	// Issuer is the OIDC issuer the claims came from. It is the
+	// configured issuer_url when present, otherwise the id_token /
+	// userinfo `iss` claim (never client-supplied).
+	Issuer string `json:"issuer,omitempty"`
+	// EmailVerified is the provider's `email_verified` claim. It must be
+	// true before an existing local account can be bound by email;
+	// otherwise an attacker who controls an unverified address at the
+	// IdP could take over the local account.
+	EmailVerified bool                   `json:"email_verified,omitempty"`
+	Username      string                 `json:"username,omitempty"`
+	Email         string                 `json:"email,omitempty"`
+	Claims        map[string]interface{} `json:"claims,omitempty"`
 }
 
 // RegisterRequest represents a registration request

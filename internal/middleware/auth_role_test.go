@@ -54,11 +54,17 @@ func uintToStr(t uint64) string {
 }
 
 func (f *fakeMemberService) seedActive(userID string, tenantID uint64, role types.TenantRole) {
+	f.seedStatus(userID, tenantID, role, types.TenantMemberStatusActive)
+}
+
+func (f *fakeMemberService) seedStatus(
+	userID string, tenantID uint64, role types.TenantRole, status types.TenantMemberStatus,
+) {
 	f.members[memberKey(userID, tenantID)] = &types.TenantMember{
 		UserID:   userID,
 		TenantID: tenantID,
 		Role:     role,
-		Status:   types.TenantMemberStatusActive,
+		Status:   status,
 	}
 }
 
@@ -217,13 +223,37 @@ func TestResolveTenantRole_AutoPromoteSkippedIfTenantHasMembers(t *testing.T) {
 	}
 }
 
-func TestResolveTenantRole_FailOpenAdminWhenRBACDisabled(t *testing.T) {
+func TestResolveTenantRole_RBACDisabledStillRequiresMembership(t *testing.T) {
 	svc := newFakeMemberService()
 	user := &types.User{ID: "u1", TenantID: 7}
-	// targetTenantID != home，所以不进 auto-promote 分支。
+	// targetTenantID != home，所以不进 auto-promote 分支。即使 RBAC
+	// 关闭，没有成员身份也不能拿到 Admin —— 角色来自成员关系，
+	// 而不是配置开关。
 	got, ok := resolveTenantRole(context.Background(), svc, user, 8, false, cfgWithRBAC(false))
-	if !ok || got != types.TenantRoleAdmin {
-		t.Fatalf("EnableRBAC=false should fail open Admin, got (%v, %v)", got, ok)
+	if ok {
+		t.Fatalf("EnableRBAC=false must not fail open to Admin, got (%v, %v)", got, ok)
+	}
+}
+
+func TestResolveTenantRole_RemovedMemberInHomeTenantDenied(t *testing.T) {
+	svc := newFakeMemberService()
+	// The user was removed from their home workspace: users.tenant_id
+	// still points at it, but the membership row is suspended. Another
+	// member keeps the orphan-tenant self-heal path closed.
+	svc.seedStatus("u1", 7, types.TenantRoleOwner, types.TenantMemberStatusSuspended)
+	svc.seedActive("other", 7, types.TenantRoleOwner)
+	user := &types.User{ID: "u1", TenantID: 7}
+
+	if got, ok := resolveTenantRole(context.Background(), svc, user, 7, false, cfgWithRBAC(true)); ok {
+		t.Fatalf("removed member must be denied in their home tenant, got role=%v", got)
+	}
+	// Same answer with RBAC off: identity resolution is not gated by the
+	// enforcement switch.
+	if got, ok := resolveTenantRole(context.Background(), svc, user, 7, false, cfgWithRBAC(false)); ok {
+		t.Fatalf("removed member must be denied even with EnableRBAC=false, got role=%v", got)
+	}
+	if len(svc.addCalls) != 0 {
+		t.Fatalf("removed member must not be auto-promoted, got %+v", svc.addCalls)
 	}
 }
 
@@ -237,18 +267,18 @@ func TestResolveTenantRole_FailClosedWhenRBACEnabled(t *testing.T) {
 	}
 }
 
-func TestResolveTenantRole_LookupErrorFailsOpenWhenRBACDisabled(t *testing.T) {
-	// 短暂 DB 错误时，fail-open 模式不应锁死现有用户。这里 targetTenantID 故意
-	// 选与 home 不同的值，避免进入 home-tenant auto-promote 分支。
+func TestResolveTenantRole_LookupErrorFailsClosed(t *testing.T) {
+	// A transient DB error must not grant Admin. Identity resolution
+	// fails closed regardless of EnableRBAC; only role *gates* honour
+	// the rollout switch.
 	svc := newFakeMemberService()
 	svc.failGet = errors.New("transient db failure")
 	// 让 HasAnyMembers 返回 true，关闭孤儿空间自愈路径。
 	svc.seedActive("placeholder", 8, types.TenantRoleAdmin)
 	user := &types.User{ID: "u1", TenantID: 7}
 
-	got, ok := resolveTenantRole(context.Background(), svc, user, 8, false, cfgWithRBAC(false))
-	if !ok || got != types.TenantRoleAdmin {
-		t.Fatalf("transient lookup error under RBAC=false should fail open Admin, got (%v, %v)", got, ok)
+	if got, ok := resolveTenantRole(context.Background(), svc, user, 8, false, cfgWithRBAC(false)); ok {
+		t.Fatalf("lookup error must fail closed even with RBAC=false, got (%v, %v)", got, ok)
 	}
 }
 

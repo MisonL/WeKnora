@@ -128,6 +128,11 @@ type UserRepository interface {
 	GetUsersByIDs(ctx context.Context, ids []string) (map[string]*types.User, error)
 	// GetUserByEmail gets a user by email
 	GetUserByEmail(ctx context.Context, email string) (*types.User, error)
+	// GetUserByOIDCIdentity finds the account bound to the given
+	// (issuer, subject) pair. Returns ErrUserNotFound when no row is
+	// bound; OIDC login uses this lookup before any email-based match
+	// so a subject match always wins.
+	GetUserByOIDCIdentity(ctx context.Context, issuer, subject string) (*types.User, error)
 	// GetUserByUsername gets a user by username
 	GetUserByUsername(ctx context.Context, username string) (*types.User, error)
 	// GetUserByTenantID gets the first user (owner) of a tenant
@@ -165,6 +170,11 @@ type AuthTokenRepository interface {
 	GetTokensByUserID(ctx context.Context, userID string) ([]*types.AuthToken, error)
 	// UpdateToken updates a token
 	UpdateToken(ctx context.Context, token *types.AuthToken) error
+	// RevokeTokenIfActive atomically flips is_revoked from false to true
+	// for the given token value. The boolean result reports whether this
+	// call performed the transition; false means the row was already
+	// revoked (or missing), which callers treat as refresh-token reuse.
+	RevokeTokenIfActive(ctx context.Context, tokenValue string) (bool, error)
 	// DeleteToken deletes a token
 	DeleteToken(ctx context.Context, id string) error
 	// DeleteExpiredTokens deletes all expired tokens

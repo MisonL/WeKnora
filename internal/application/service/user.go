@@ -69,6 +69,22 @@ var (
 	// one so callers can reject no-op rotations that would still revoke
 	// every session.
 	ErrSamePassword = errors.New("new password must differ from current password")
+
+	// ErrOIDCEmailNotVerified is returned when an OIDC login matches an
+	// existing local account by email but the provider did not assert
+	// email_verified. Binding on an unverified address would let whoever
+	// controls that address at the IdP take over the local account.
+	ErrOIDCEmailNotVerified = errors.New("邮箱未验证，无法绑定已有账号")
+
+	// ErrOIDCIdentityConflict is returned when the email matches a local
+	// account that is already bound to a different OIDC (issuer, subject)
+	// pair. Rebinding would silently transfer the account to a second
+	// external identity.
+	ErrOIDCIdentityConflict = errors.New("该邮箱已绑定其他 OIDC 身份")
+
+	// ErrOIDCMissingSubject is returned when the provider supplied no
+	// stable `sub`. Without it the identity cannot be bound at all.
+	ErrOIDCMissingSubject = errors.New("OIDC provider did not return a stable subject")
 )
 
 // Machine-readable change-password failure reasons for HTTP details fields.
@@ -227,6 +243,29 @@ func (s *userService) Register(ctx context.Context, req *types.RegisterRequest) 
 	return user, nil
 }
 
+// dummyPasswordHash is a valid bcrypt hash compared against when the
+// supplied email has no account. Without it, a missing user returns
+// before any bcrypt work and the response latency enumerates registered
+// addresses. Built once lazily; the cost matches bcrypt.DefaultCost so
+// the timings line up with a real wrong-password check.
+var (
+	dummyPasswordHashOnce sync.Once
+	dummyPasswordHash     []byte
+)
+
+func comparePasswordAgainstDummy(password string) {
+	dummyPasswordHashOnce.Do(func() {
+		hash, err := bcrypt.GenerateFromPassword([]byte("weknora-dummy-password"), bcrypt.DefaultCost)
+		if err != nil {
+			// Cryptographically improbable; fall back to a fixed valid
+			// bcrypt hash so the timing path still does real bcrypt work.
+			hash = []byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy")
+		}
+		dummyPasswordHash = hash
+	})
+	_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(password))
+}
+
 // Login authenticates a user and returns tokens
 func (s *userService) Login(ctx context.Context, req *types.LoginRequest) (*types.LoginResponse, error) {
 	logger.Info(ctx, "Start user login")
@@ -234,6 +273,9 @@ func (s *userService) Login(ctx context.Context, req *types.LoginRequest) (*type
 	user, err := s.userRepo.GetUserByEmail(ctx, req.Email)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get user by email: %v", err)
+		// Equalise timing with the existing-user path so the response
+		// does not reveal whether the address is registered.
+		comparePasswordAgainstDummy(req.Password)
 		return &types.LoginResponse{
 			Success: false,
 			Message: "Invalid email or password",
@@ -241,6 +283,7 @@ func (s *userService) Login(ctx context.Context, req *types.LoginRequest) (*type
 	}
 	if user == nil {
 		logger.Warn(ctx, "User not found for email")
+		comparePasswordAgainstDummy(req.Password)
 		return &types.LoginResponse{
 			Success: false,
 			Message: "Invalid email or password",
@@ -525,21 +568,81 @@ func (s *userService) LoginWithOIDC(
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(userInfo.Email) == "" {
+	return s.loginWithOIDCUserInfo(ctx, userInfo, provisioning)
+}
+
+// loginWithOIDCUserInfo completes an OIDC login from already-resolved
+// claims. Split from LoginWithOIDC so the account-binding policy can be
+// tested without a live IdP.
+//
+// Account resolution is identity-first:
+//
+//  1. (issuer, subject) already bound → log that account in. This is the
+//     only path that can log in an existing account without an email
+//     check; the pair is the provider's stable identifier.
+//  2. Otherwise look up by email.
+//     a. account bound to a different (issuer, subject) → refuse;
+//     b. unbound account and email_verified=false → refuse with
+//     ErrOIDCEmailNotVerified;
+//     c. unbound account and email_verified=true → bind and log in.
+//  3. No account at all → provision a new one and bind it.
+func (s *userService) loginWithOIDCUserInfo(
+	ctx context.Context,
+	userInfo *types.OIDCUserInfo,
+	provisioning types.TenantProvisioningMode,
+) (*types.OIDCCallbackResponse, error) {
+	if userInfo == nil {
+		return nil, errors.New("OIDC user info is required")
+	}
+	subject := strings.TrimSpace(userInfo.Subject)
+	if subject == "" {
+		return nil, ErrOIDCMissingSubject
+	}
+	issuer := strings.TrimSpace(userInfo.Issuer)
+	if issuer == "" {
+		issuer = extractClaimAsString(userInfo.Claims, "iss")
+	}
+	if issuer == "" {
+		return nil, errors.New("OIDC issuer is not configured and was not returned by the provider")
+	}
+	email := strings.TrimSpace(userInfo.Email)
+	if email == "" {
 		return nil, errors.New("OIDC provider did not return email")
 	}
 
-	user, err := s.userRepo.GetUserByEmail(ctx, userInfo.Email)
+	user, err := s.userRepo.GetUserByOIDCIdentity(ctx, issuer, subject)
 	if err != nil && !isUserLookupNotFound(err) {
-		return nil, fmt.Errorf("failed to query user by email: %w", err)
+		return nil, fmt.Errorf("failed to query user by OIDC identity: %w", err)
 	}
 	isNewUser := false
 	if isUserLookupNotFound(err) || user == nil {
-		user, err = s.provisionOIDCUser(ctx, userInfo, provisioning)
-		if err != nil {
-			return nil, err
+		// No account is bound to this external identity yet.
+		user, err = s.userRepo.GetUserByEmail(ctx, email)
+		if err != nil && !isUserLookupNotFound(err) {
+			return nil, fmt.Errorf("failed to query user by email: %w", err)
 		}
-		isNewUser = true
+		if isUserLookupNotFound(err) || user == nil {
+			user, err = s.provisionOIDCUser(ctx, userInfo, provisioning)
+			if err != nil {
+				return nil, err
+			}
+			isNewUser = true
+			if err := s.bindOIDCIdentity(ctx, user, issuer, subject); err != nil {
+				return nil, err
+			}
+		} else {
+			if user.OIDCIssuer != nil && strings.TrimSpace(*user.OIDCIssuer) != "" {
+				// The address already belongs to a different external
+				// identity. Never rebind: that would move the account.
+				return nil, ErrOIDCIdentityConflict
+			}
+			if !userInfo.EmailVerified {
+				return nil, ErrOIDCEmailNotVerified
+			}
+			if err := s.bindOIDCIdentity(ctx, user, issuer, subject); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	if !user.IsActive {
@@ -1340,7 +1443,7 @@ func (s *userService) ValidateToken(ctx context.Context, tokenString string) (*t
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return []byte(getJwtSecret()), nil
-	})
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 
 	if err != nil || !token.Valid {
 		return nil, 0, errors.New("invalid token")
@@ -1449,7 +1552,7 @@ func userIDFromSignedToken(tokenString string) (string, error) {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return []byte(getJwtSecret()), nil
-	}, jwt.WithoutClaimsValidation())
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithoutClaimsValidation())
 	if err != nil || token == nil || !token.Valid {
 		return "", errors.New("invalid token")
 	}
@@ -1457,6 +1560,12 @@ func userIDFromSignedToken(tokenString string) (string, error) {
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
 		return "", errors.New("invalid token claims")
+	}
+	// Claims validation is intentionally disabled so logout still works
+	// after the access token expired, but a token with no exp claim at
+	// all is never acceptable: it would be replayable forever.
+	if _, ok := claims["exp"]; !ok {
+		return "", errors.New("invalid token")
 	}
 
 	userID, ok := claims["user_id"].(string)
@@ -1506,7 +1615,7 @@ func (s *userService) RefreshToken(
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return []byte(getJwtSecret()), nil
-	})
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 
 	if err != nil || !token.Valid {
 		return "", "", errors.New("invalid refresh token")
@@ -1545,10 +1654,30 @@ func (s *userService) RefreshToken(
 	if err != nil {
 		return "", "", err
 	}
+	// A refresh token minted before the account was disabled must not
+	// roll the session forward. Disable revokes tokens too, but that
+	// write can lag or fail; this is the authoritative check.
+	if user == nil || !user.IsActive {
+		return "", "", errors.New("account is disabled")
+	}
 
-	// Revoke old refresh token
-	tokenRecord.IsRevoked = true
-	_ = s.tokenRepo.UpdateToken(ctx, tokenRecord)
+	// Revoke the old refresh token with a conditional update: exactly one
+	// concurrent rotation can flip is_revoked from false to true. If our
+	// update matched nothing, another request already consumed this
+	// token — treat it as replay and tear down every session for the user.
+	rotated, err := s.tokenRepo.RevokeTokenIfActive(ctx, refreshTokenString)
+	if err != nil {
+		return "", "", fmt.Errorf("revoke refresh token: %w", err)
+	}
+	if !rotated {
+		if revokeErr := s.tokenRepo.RevokeTokensByUserID(ctx, userID); revokeErr != nil {
+			logger.Errorf(ctx,
+				"Refresh token reuse detected for user %s and session revocation failed: %v",
+				userID, revokeErr)
+		}
+		logger.Warnf(ctx, "Refresh token reuse detected for user %s; all sessions revoked", userID)
+		return "", "", errors.New("refresh token reuse detected")
+	}
 
 	// Generate new tokens
 	return s.GenerateTokens(ctx, user)
@@ -1817,6 +1946,11 @@ func (s *userService) resolveOIDCUserInfo(ctx context.Context, cfg *config.OIDCA
 	if sub, _ := claims["sub"].(string); sub != "" {
 		info.Subject = sub
 	}
+	info.Issuer = strings.TrimSpace(cfg.IssuerURL)
+	if info.Issuer == "" {
+		info.Issuer = extractClaimAsString(claims, "iss")
+	}
+	info.EmailVerified = extractClaimAsBool(claims, "email_verified")
 	info.Username = extractClaimAsString(claims, cfg.UserInfoMapping.Username)
 	info.Email = extractClaimAsString(claims, cfg.UserInfoMapping.Email)
 	if info.Username == "" {
@@ -1894,6 +2028,27 @@ func (s *userService) provisionOIDCUser(
 		return nil, fmt.Errorf("failed to mark OIDC-only login preference: %w", err)
 	}
 	return user, nil
+}
+
+// bindOIDCIdentity persists the (issuer, subject) pair onto a local
+// account. The unique index (see migration 000137) is the final arbiter
+// against two accounts claiming one external identity.
+func (s *userService) bindOIDCIdentity(ctx context.Context, user *types.User, issuer, subject string) error {
+	if user == nil {
+		return errors.New("user is required")
+	}
+	issuer = strings.TrimSpace(issuer)
+	subject = strings.TrimSpace(subject)
+	if issuer == "" || subject == "" {
+		return ErrOIDCMissingSubject
+	}
+	user.OIDCIssuer = &issuer
+	user.OIDCSubject = &subject
+	user.UpdatedAt = time.Now()
+	if err := s.userRepo.UpdateUser(ctx, user); err != nil {
+		return fmt.Errorf("failed to bind OIDC identity: %w", err)
+	}
+	return nil
 }
 
 func (s *userService) generateOIDCUsername(ctx context.Context, info *types.OIDCUserInfo) string {
@@ -2190,6 +2345,32 @@ func extractClaimAsString(claims map[string]interface{}, key string) string {
 		return strings.TrimSpace(v)
 	default:
 		return strings.TrimSpace(fmt.Sprint(v))
+	}
+}
+
+// extractClaimAsBool reads a boolean-ish claim. OIDC providers encode
+// email_verified as a JSON boolean, but string "true"/"false" (and the
+// occasional numeric) appear in the wild; anything unrecognised is false
+// so an odd encoding can never be read as "verified".
+func extractClaimAsBool(claims map[string]interface{}, key string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	switch v := claims[key].(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	case float64:
+		return v == 1
+	case int64:
+		return v == 1
+	case json.Number:
+		n, err := v.Int64()
+		return err == nil && n == 1
+	default:
+		return false
 	}
 }
 
