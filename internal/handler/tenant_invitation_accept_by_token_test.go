@@ -52,6 +52,12 @@ func (s *acceptByTokenUserSvc) UpdateUser(_ context.Context, user *types.User) e
 	return nil
 }
 
+func (s *acceptByTokenUserSvc) SetUserTenantID(_ context.Context, _ string, tenantID uint64) error {
+	s.updateCalled = true
+	s.updatedTenant = tenantID
+	return nil
+}
+
 type acceptByTokenTenantSvc struct {
 	interfaces.TenantService
 }

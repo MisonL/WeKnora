@@ -295,6 +295,25 @@ func (r *cleanupUserRepo) UpdateUser(_ context.Context, user *types.User) error 
 	r.users[user.ID] = &cp
 	return nil
 }
+func (r *cleanupUserRepo) UpdateUserPreferencesOnly(
+	_ context.Context, id string, prefs types.UserPreferences,
+) error {
+	if u := r.users[id]; u != nil {
+		u.Preferences = prefs
+	}
+	return nil
+}
+func (r *cleanupUserRepo) UpdateUserTenantID(_ context.Context, id string, tenantID uint64) error {
+	if u := r.users[id]; u != nil {
+		u.TenantID = tenantID
+	}
+	return nil
+}
+func (r *cleanupUserRepo) UpdateUserPasswordHash(context.Context, string, string) error { return nil }
+func (r *cleanupUserRepo) UpdateUserSystemAdmin(context.Context, string, bool) error    { return nil }
+func (r *cleanupUserRepo) UpdateUserOIDCIdentity(context.Context, string, string, string) error {
+	return nil
+}
 func (r *cleanupUserRepo) DeleteUser(context.Context, string) error { return nil }
 func (r *cleanupUserRepo) ListUsers(context.Context, int, int) ([]*types.User, error) {
 	return nil, nil

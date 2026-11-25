@@ -35,7 +35,7 @@ func TestDeleteExtractedImagesKeepsFilesAnotherOwnerStillClaims(t *testing.T) {
 
 	deleteExtractedImages(
 		context.Background(), files,
-		knowledgeResourceOwners(catalog, "kn-1"),
+		knowledgeResourceOwners(catalog, "kn-1"), 7,
 		[]string{shared, exclusive, legacy},
 	)
 
@@ -65,7 +65,7 @@ func TestDeleteExtractedImagesReleasesEveryOwnerBeforeDeciding(t *testing.T) {
 
 	deleteExtractedImages(
 		context.Background(), files,
-		knowledgeResourceOwners(catalog, "kn-1", "kn-2"),
+		knowledgeResourceOwners(catalog, "kn-1", "kn-2"), 7,
 		[]string{shared},
 	)
 
@@ -85,7 +85,7 @@ func TestDeleteExtractedImagesKeepsFileWhenReleaseFails(t *testing.T) {
 
 	deleteExtractedImages(
 		context.Background(), files,
-		knowledgeResourceOwners(catalog, "kn-1"),
+		knowledgeResourceOwners(catalog, "kn-1"), 7,
 		[]string{handleRef("d")},
 	)
 
@@ -99,7 +99,7 @@ func TestDeleteExtractedImagesWithoutCatalogDeletesEverything(t *testing.T) {
 	files := &deleteRecorder{}
 	urls := []string{handleRef("e"), "local://7/exports/x.png"}
 
-	deleteExtractedImages(context.Background(), files, knowledgeResourceOwners(nil, "kn-1"), urls)
+	deleteExtractedImages(context.Background(), files, knowledgeResourceOwners(nil, "kn-1"), 7, urls)
 
 	if len(files.deleted) != len(urls) {
 		t.Fatalf("deleted %v, want %v", files.deleted, urls)
@@ -116,7 +116,7 @@ func TestMergeKnowledgeReleaseURLsIncludesOwnerBindings(t *testing.T) {
 	files := &deleteRecorder{}
 
 	urls := mergeKnowledgeReleaseURLs(context.Background(), catalog, []string{"kn-1"}, []string{legacy})
-	deleteExtractedImages(context.Background(), files, knowledgeResourceOwners(catalog, "kn-1"), urls)
+	deleteExtractedImages(context.Background(), files, knowledgeResourceOwners(catalog, "kn-1"), 7, urls)
 
 	want := []string{legacy, bound}
 	if len(files.deleted) != len(want) {
@@ -138,7 +138,7 @@ func TestMergeKnowledgeReleaseURLsReleasesMarkdownOnlyBindings(t *testing.T) {
 	files := &deleteRecorder{}
 
 	urls := mergeKnowledgeReleaseURLs(context.Background(), catalog, []string{"kn-1"}, nil)
-	deleteExtractedImages(context.Background(), files, knowledgeResourceOwners(catalog, "kn-1"), urls)
+	deleteExtractedImages(context.Background(), files, knowledgeResourceOwners(catalog, "kn-1"), 7, urls)
 
 	if len(files.deleted) != 1 || files.deleted[0] != bound {
 		t.Fatalf("deleted %v, want markdown-bound handle %q", files.deleted, bound)
@@ -257,5 +257,35 @@ func TestMergeKnowledgeReleaseURLsOmitsSourceFileBinding(t *testing.T) {
 	urls := mergeKnowledgeReleaseURLs(ctx, catalog, []string{"kn-1"}, nil)
 	if len(urls) != 1 || urls[0] != image {
 		t.Fatalf("release URLs = %v, want only extracted image %q", urls, image)
+	}
+}
+
+// tenantScopedDeleteRecorder implements the optional tenant guard and records
+// how the cleanup invoked it.
+type tenantScopedDeleteRecorder struct {
+	interfaces.FileService
+	tenants []uint64
+	deleted []string
+}
+
+func (f *tenantScopedDeleteRecorder) DeleteFile(ctx context.Context, filePath string) error {
+	return f.DeleteFileForTenant(ctx, 0, filePath)
+}
+
+func (f *tenantScopedDeleteRecorder) DeleteFileForTenant(
+	_ context.Context, tenantID uint64, filePath string,
+) error {
+	f.tenants = append(f.tenants, tenantID)
+	f.deleted = append(f.deleted, filePath)
+	return nil
+}
+
+// Cleanup passes the owning tenant to a driver that can enforce the tenant
+// prefix, so a forged reference cannot reach another workspace's bytes.
+func TestDeleteExtractedImagesUsesTenantScopedDelete(t *testing.T) {
+	files := &tenantScopedDeleteRecorder{}
+	deleteExtractedImages(context.Background(), files, nil, 7, []string{"local://7/exports/a.png"})
+	if len(files.deleted) != 1 || files.tenants[0] != 7 {
+		t.Fatalf("tenant-scoped delete not used: %+v", files)
 	}
 }

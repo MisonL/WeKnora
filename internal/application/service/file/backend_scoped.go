@@ -112,6 +112,22 @@ func (s *backendScopedFileService) DeleteFile(ctx context.Context, path string) 
 	}
 	return s.inner.DeleteFile(ctx, p)
 }
+
+// DeleteFileForTenant keeps the tenant guard alive through the storage-backend
+// scope wrapper: the wrapper itself knows nothing about tenant layout, so the
+// call is forwarded to the inner driver.
+func (s *backendScopedFileService) DeleteFileForTenant(
+	ctx context.Context, tenantID uint64, path string,
+) error {
+	p, err := s.unwrap(path)
+	if err != nil {
+		return err
+	}
+	if scoped, ok := s.inner.(interfaces.TenantScopedFileService); ok {
+		return scoped.DeleteFileForTenant(ctx, tenantID, p)
+	}
+	return s.inner.DeleteFile(ctx, p)
+}
 func (s *backendScopedFileService) CopyFile(ctx context.Context, path string, tenantID uint64, knowledgeID string) (string, error) {
 	p, err := s.unwrap(path)
 	if err != nil {

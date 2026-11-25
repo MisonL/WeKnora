@@ -145,24 +145,101 @@ func (r *userRepository) GetUserByTenantID(ctx context.Context, tenantID uint64)
 	return &user, nil
 }
 
-// UpdateUser updates user data while preserving account status. Status changes
-// must go through SetUserActive so stale profile/password writes cannot undo
-// an administrator's enable/disable action.
+// protectedUserColumns are never written by a full-row UpdateUser. They are
+// authorization/identity state that only dedicated, guarded operations may
+// change: status via SetUserActive, the platform-admin flag via
+// UpdateUserSystemAdmin/RevokeSystemAdmin, tenant membership via
+// UpdateUserTenantID, credentials via UpdateUserPasswordHash, and OIDC
+// binding via UpdateUserOIDCIdentity.
+//
+// Omitting them is what keeps a read-modify-write from resurrecting a value a
+// concurrent administrator just revoked — the exact P1 where saving UI
+// preferences rewrote is_system_admin=true from a stale in-memory user.
+var protectedUserColumns = []string{
+	"is_active",
+	"is_system_admin",
+	"tenant_id",
+	"password_hash",
+	"oidc_issuer",
+	"oidc_subject",
+	"created_at",
+}
+
+// UpdateUser updates the editable profile/preferences fields of user data.
+// Protected columns (see protectedUserColumns) are never touched; use the
+// dedicated setters for them.
 func (r *userRepository) UpdateUser(ctx context.Context, user *types.User) error {
-	if user != nil && user.TenantID == 0 {
-		return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			// Keep status and the nullable tenant column out of the struct
-			// write, then explicitly store NULL for the tenant.
-			// Writing uint64(0) would violate the PostgreSQL tenant FK.
-			if err := tx.Omit("tenant_id", "is_active").Save(user).Error; err != nil {
-				return err
-			}
-			return tx.Model(&types.User{}).
-				Where("id = ?", user.ID).
-				UpdateColumn("tenant_id", nil).Error
-		})
+	return r.db.WithContext(ctx).Omit(protectedUserColumns...).Save(user).Error
+}
+
+// UpdateUserPreferencesOnly writes the preferences column alone, so an
+// unrelated concurrent change to account status, admin flag, tenant or
+// password survives the write.
+func (r *userRepository) UpdateUserPreferencesOnly(
+	ctx context.Context, userID string, prefs types.UserPreferences,
+) error {
+	return r.db.WithContext(ctx).Model(&types.User{}).
+		Where("id = ?", userID).
+		Updates(map[string]interface{}{
+			"preferences": prefs,
+			"updated_at":  time.Now(),
+		}).Error
+}
+
+// UpdateUserTenantID writes only users.tenant_id. tenantID 0 stores NULL so a
+// tenantless account never violates the tenant foreign key.
+func (r *userRepository) UpdateUserTenantID(ctx context.Context, userID string, tenantID uint64) error {
+	var value interface{}
+	if tenantID == 0 {
+		value = nil
+	} else {
+		value = tenantID
 	}
-	return r.db.WithContext(ctx).Omit("is_active").Save(user).Error
+	return r.db.WithContext(ctx).Model(&types.User{}).
+		Where("id = ?", userID).
+		Updates(map[string]interface{}{
+			"tenant_id":  value,
+			"updated_at": time.Now(),
+		}).Error
+}
+
+// UpdateUserPasswordHash writes only password_hash.
+func (r *userRepository) UpdateUserPasswordHash(
+	ctx context.Context, userID, passwordHash string,
+) error {
+	return r.db.WithContext(ctx).Model(&types.User{}).
+		Where("id = ?", userID).
+		Updates(map[string]interface{}{
+			"password_hash": passwordHash,
+			"updated_at":    time.Now(),
+		}).Error
+}
+
+// UpdateUserSystemAdmin writes only is_system_admin. The last-admin and
+// self-revoke guards live in RevokeSystemAdmin; this setter is the promotion
+// counterpart used by the SystemAdmin-gated handler.
+func (r *userRepository) UpdateUserSystemAdmin(
+	ctx context.Context, userID string, isSystemAdmin bool,
+) error {
+	return r.db.WithContext(ctx).Model(&types.User{}).
+		Where("id = ?", userID).
+		Updates(map[string]interface{}{
+			"is_system_admin": isSystemAdmin,
+			"updated_at":      time.Now(),
+		}).Error
+}
+
+// UpdateUserOIDCIdentity writes only the OIDC binding columns.
+func (r *userRepository) UpdateUserOIDCIdentity(
+	ctx context.Context, userID, issuer, subject string,
+) error {
+	return r.db.WithContext(ctx).Model(&types.User{}).
+		Where("id = ?", userID).
+		Updates(map[string]interface{}{
+			"oidc_issuer":  issuer,
+			"oidc_subject": subject,
+			"updated_at":   time.Now(),
+		}).Error
 }
 
 // DeleteUser deletes a user

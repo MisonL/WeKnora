@@ -197,7 +197,7 @@ func (h *AuthHandler) RegisterByInvite(c *gin.Context) {
 
 	// The invited tenant becomes the user's initial/default tenant. No
 	user.TenantID = inv.TenantID
-	if err := h.userService.UpdateUser(ctx, user); err != nil {
+	if err := h.userService.SetUserTenantID(ctx, user.ID, inv.TenantID); err != nil {
 		logger.Errorf(ctx, "register-by-invite: failed to set home tenant for user %s: %v", user.ID, err)
 		_ = h.userService.DeleteUser(ctx, user.ID)
 		c.Error(apperrors.NewInternalServerError("failed to finalise invited account").WithDetails(err.Error()))
@@ -211,7 +211,7 @@ func (h *AuthHandler) RegisterByInvite(c *gin.Context) {
 		// fails, remove the half-provisioned identity.
 		logger.Errorf(ctx, "register-by-invite: accept failed for user %s: %v", user.ID, err)
 		user.TenantID = 0
-		if rollbackErr := h.userService.UpdateUser(ctx, user); rollbackErr != nil {
+		if rollbackErr := h.userService.SetUserTenantID(ctx, user.ID, 0); rollbackErr != nil {
 			logger.Errorf(ctx, "register-by-invite: failed to restore tenantless user %s: %v", user.ID, rollbackErr)
 			_ = h.userService.DeleteUser(ctx, user.ID)
 		}

@@ -147,10 +147,15 @@ func (r *resourceReleaser) deletable(ctx context.Context, ref string) bool {
 // Errors are logged but do not fail the overall deletion.
 //
 // releaser may be nil, in which case every file is deleted unconditionally.
+// tenantID is the workspace that owns the knowledge being removed: drivers
+// implementing interfaces.TenantScopedFileService refuse a physical path whose
+// tenant segment differs, so a forged image_info reference cannot reach
+// another workspace's bytes.
 func deleteExtractedImages(
 	ctx context.Context,
 	fileSvc interfaces.FileService,
 	releaser *resourceReleaser,
+	tenantID uint64,
 	imageURLs []string,
 ) {
 	if len(imageURLs) == 0 {
@@ -162,7 +167,17 @@ func deleteExtractedImages(
 			logger.Infof(ctx, "Keeping extracted image %s: another owner may still reference it", url)
 			continue
 		}
-		if err := fileSvc.DeleteFile(ctx, url); err != nil {
+		var err error
+		if tenantID != 0 {
+			if scoped, ok := fileSvc.(interfaces.TenantScopedFileService); ok {
+				err = scoped.DeleteFileForTenant(ctx, tenantID, url)
+			} else {
+				err = fileSvc.DeleteFile(ctx, url)
+			}
+		} else {
+			err = fileSvc.DeleteFile(ctx, url)
+		}
+		if err != nil {
 			logger.Errorf(ctx, "Failed to delete extracted image %s: %v", url, err)
 		}
 	}
@@ -640,7 +655,7 @@ func (s *knowledgeService) executeKnowledgeDelete(plan *knowledgeDeletePlan, sin
 			logger.Warnf(ctx, "No file service for KB %s, skipping %d image deletions", kbID, len(urls))
 			continue
 		}
-		deleteExtractedImages(ctx, fSvc, knowledgeResourceOwners(s.resourceCatalog, kbKnowledgeIDs[kbID]...), urls)
+		deleteExtractedImages(ctx, fSvc, knowledgeResourceOwners(s.resourceCatalog, kbKnowledgeIDs[kbID]...), tenantInfo.ID, urls)
 	}
 	// TenantInfo can be shared by concurrent cleanup branches; update only storage accounting in the repository.
 	if err := s.tenantRepo.AdjustStorageUsed(ctx, tenantInfo.ID, storageAdjust); err != nil {
@@ -743,7 +758,7 @@ func (s *knowledgeService) cleanupKnowledgeResources(ctx context.Context, knowle
 	// Delete extracted images after chunks are deleted. The claims released
 	// here are re-taken by triggerManualProcessing, which always runs after
 	// this cleanup and re-binds whatever the new body still references.
-	deleteExtractedImages(ctx, fileSvc, knowledgeResourceOwners(s.resourceCatalog, knowledge.ID), imageURLs)
+	deleteExtractedImages(ctx, fileSvc, knowledgeResourceOwners(s.resourceCatalog, knowledge.ID), tenantInfo.ID, imageURLs)
 
 	namespace := types.NameSpace{KnowledgeBase: knowledge.KnowledgeBaseID, Knowledge: knowledge.ID}
 	if err := s.graphEngine.DelGraph(ctx, []types.NameSpace{namespace}); err != nil {

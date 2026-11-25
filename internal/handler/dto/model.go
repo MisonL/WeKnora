@@ -2,6 +2,7 @@ package dto
 
 import (
 	"context"
+	"net/url"
 	"strings"
 	"time"
 
@@ -15,6 +16,37 @@ import (
 type VendorRef struct {
 	Provider string
 	BaseURL  string
+}
+
+// SameOrigin reports whether two base URLs point at the same scheme + host +
+// port origin. It is stricter than vendor detection on purpose: a stored
+// credential may only follow a test request to the exact endpoint origin it
+// was issued for. Unparseable or schemeless inputs are never same-origin.
+func SameOrigin(a, b string) bool {
+	originA, okA := originOf(a)
+	originB, okB := originOf(b)
+	return okA && okB && originA == originB
+}
+
+func originOf(raw string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return "", false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "https":
+			port = "443"
+		default:
+			port = "80"
+		}
+	}
+	return scheme + "://" + strings.ToLower(u.Hostname()) + ":" + port, true
 }
 
 // vendorID resolves the ref to a comparable vendor id. An id that matches no

@@ -33,6 +33,17 @@ func (r *provisioningUserRepo) UpdateUser(_ context.Context, user *types.User) e
 	return nil
 }
 
+func (r *provisioningUserRepo) UpdateUserTenantID(_ context.Context, _ string, tenantID uint64) error {
+	r.updatedTenant = tenantID
+	return nil
+}
+
+func (r *provisioningUserRepo) UpdateUserPreferencesOnly(
+	_ context.Context, _ string, _ types.UserPreferences,
+) error {
+	return nil
+}
+
 type provisioningTenantService struct {
 	interfaces.TenantService
 	createCalls int

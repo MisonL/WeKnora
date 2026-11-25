@@ -371,7 +371,7 @@ func (h *TenantInvitationHandler) autoAcceptInvitationAndRespond(
 	}
 	if user.TenantID == 0 {
 		user.TenantID = tenantID
-		if updateErr := h.userService.UpdateUser(ctx, user); updateErr != nil {
+		if updateErr := h.userService.SetUserTenantID(ctx, user.ID, tenantID); updateErr != nil {
 			logger.Errorf(ctx,
 				"auto_accept: member added but default tenant update failed: user=%s tenant=%d err=%v",
 				user.ID, tenantID, updateErr)
@@ -556,7 +556,7 @@ func (h *TenantInvitationHandler) AcceptMyInvitation(c *gin.Context) {
 	// only supplies the login/navigation default.
 	if user, userErr := h.userService.GetUserByID(ctx, caller); userErr == nil && user != nil && user.TenantID == 0 {
 		user.TenantID = member.TenantID
-		if updateErr := h.userService.UpdateUser(ctx, user); updateErr != nil {
+		if updateErr := h.userService.SetUserTenantID(ctx, user.ID, member.TenantID); updateErr != nil {
 			logger.Errorf(ctx, "AcceptMyInvitation failed to set default tenant: user=%s tenant=%d err=%v",
 				caller, member.TenantID, updateErr)
 			c.Error(apperrors.NewInternalServerError("invitation accepted but default workspace update failed").WithDetails(updateErr.Error()))
@@ -633,7 +633,7 @@ func (h *TenantInvitationHandler) AcceptMyInvitationByToken(c *gin.Context) {
 	// 无租户用户将首个加入的空间设为默认空间（与 AcceptMyInvitation 同理）。
 	if user, userErr := h.userService.GetUserByID(ctx, caller); userErr == nil && user != nil && user.TenantID == 0 {
 		user.TenantID = member.TenantID
-		if updateErr := h.userService.UpdateUser(ctx, user); updateErr != nil {
+		if updateErr := h.userService.SetUserTenantID(ctx, user.ID, member.TenantID); updateErr != nil {
 			logger.Errorf(ctx, "AcceptMyInvitationByToken failed to set default tenant: user=%s tenant=%d err=%v",
 				caller, member.TenantID, updateErr)
 			c.Error(apperrors.NewInternalServerError("invitation accepted but default workspace update failed").WithDetails(updateErr.Error()))

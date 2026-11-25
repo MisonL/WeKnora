@@ -265,9 +265,11 @@ func RegisterAuthRoutes(r *gin.RouterGroup, handler *handler.AuthHandler, g *rba
 //
 // Reads (GetSystemInfo / ListParserEngines / GetStorageEngineStatus)
 // are gated to Viewer+ — any tenant member can see "is the parser
-// reachable". The /*-check / /reconnect endpoints actively probe
-// remote services with tenant credentials and could trigger network
-// fanout, so they're Admin+.
+// reachable". The /*-check endpoints actively probe remote services with
+// tenant credentials and could trigger network fanout, so they're Admin+.
+//
+// /docreader/reconnect is deliberately NOT here: it repoints the
+// process-wide DocReader instance, so it lives in RegisterSystemAdminRoutes.
 func RegisterSystemRoutes(
 	r *gin.RouterGroup,
 	handler *handler.SystemHandler,
@@ -283,7 +285,6 @@ func RegisterSystemRoutes(
 		systemRoutes.GET("/info", g.Viewer(), handler.GetSystemInfo)
 		systemRoutes.GET("/parser-engines", g.Viewer(), handler.ListParserEngines)
 		systemRoutes.POST("/parser-engines/check", g.Admin(), handler.CheckParserEngines)
-		systemRoutes.POST("/docreader/reconnect", g.Admin(), handler.ReconnectDocReader)
 		systemRoutes.GET("/storage-engine-status", g.Viewer(), handler.GetStorageEngineStatus)
 		systemRoutes.POST("/storage-engine-check", g.Admin(), handler.CheckStorageEngine)
 		systemRoutes.POST("/sandbox-check", g.Admin(), handler.CheckSandboxConfig)
@@ -398,4 +399,10 @@ func RegisterSystemAdminRoutes(
 				apiKeyPlatform(types.APIKeyCapabilitySystemAuditRead), auditLogHandler.ListSystemAuditLog)
 		}
 	}
+
+	// DocReader reconnection swaps the process-wide parser endpoint, so it is
+	// platform infrastructure, not a workspace setting: every tenant's parsing
+	// traffic (file bytes and parser credentials included) follows the new
+	// address. It lives under the /system path but is guarded by SystemAdmin.
+	r.POST("/system/docreader/reconnect", g.SystemAdmin(), handler.ReconnectDocReader)
 }

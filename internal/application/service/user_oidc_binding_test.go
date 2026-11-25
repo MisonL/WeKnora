@@ -79,6 +79,27 @@ func (r *oidcBindingRepo) UpdateUser(_ context.Context, u *types.User) error {
 	return nil
 }
 
+func (r *oidcBindingRepo) UpdateUserOIDCIdentity(_ context.Context, id, issuer, subject string) error {
+	if u := r.users[id]; u != nil {
+		u.OIDCIssuer = &issuer
+		u.OIDCSubject = &subject
+	}
+	return nil
+}
+
+func (r *oidcBindingRepo) UpdateUserPreferencesOnly(
+	_ context.Context, id string, prefs types.UserPreferences,
+) error {
+	if u := r.users[id]; u != nil {
+		u.Preferences = prefs
+	}
+	return nil
+}
+
+func (r *oidcBindingRepo) UpdateUserTenantID(context.Context, string, uint64) error     { return nil }
+func (r *oidcBindingRepo) UpdateUserPasswordHash(context.Context, string, string) error { return nil }
+func (r *oidcBindingRepo) UpdateUserSystemAdmin(context.Context, string, bool) error    { return nil }
+
 func (r *oidcBindingRepo) DeleteUser(context.Context, string) error { return nil }
 
 func (r *oidcBindingRepo) ListUsers(context.Context, int, int) ([]*types.User, error) {

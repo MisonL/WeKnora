@@ -3517,6 +3517,83 @@ func (s *knowledgeService) updateChunkVector(ctx context.Context, kbID string, c
 	return nil
 }
 
+// validateChunkImageURL decides whether an image reference submitted through
+// the chunk image-edit endpoint may be persisted on a chunk.
+//
+// The endpoint rewrites the chunk's image_info wholesale, and knowledge delete
+// later collects those URLs and deletes the bytes. Accepting an arbitrary URL
+// therefore lets an editor of one document point a chunk at another tenant's
+// object and destroy it through the later delete. The rules:
+//
+//   - empty: nothing to store, nothing to delete later.
+//   - http(s): remote references are kept verbatim (no local path is derived).
+//   - resource://: must resolve to a live resource owned by this tenant and
+//     bound to this very knowledge.
+//   - local://, optionally behind a storage://<backend>/ scope wrapper: the
+//     tenant segment must equal this knowledge's tenant, and the document
+//     segment must be this knowledge's ID — or the "exports" namespace used by
+//     SaveBytes for extracted images, which is tenant-scoped only.
+//   - other provider schemes (minio://, s3://, ...): their paths have
+//     provider-specific layouts; tenant isolation there comes from the
+//     catalog binding and storage credentials, so the reference is left as-is
+//     (this matches the pre-existing contract).
+func validateChunkImageURL(
+	ctx context.Context,
+	rawURL string,
+	tenantID uint64,
+	knowledgeID string,
+	catalog interfaces.ResourceCatalog,
+) error {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return nil
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		return nil
+	}
+	if _, ok := types.ParseResourcePath(trimmed); ok {
+		if catalog == nil {
+			return werrors.NewForbiddenError("image reference cannot be verified")
+		}
+		resource, err := catalog.Resolve(ctx, trimmed)
+		if err != nil || resource == nil || resource.TenantID != tenantID {
+			return werrors.NewForbiddenError("image reference does not belong to this workspace")
+		}
+		refs, err := catalog.ListReferencesByOwner(ctx, types.ResourceOwnerKnowledge, knowledgeID)
+		if err != nil {
+			return werrors.NewForbiddenError("image reference ownership cannot be verified")
+		}
+		for _, ref := range refs {
+			if ref == trimmed {
+				return nil
+			}
+		}
+		return werrors.NewForbiddenError("image reference does not belong to this document")
+	}
+
+	physical := trimmed
+	if _, inner, ok := types.ParseStorageBackendPath(trimmed); ok {
+		physical = inner
+	}
+	lowerPhysical := strings.ToLower(physical)
+	if strings.HasPrefix(lowerPhysical, "local://") || strings.HasPrefix(lowerPhysical, "local:/") {
+		rest := strings.TrimLeft(physical[len("local:"):], "/")
+		parts := strings.Split(rest, "/")
+		if len(parts) < 2 {
+			return werrors.NewForbiddenError("image reference is not a valid local path")
+		}
+		pathTenant, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil || pathTenant != tenantID {
+			return werrors.NewForbiddenError("image reference belongs to another workspace")
+		}
+		if parts[1] != knowledgeID && parts[1] != "exports" {
+			return werrors.NewForbiddenError("image reference belongs to another document")
+		}
+	}
+	return nil
+}
+
 func (s *knowledgeService) UpdateImageInfo(
 	ctx context.Context,
 	knowledgeID string,
@@ -3549,6 +3626,12 @@ func (s *knowledgeService) UpdateImageInfo(
 		chunk.TenantID != knowledge.TenantID ||
 		chunk.KnowledgeBaseID != knowledge.KnowledgeBaseID {
 		return werrors.NewForbiddenError("chunk does not belong to its knowledge document")
+	}
+	// The URL submitted here is later collected by knowledge delete and its
+	// bytes are removed from shared storage. Only references this tenant (and
+	// this document) already own may be written back.
+	if err := validateChunkImageURL(ctx, image.URL, chunk.TenantID, chunk.KnowledgeID, s.resourceCatalog); err != nil {
+		return err
 	}
 	chunk.ImageInfo = imageInfo
 	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)

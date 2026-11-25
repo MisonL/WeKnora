@@ -36,6 +36,11 @@ type UserService interface {
 	GetUserByTenantID(ctx context.Context, tenantID uint64) (*types.User, error)
 	// UpdateUser updates user data without changing account status; use SetUserActive for that.
 	UpdateUser(ctx context.Context, user *types.User) error
+	// SetUserTenantID updates only the user's default workspace pointer.
+	SetUserTenantID(ctx context.Context, userID string, tenantID uint64) error
+	// SetUserSystemAdmin updates only the platform-admin flag. Callers must
+	// enforce the SystemAdmin gate before invoking it.
+	SetUserSystemAdmin(ctx context.Context, userID string, isSystemAdmin bool) error
 	// DeleteUser deletes a user
 	DeleteUser(ctx context.Context, id string) error
 	// ChangePassword changes user password
@@ -139,6 +144,19 @@ type UserRepository interface {
 	GetUserByTenantID(ctx context.Context, tenantID uint64) (*types.User, error)
 	// UpdateUser updates user data without changing account status; use SetUserActive for that.
 	UpdateUser(ctx context.Context, user *types.User) error
+	// UpdateUserPreferencesOnly writes only the preferences column. Callers
+	// that read a user, change preferences and persist must use this instead
+	// of UpdateUser: a full-row save carries stale account columns and can
+	// resurrect a concurrently revoked admin flag or disabled status.
+	UpdateUserPreferencesOnly(ctx context.Context, userID string, prefs types.UserPreferences) error
+	// UpdateUserTenantID writes only users.tenant_id; 0 stores NULL.
+	UpdateUserTenantID(ctx context.Context, userID string, tenantID uint64) error
+	// UpdateUserPasswordHash writes only password_hash.
+	UpdateUserPasswordHash(ctx context.Context, userID, passwordHash string) error
+	// UpdateUserSystemAdmin writes only is_system_admin.
+	UpdateUserSystemAdmin(ctx context.Context, userID string, isSystemAdmin bool) error
+	// UpdateUserOIDCIdentity writes only oidc_issuer / oidc_subject.
+	UpdateUserOIDCIdentity(ctx context.Context, userID, issuer, subject string) error
 	// SetUserActive atomically changes status and revokes sessions on disable,
 	// preserving at least one active system administrator.
 	SetUserActive(ctx context.Context, userID, actorID string, active bool) (*types.User, error)

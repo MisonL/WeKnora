@@ -219,7 +219,8 @@ func cleanupCopiedObjects(ctx context.Context, svc interfaces.FileService, relea
 	if len(paths) == 0 || svc == nil {
 		return
 	}
-	deleteExtractedImages(ctx, svc, releaser, paths)
+	tenantID, _ := types.TenantIDFromContext(ctx)
+	deleteExtractedImages(ctx, svc, releaser, tenantID, paths)
 }
 
 func (s *knowledgeService) CloneKnowledgeBase(ctx context.Context, srcID, dstID string) error {

@@ -417,7 +417,7 @@ func (h *TenantHandler) CreateTenant(c *gin.Context) {
 	// finalisation fails so the user is not left with an unreachable tenant.
 	if caller.TenantID == 0 && !platformCaller {
 		caller.TenantID = createdTenant.ID
-		if err := h.userService.UpdateUser(ctx, caller); err != nil {
+		if err := h.userService.SetUserTenantID(ctx, caller.ID, createdTenant.ID); err != nil {
 			logger.Errorf(ctx, "Failed to set first tenant %d as default for user %s: %v",
 				createdTenant.ID, caller.ID, err)
 			if h.memberService != nil {

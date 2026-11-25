@@ -133,6 +133,44 @@ func (s *stubUserRepoForAuth) UpdateUser(context.Context, *types.User) error {
 	s.updateCalls++
 	return nil
 }
+func (s *stubUserRepoForAuth) UpdateUserPreferencesOnly(
+	_ context.Context, id string, prefs types.UserPreferences,
+) error {
+	s.updateCalls++
+	if user := s.users[id]; user != nil {
+		user.Preferences = prefs
+	}
+	return nil
+}
+func (s *stubUserRepoForAuth) UpdateUserTenantID(_ context.Context, id string, tenantID uint64) error {
+	s.updateCalls++
+	if user := s.users[id]; user != nil {
+		user.TenantID = tenantID
+	}
+	return nil
+}
+func (s *stubUserRepoForAuth) UpdateUserPasswordHash(_ context.Context, id, hash string) error {
+	s.updateCalls++
+	if user := s.users[id]; user != nil {
+		user.PasswordHash = hash
+	}
+	return nil
+}
+func (s *stubUserRepoForAuth) UpdateUserSystemAdmin(_ context.Context, id string, isAdmin bool) error {
+	s.updateCalls++
+	if user := s.users[id]; user != nil {
+		user.IsSystemAdmin = isAdmin
+	}
+	return nil
+}
+func (s *stubUserRepoForAuth) UpdateUserOIDCIdentity(_ context.Context, id, issuer, subject string) error {
+	s.updateCalls++
+	if user := s.users[id]; user != nil {
+		user.OIDCIssuer = &issuer
+		user.OIDCSubject = &subject
+	}
+	return nil
+}
 func (s *stubUserRepoForAuth) DeleteUser(context.Context, string) error { return nil }
 func (s *stubUserRepoForAuth) ListUsers(context.Context, int, int) ([]*types.User, error) {
 	return nil, nil

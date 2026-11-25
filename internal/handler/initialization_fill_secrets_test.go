@@ -23,7 +23,9 @@ func (s *stubFillSecretsModelService) GetModelByID(ctx context.Context, id strin
 
 func TestFillSecretsFromStoredModel_FillsExtraConfig(t *testing.T) {
 	stored := &types.Model{
+		TenantID: testTenantID,
 		Parameters: types.ModelParameters{
+			BaseURL:   storedOrigin,
 			APIKey:    "sk-stored",
 			AppSecret: "app-secret-stored",
 			ExtraConfig: map[string]string{
@@ -37,9 +39,9 @@ func TestFillSecretsFromStoredModel_FillsExtraConfig(t *testing.T) {
 			getModelByID: func(context.Context, string) (*types.Model, error) { return stored, nil },
 		},
 	}
-	req := &ModelTestRequest{ModelID: "m-1"}
+	req := &ModelTestRequest{ModelID: "m-1", BaseURL: storedOrigin}
 
-	h.fillSecretsFromStoredModel(context.Background(), req)
+	h.fillSecretsFromStoredModel(tenantCtx(testTenantID), req)
 
 	if req.APIKey != "sk-stored" || req.AppSecret != "app-secret-stored" {
 		t.Fatalf("secrets not filled from stored model: apiKey=%q appSecret=%q", req.APIKey, req.AppSecret)
@@ -57,7 +59,9 @@ func TestFillSecretsFromStoredModel_FillsExtraConfig(t *testing.T) {
 // one must not overwrite it — same precedence as the secret fields.
 func TestFillSecretsFromStoredModel_RequestExtraConfigWins(t *testing.T) {
 	stored := &types.Model{
+		TenantID: testTenantID,
 		Parameters: types.ModelParameters{
+			BaseURL:     storedOrigin,
 			ExtraConfig: map[string]string{"thinking_control": "none"},
 		},
 	}
@@ -68,12 +72,13 @@ func TestFillSecretsFromStoredModel_RequestExtraConfigWins(t *testing.T) {
 	}
 	req := &ModelTestRequest{
 		ModelID:     "m-1",
+		BaseURL:     storedOrigin,
 		APIKey:      "sk-typed",
 		AppSecret:   "app-typed",
 		ExtraConfig: map[string]string{"thinking_control": "enabled"},
 	}
 
-	h.fillSecretsFromStoredModel(context.Background(), req)
+	h.fillSecretsFromStoredModel(tenantCtx(testTenantID), req)
 
 	if req.ExtraConfig["thinking_control"] != "enabled" {
 		t.Fatalf("request ExtraConfig overwritten: %v", req.ExtraConfig)
@@ -90,7 +95,9 @@ func TestFillSecretsFromStoredModel_RequestExtraConfigWins(t *testing.T) {
 // button only sends modelId).
 func TestFillSecretsFromStoredModel_SecretsStillFilledWithoutExtraConfig(t *testing.T) {
 	stored := &types.Model{
+		TenantID: testTenantID,
 		Parameters: types.ModelParameters{
+			BaseURL:     storedOrigin,
 			APIKey:      "sk-stored",
 			AppSecret:   "app-secret-stored",
 			ExtraConfig: map[string]string{"remote_model_name": "gpt-x"},
@@ -101,9 +108,11 @@ func TestFillSecretsFromStoredModel_SecretsStillFilledWithoutExtraConfig(t *test
 			getModelByID: func(context.Context, string) (*types.Model, error) { return stored, nil },
 		},
 	}
-	req := &ModelTestRequest{ModelID: "m-1", APIKey: "sk-typed", AppSecret: "app-typed"}
+	req := &ModelTestRequest{
+		ModelID: "m-1", BaseURL: storedOrigin, APIKey: "sk-typed", AppSecret: "app-typed",
+	}
 
-	h.fillSecretsFromStoredModel(context.Background(), req)
+	h.fillSecretsFromStoredModel(tenantCtx(testTenantID), req)
 
 	if req.ExtraConfig == nil || req.ExtraConfig["remote_model_name"] != "gpt-x" {
 		t.Fatalf("ExtraConfig not filled when secrets were provided: %v", req.ExtraConfig)
@@ -136,9 +145,9 @@ func TestFillSecretsFromStoredModel_ModelNotFoundNoop(t *testing.T) {
 			},
 		},
 	}
-	req := &ModelTestRequest{ModelID: "missing"}
+	req := &ModelTestRequest{ModelID: "missing", BaseURL: storedOrigin}
 
-	h.fillSecretsFromStoredModel(context.Background(), req)
+	h.fillSecretsFromStoredModel(tenantCtx(testTenantID), req)
 
 	if req.ExtraConfig != nil {
 		t.Fatalf("ExtraConfig changed on model lookup failure: %v", req.ExtraConfig)

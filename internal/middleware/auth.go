@@ -827,8 +827,11 @@ func resolveTenantRole(
 
 	// 2. 跨空间超管直通：CanAccessAllTenants 用户切到别的空间时不强制要求 membership。
 	//    注意：这里只授予临时 Admin 角色，不写入 tenant_members，避免"看一眼别人空间"
-	//    意外升级为持久化所有权。
-	if crossTenantSwitch && user.CanAccessAllTenants {
+	//    意外升级为持久化所有权。部署级开关 EnableCrossTenantAccess 关闭时，
+	//    CanAccessAllTenants 属性不再授予任何跨空间能力——否则关闭开关只能挡住
+	//    路由层，JWT/X-Tenant-ID 仍能凭属性拿到目标空间 Admin。
+	if crossTenantSwitch && user.CanAccessAllTenants &&
+		cfg != nil && cfg.Tenant != nil && cfg.Tenant.EnableCrossTenantAccess {
 		logger.Infof(ctx,
 			"[auth] resolveTenantRole step2 (cross-tenant superuser) -> Admin: user=%s tenant=%d",
 			user.ID, targetTenantID)

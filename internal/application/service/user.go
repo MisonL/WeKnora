@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -714,6 +715,17 @@ func (s *userService) UpdateUser(ctx context.Context, user *types.User) error {
 	return s.userRepo.UpdateUser(ctx, user)
 }
 
+// SetUserTenantID changes only the user's default workspace pointer.
+func (s *userService) SetUserTenantID(ctx context.Context, userID string, tenantID uint64) error {
+	return s.userRepo.UpdateUserTenantID(ctx, userID, tenantID)
+}
+
+// SetUserSystemAdmin changes only the platform-admin flag. Authorization lives
+// at the SystemAdmin-gated handler.
+func (s *userService) SetUserSystemAdmin(ctx context.Context, userID string, isSystemAdmin bool) error {
+	return s.userRepo.UpdateUserSystemAdmin(ctx, userID, isSystemAdmin)
+}
+
 // Account-status errors share repository identity for errors.Is at the HTTP boundary.
 var (
 	ErrCannotDisableSelf      = apprepo.ErrCannotDisableSelf
@@ -830,8 +842,7 @@ func (s *userService) UpdateUserPreferences(
 	}
 
 	user.Preferences = merged
-	user.UpdatedAt = time.Now()
-	if err := s.userRepo.UpdateUser(ctx, user); err != nil {
+	if err := s.userRepo.UpdateUserPreferencesOnly(ctx, userID, merged); err != nil {
 		return types.UserPreferences{}, err
 	}
 	return merged, nil
@@ -910,13 +921,21 @@ func (s *userService) ChangePassword(ctx context.Context, userID, oldPassword, n
 
 	user.PasswordHash = string(hashedPassword)
 	user.UpdatedAt = time.Now()
-	if user.Preferences.OidcOnlyLogin != nil && *user.Preferences.OidcOnlyLogin {
+	clearOidcOnly := user.Preferences.OidcOnlyLogin != nil && *user.Preferences.OidcOnlyLogin
+	if clearOidcOnly {
 		cleared := false
 		user.Preferences.OidcOnlyLogin = &cleared
 	}
 
-	if err := s.userRepo.UpdateUser(ctx, user); err != nil {
+	// Column-scoped write: a full-row save from this stale snapshot could
+	// otherwise undo a concurrent admin flag/status change.
+	if err := s.userRepo.UpdateUserPasswordHash(ctx, userID, user.PasswordHash); err != nil {
 		return err
+	}
+	if clearOidcOnly {
+		if err := s.userRepo.UpdateUserPreferencesOnly(ctx, userID, user.Preferences); err != nil {
+			return err
+		}
 	}
 
 	// Invalidate every outstanding session so a stolen token cannot
@@ -944,7 +963,7 @@ func (s *userService) AdminResetPassword(ctx context.Context, userID, newPasswor
 
 	user.PasswordHash = string(hashedPassword)
 	user.UpdatedAt = time.Now()
-	if err := s.userRepo.UpdateUser(ctx, user); err != nil {
+	if err := s.userRepo.UpdateUserPasswordHash(ctx, userID, user.PasswordHash); err != nil {
 		return err
 	}
 
@@ -1062,6 +1081,15 @@ func (s *userService) ValidatePassword(ctx context.Context, userID string, passw
 	return bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password))
 }
 
+// crossTenantAccessEnabled reports whether this deployment allows users with
+// CanAccessAllTenants to act in workspaces they are not a member of. The
+// attribute alone is not an authorization: operators flip this switch to
+// revoke every cross-tenant capability without editing user rows, so every
+// path that would honour the attribute must also consult it.
+func (s *userService) crossTenantAccessEnabled() bool {
+	return s.config != nil && s.config.Tenant != nil && s.config.Tenant.EnableCrossTenantAccess
+}
+
 // GenerateTokens generates access and refresh tokens for user. The
 // access token's tenant_id claim defaults to user.TenantID (home), but
 // if the user has persisted a still-valid "last active tenant"
@@ -1115,8 +1143,11 @@ func (s *userService) resolveLoginTenantID(ctx context.Context, user *types.User
 	}
 
 	// Membership (or cross-tenant superuser) must still be valid. Mirrors
-	// the gate in SwitchTenant so the two entry points stay consistent.
-	if !user.CanAccessAllTenants {
+	// the gate in SwitchTenant so the two entry points stay consistent. The
+	// superuser bypass additionally requires the deployment switch: with
+	// EnableCrossTenantAccess off, a lingering CanAccessAllTenants=true must
+	// not mint a token for a workspace the user left.
+	if !user.CanAccessAllTenants || !s.crossTenantAccessEnabled() {
 		if s.memberService == nil {
 			logger.Warnf(ctx,
 				"resolveLoginTenantID: member service unavailable; falling back to home for user %s",
@@ -1159,7 +1190,10 @@ func (s *userService) homeOrFirstMembershipTenant(ctx context.Context, user *typ
 	if user.TenantID == 0 {
 		return s.resolveFirstMembershipTenant(ctx, user)
 	}
-	if user.CanAccessAllTenants || s.memberService == nil {
+	// The superuser attribute only skips the home-membership gate when the
+	// deployment enables cross-tenant access; a closed switch must not keep
+	// landing a removed member in a workspace they no longer belong to.
+	if (s.crossTenantAccessEnabled() && user.CanAccessAllTenants) || s.memberService == nil {
 		return user.TenantID
 	}
 	member, err := s.memberService.GetMembership(ctx, user.ID, user.TenantID)
@@ -1190,10 +1224,15 @@ func (s *userService) clearStaleHomeTenant(ctx context.Context, user *types.User
 	if s.userRepo == nil {
 		return
 	}
-	if err := s.userRepo.UpdateUser(ctx, user); err != nil {
+	if err := s.userRepo.UpdateUserTenantID(ctx, user.ID, 0); err != nil {
 		logger.Warnf(ctx,
 			"clearStaleHomeTenant: failed to persist cleared home for user %s (was tenant %d): %v",
 			user.ID, staleHome, err)
+	}
+	if err := s.userRepo.UpdateUserPreferencesOnly(ctx, user.ID, user.Preferences); err != nil {
+		logger.Warnf(ctx,
+			"clearStaleHomeTenant: failed to persist cleared preference for user %s: %v",
+			user.ID, err)
 	}
 }
 
@@ -1226,7 +1265,7 @@ func (s *userService) resolveFirstMembershipTenant(ctx context.Context, user *ty
 
 		user.TenantID = member.TenantID
 		if s.userRepo != nil {
-			if err := s.userRepo.UpdateUser(ctx, user); err != nil {
+			if err := s.userRepo.UpdateUserTenantID(ctx, user.ID, member.TenantID); err != nil {
 				logger.Warnf(ctx, "resolveLoginTenantID: failed to persist tenant %d for tenantless user %s: %v",
 					member.TenantID, user.ID, err)
 				user.TenantID = 0
@@ -1246,11 +1285,23 @@ func (s *userService) clearLastActiveTenantPreference(ctx context.Context, user 
 		return
 	}
 	user.Preferences.LastActiveTenantID = nil
-	if err := s.userRepo.UpdateUser(ctx, user); err != nil {
+	if err := s.userRepo.UpdateUserPreferencesOnly(ctx, user.ID, user.Preferences); err != nil {
 		logger.Warnf(ctx,
 			"clearLastActiveTenantPreference: failed to persist cleared preference for user %s: %v",
 			user.ID, err)
 	}
+}
+
+// newTokenID returns the JWT `jti` for one minted token: 16 random bytes as
+// hex. iat/exp only have second granularity, so two logins (or a login and a
+// refresh rotation) in the same second would otherwise produce byte-identical
+// tokens — colliding in the token table and undermining replay detection.
+func newTokenID() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 // generateTokensForTenant is the shared implementation behind
@@ -1262,6 +1313,10 @@ func (s *userService) generateTokensForTenant(
 	user *types.User,
 	activeTenantID uint64,
 ) (accessToken, refreshToken string, err error) {
+	accessJTI, err := newTokenID()
+	if err != nil {
+		return "", "", fmt.Errorf("generate access token id: %w", err)
+	}
 	// Generate access token (expires in 24 hours)
 	accessClaims := jwt.MapClaims{
 		"user_id":   user.ID,
@@ -1269,6 +1324,7 @@ func (s *userService) generateTokensForTenant(
 		"tenant_id": activeTenantID,
 		"exp":       time.Now().Add(24 * time.Hour).Unix(),
 		"iat":       time.Now().Unix(),
+		"jti":       accessJTI,
 		"type":      "access",
 	}
 
@@ -1278,11 +1334,16 @@ func (s *userService) generateTokensForTenant(
 		return "", "", err
 	}
 
+	refreshJTI, err := newTokenID()
+	if err != nil {
+		return "", "", fmt.Errorf("generate refresh token id: %w", err)
+	}
 	// Generate refresh token (expires in 7 days)
 	refreshClaims := jwt.MapClaims{
 		"user_id": user.ID,
 		"exp":     time.Now().Add(7 * 24 * time.Hour).Unix(),
 		"iat":     time.Now().Unix(),
+		"jti":     refreshJTI,
 		"type":    "refresh",
 	}
 
@@ -1357,8 +1418,11 @@ func (s *userService) SwitchTenant(
 	}
 
 	// Verify membership unless the caller is a cross-tenant superuser
-	// switching outside their home tenant.
-	if !user.CanAccessAllTenants || targetTenantID == user.TenantID {
+	// switching outside their home tenant, and the deployment enables
+	// cross-workspace access. The attribute without the switch is not an
+	// authorization: a closed switch must reject a switch into a workspace
+	// the user has no active membership in.
+	if !user.CanAccessAllTenants || !s.crossTenantAccessEnabled() || targetTenantID == user.TenantID {
 		if s.memberService == nil {
 			return nil, errors.New("workspace membership service unavailable")
 		}
@@ -2023,8 +2087,7 @@ func (s *userService) provisionOIDCUser(
 
 	oidcOnly := true
 	user.Preferences.OidcOnlyLogin = &oidcOnly
-	user.UpdatedAt = time.Now()
-	if err := s.userRepo.UpdateUser(ctx, user); err != nil {
+	if err := s.userRepo.UpdateUserPreferencesOnly(ctx, user.ID, user.Preferences); err != nil {
 		return nil, fmt.Errorf("failed to mark OIDC-only login preference: %w", err)
 	}
 	return user, nil
@@ -2045,7 +2108,7 @@ func (s *userService) bindOIDCIdentity(ctx context.Context, user *types.User, is
 	user.OIDCIssuer = &issuer
 	user.OIDCSubject = &subject
 	user.UpdatedAt = time.Now()
-	if err := s.userRepo.UpdateUser(ctx, user); err != nil {
+	if err := s.userRepo.UpdateUserOIDCIdentity(ctx, user.ID, issuer, subject); err != nil {
 		return fmt.Errorf("failed to bind OIDC identity: %w", err)
 	}
 	return nil
