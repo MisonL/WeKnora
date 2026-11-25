@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/types"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel/propagation"
 )
@@ -45,7 +46,10 @@ func GinMiddleware() gin.HandlerFunc {
 			Metadata: map[string]interface{}{
 				"http.method": c.Request.Method,
 				"http.path":   c.FullPath(),
-				"http.query":  c.Request.URL.RawQuery,
+				// The query string can carry OAuth codes, handshake tickets
+				// and other bearer credentials; trace metadata persists
+				// outside the access log, so it gets the same redaction.
+				"http.query": secutils.SanitizeQuery(c.Request.URL.RawQuery),
 			},
 			Tags: []string{"http", strings.ToLower(c.Request.Method)},
 		}

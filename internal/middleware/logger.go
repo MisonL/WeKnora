@@ -3,9 +3,9 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -50,32 +50,150 @@ func (r loggerResponseBodyWriter) Write(b []byte) (int, error) {
 	return r.ResponseWriter.Write(b)
 }
 
-// sensitiveFieldRegex 匹配 JSON 中的敏感字段（不区分大小写，兼容 snake_case / camelCase / PascalCase）。
-// $1 捕获原始字段名（包括两侧引号），保持日志中的字段名不变，仅将值替换为 "***"。
+// sensitiveJSONFieldNames lists keys whose value is replaced with "***".
+// Comparison is on a normalized key (lowercased, "_" and "-" removed), so one
+// entry covers snake_case, kebab-case, camelCase and PascalCase spellings.
 //
-// IM 渠道的凭证不走 api_key/secret 命名（见 internal/im/*/factory.go 读取的
-// creds key），例如企业微信长连接的 bot_secret、飞书 app_secret、钉钉
-// app_secret/signing_secret、Telegram bot_token、Slack signing_secret 等，
-// 因此必须逐个列出，否则创建渠道时的请求体会把明文密钥写进访问日志。
-var sensitiveFieldRegex = regexp.MustCompile(
-	`(?i)("(?:new[_-]?password|old[_-]?password|password|passwd|ticket|token|access[_-]?token|` +
-		`refresh[_-]?token|next[_-]?token|device[_-]?token|pending[_-]?token|pairing[_-]?link|` +
-		`id[_-]?token|authorization|auth[_-]?token|api[_-]?key|` +
-		`api[_-]?secret|secret[_-]?key|client[_-]?secret|private[_-]?key|secret|` +
-		`authorization[_-]?url|authorization[_-]?attempt|assertion|` +
-		`bot[_-]?secret|bot[_-]?token|app[_-]?secret|app[_-]?token|agent[_-]?secret|` +
-		`encoding[_-]?aes[_-]?key|encrypt[_-]?key|verification[_-]?token|signing[_-]?secret|` +
-		`outgoing[_-]?token|secret[_-]?token|webhook[_-]?secret)")\s*:\s*"[^"]*"`,
-)
+// IM channel credentials do not follow the api_key/secret naming (see the
+// creds keys read by internal/im/*/factory.go): 企业微信 bot_secret、飞书
+// app_secret、钉钉 app_secret/signing_secret、Telegram bot_token、Slack
+// signing_secret 等，必须逐个列出，否则创建渠道时的请求体会把明文密钥写进访问日志。
+var sensitiveJSONFieldNames = []string{
+	"new_password", "old_password", "password", "passwd", "ticket", "token",
+	"access_token", "refresh_token", "next_token", "device_token",
+	"pending_token", "pairing_link", "id_token", "authorization",
+	"auth_token", "api_key", "api_secret", "secret_key", "client_secret",
+	"private_key", "secret", "authorization_url", "authorization_attempt",
+	"assertion", "bot_secret", "bot_token", "app_secret", "app_token",
+	"agent_secret", "encoding_aes_key", "encrypt_key", "verification_token",
+	"signing_secret", "outgoing_token", "secret_token", "webhook_secret",
+	// Initialization payloads (model providers + COS/MinIO) and invitation
+	// links. The values are plaintext credentials or bearer links.
+	"app_password", "access_key_id", "access_key", "secret_access_key",
+	"secret_id", "api_token", "mineru_api_key", "mineru_server_api_key",
+	"paddleocr_vl_cloud_token", "invite_url", "registration_url",
+}
+
+// sensitiveJSONWholeValueKeys replace the entire subtree, not just a scalar:
+// these objects exist to carry credentials and every leaf matters.
+var sensitiveJSONWholeValueKeys = map[string]struct{}{
+	"credentials": {},
+	"headers":     {},
+}
+
+// sensitiveJSONFields is the normalized key set used by the JSON-aware
+// redactor.
+var sensitiveJSONFields = func() map[string]struct{} {
+	out := make(map[string]struct{}, len(sensitiveJSONFieldNames))
+	for _, name := range sensitiveJSONFieldNames {
+		out[normalizeSensitiveKey(name)] = struct{}{}
+	}
+	return out
+}()
+
+// normalizeSensitiveKey lowercases a JSON key and drops "_"/"-" so camelCase,
+// snake_case and kebab-case spellings of the same field compare equal.
+func normalizeSensitiveKey(key string) string {
+	var b strings.Builder
+	b.Grow(len(key))
+	for _, r := range strings.ToLower(key) {
+		if r == '_' || r == '-' {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// sensitiveFieldRegex is the fallback for bodies that are not valid JSON
+// (truncated previews, plain-text upstream errors, form-encoded bodies).
+// $1 captures the original field name (including quotes) so the log keeps the
+// field name and only loses the value. The value pattern accepts escaped
+// quotes (\"), numbers, null/booleans, and an unterminated string running to
+// the end of a truncated body.
+var sensitiveFieldRegex = buildSensitiveFieldRegex()
+
+func buildSensitiveFieldRegex() *regexp.Regexp {
+	names := make([]string, 0, len(sensitiveJSONFieldNames))
+	for _, name := range sensitiveJSONFieldNames {
+		// "_" becomes an optional separator so apikey/apiKey/api_key/api-key
+		// all match under the case-insensitive flag.
+		names = append(names, strings.ReplaceAll(name, "_", "[_-]?"))
+	}
+	pattern := `(?i)("(?:` + strings.Join(names, "|") + `)")\s*:\s*(?:` +
+		`"(?:[^"\\]|\\.)*"` + // quoted string (escapes handled)
+		`|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?` + // number
+		`|null|true|false` + // literals
+		`|"(?:[^"\\]|\\.)*\z` + // unterminated string at the truncation edge
+		`)`
+	return regexp.MustCompile(pattern)
+}
 
 // dataURIRegex matches an inline data URI whose payload is base64. Request logs
 // are capped at 10KB, and an image upload still fills that cap with file bytes.
 var dataURIRegex = regexp.MustCompile(`(?i)\bdata:[^\s"'<>]{0,128};base64,[A-Za-z0-9+/=\r\n]*`)
 
 // sanitizeBody 清理敏感信息，并把 data URI 的 base64 载荷换成长度标记。
+//
+// JSON documents take the structured path: keys are matched after
+// normalization, nested maps and arrays are traversed, and credential
+// containers (credentials/headers) are replaced whole. Anything else —
+// truncated previews, plain-text errors, form bodies — falls back to the
+// token regex, which is quote-aware.
 func sanitizeBody(body string) string {
 	redacted := dataURIRegex.ReplaceAllStringFunc(body, redactDataURI)
+	if out, ok := sanitizeJSONBody(redacted); ok {
+		return out
+	}
 	return sensitiveFieldRegex.ReplaceAllString(redacted, `$1:"***"`)
+}
+
+// sanitizeJSONBody redacts a valid JSON document and re-encodes it. Numbers
+// are decoded as json.Number so large ids keep their exact spelling. The
+// second Decode guards against a valid prefix followed by garbage, which must
+// not be silently dropped from the log.
+func sanitizeJSONBody(body string) (string, bool) {
+	dec := json.NewDecoder(strings.NewReader(body))
+	dec.UseNumber()
+	var value any
+	if err := dec.Decode(&value); err != nil {
+		return "", false
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return "", false
+	}
+	encoded, err := json.Marshal(redactJSONValue(value))
+	if err != nil {
+		return "", false
+	}
+	return string(encoded), true
+}
+
+func redactJSONValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			normalized := normalizeSensitiveKey(key)
+			if _, whole := sensitiveJSONWholeValueKeys[normalized]; whole {
+				typed[key] = "***"
+				continue
+			}
+			if _, sensitive := sensitiveJSONFields[normalized]; sensitive {
+				typed[key] = "***"
+				continue
+			}
+			typed[key] = redactJSONValue(child)
+		}
+		return typed
+	case []any:
+		for i := range typed {
+			typed[i] = redactJSONValue(typed[i])
+		}
+		return typed
+	default:
+		return value
+	}
 }
 
 func redactDataURI(match string) string {
@@ -88,36 +206,12 @@ func redactDataURI(match string) string {
 	return fmt.Sprintf("%s;base64,[redacted %d chars]", match[:idx], payloadLen)
 }
 
-var sensitiveQueryFields = map[string]struct{}{
-	"access_token":          {},
-	"authorization_attempt": {},
-	"code":                  {},
-	"id_token":              {},
-	"refresh_token":         {},
-	"state":                 {},
-	// ticket is the sandbox terminal's WebSocket handshake credential. A
-	// browser cannot set Authorization on an upgrade, so it travels in the
-	// query string; anyone holding it for its 2-minute TTL can open a shell
-	// in the session's sandbox, which is why it must never reach a log line.
-	"ticket": {},
-	"token":  {},
-}
-
 // sanitizeQuery prevents OAuth authorization codes, CSRF/attempt state, and
-// handshake credentials from being copied into access logs. Parsing the query
-// also covers repeated and percent-encoded parameters without relying on
-// fragile string replacement.
+// handshake credentials from being copied into access logs. The shared
+// implementation also backs the Langfuse trace metadata so both surfaces
+// redact the same parameter set.
 func sanitizeQuery(raw string) string {
-	values, err := url.ParseQuery(raw)
-	if err != nil {
-		return "[invalid query omitted]"
-	}
-	for key := range values {
-		if _, sensitive := sensitiveQueryFields[strings.ToLower(key)]; sensitive {
-			values[key] = []string{"***"}
-		}
-	}
-	return values.Encode()
+	return secutils.SanitizeQuery(raw)
 }
 
 // readRequestBody 读取请求体（限制大小用于日志，但把剩余字节原样交还后续handler）
@@ -201,8 +295,9 @@ func RequestID() gin.HandlerFunc {
 
 // skipsBodyLogging reports routes whose bodies carry credentials, page
 // content or screenshots. Their access metadata is still logged; their
-// bodies are never read or buffered. sanitizeBody is no substitute: it only
-// knows fixed key names, and a value containing \" ends its match early.
+// bodies are never read or buffered. sanitizeBody is no substitute here: it
+// only knows fixed key names, so a credential under an unknown field name
+// (or free-form page text) would still be logged.
 func skipsBodyLogging(path string) bool {
 	return strings.HasPrefix(path, "/api/v1/local-browser/") ||
 		path == "/api/v1/me/browser" || strings.HasSuffix(path, "/local-browser") ||
