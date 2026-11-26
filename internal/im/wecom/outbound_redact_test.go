@@ -25,7 +25,7 @@ func swapHTTPClient(t *testing.T, transport http.RoundTripper) {
 // gettoken puts corpsecret in the query string. A transport failure surfaces a
 // *url.Error carrying the full URL, and that error reaches logger.Errorf.
 func TestGetAccessTokenErrorRedactsCorpSecret(t *testing.T) {
-	const secret = "corpsecret-SUPER-SECRET"
+	const secret = "placeholder-corp-secret"
 	swapHTTPClient(t, failingTransport(func(req *http.Request) (*http.Response, error) {
 		return nil, &url.Error{Op: "Get", URL: req.URL.String(), Err: errors.New("dial refused")}
 	}))
@@ -46,7 +46,7 @@ func TestGetAccessTokenErrorRedactsCorpSecret(t *testing.T) {
 // message/send carries the access token in the query string; the same url.Error
 // wrapper used to copy it into the log line.
 func TestSendToUserErrorRedactsAccessToken(t *testing.T) {
-	const token = "ACCESS-TOKEN-SECRET"
+	const token = "placeholder-token"
 	swapHTTPClient(t, failingTransport(func(req *http.Request) (*http.Response, error) {
 		return nil, &url.Error{Op: "Post", URL: req.URL.String(), Err: errors.New("connection reset")}
 	}))

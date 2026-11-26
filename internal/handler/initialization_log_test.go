@@ -17,13 +17,13 @@ import (
 func TestInitializationLogSummaryOmitsSecrets(t *testing.T) {
 	var req InitializationRequest
 	body := `{
-		"llm": {"source":"openai","modelName":"gpt","apiKey":"sk-llm-SECRET"},
-		"embedding": {"source":"openai","modelName":"emb","apiKey":"sk-embed-SECRET"},
-		"rerank": {"enabled":true,"modelName":"rr","apiKey":"sk-rerank-SECRET"},
+		"llm": {"source":"openai","modelName":"gpt","apiKey":"placeholder-llm-key"},
+		"embedding": {"source":"openai","modelName":"emb","apiKey":"placeholder-embed-key"},
+		"rerank": {"enabled":true,"modelName":"rr","apiKey":"placeholder-rerank-key"},
 		"multimodal": {"enabled":true,
-			"vlm": {"modelName":"vlm","apiKey":"sk-vlm-SECRET"},
+			"vlm": {"modelName":"vlm","apiKey":"placeholder-vlm-key"},
 			"storageType":"cos",
-			"cos": {"secretId":"cos-id-SECRET","secretKey":"cos-key-SECRET","region":"ap-x"}},
+			"cos": {"secretId":"placeholder-cos-id","secretKey":"placeholder-cos-key","region":"ap-x"}},
 		"documentSplitting": {"chunkSize":512,"separators":["\n"]}
 	}`
 	if err := json.Unmarshal([]byte(body), &req); err != nil {
@@ -54,12 +54,12 @@ func TestInitializationLogSummaryOmitsSecrets(t *testing.T) {
 		}
 	}
 	for _, secret := range []string{
-		"sk-llm-SECRET",
-		"sk-embed-SECRET",
-		"sk-rerank-SECRET",
-		"sk-vlm-SECRET",
-		"cos-id-SECRET",
-		"cos-key-SECRET",
+		"placeholder-llm-key",
+		"placeholder-embed-key",
+		"placeholder-rerank-key",
+		"placeholder-vlm-key",
+		"placeholder-cos-id",
+		"placeholder-cos-key",
 	} {
 		if strings.Contains(out, secret) {
 			t.Fatalf("log line leaked %q: %q", secret, out)

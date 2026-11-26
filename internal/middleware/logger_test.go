@@ -138,27 +138,27 @@ func TestSanitizeBody(t *testing.T) {
 		},
 		{
 			name: "app_password",
-			in:   `{"app_password":"S3CRET"}`,
+			in:   `{"app_password":"placeholder-credential"}`,
 			want: `{"app_password":"***"}`,
 		},
 		{
 			name: "secret_access_key",
-			in:   `{"secret_access_key":"S3CRET"}`,
+			in:   `{"secret_access_key":"placeholder-credential"}`,
 			want: `{"secret_access_key":"***"}`,
 		},
 		{
 			name: "access_key_id",
-			in:   `{"access_key_id":"AKID-S3CRET"}`,
+			in:   `{"access_key_id":"AKID-placeholder-credential"}`,
 			want: `{"access_key_id":"***"}`,
 		},
 		{
 			name: "camelCase accessKey",
-			in:   `{"accessKey":"S3CRET"}`,
+			in:   `{"accessKey":"placeholder-credential"}`,
 			want: `{"accessKey":"***"}`,
 		},
 		{
 			name: "api_token",
-			in:   `{"api_token":"S3CRET"}`,
+			in:   `{"api_token":"placeholder-credential"}`,
 			want: `{"api_token":"***"}`,
 		},
 		{
@@ -173,7 +173,7 @@ func TestSanitizeBody(t *testing.T) {
 		},
 		{
 			name: "invite and registration urls",
-			in:   `{"invite_url":"https://x/register?token=SECRET","registration_url":"https://x/register?token=SECRET"}`,
+			in:   `{"invite_url":"https://x/register?token=placeholder-invite-token","registration_url":"https://x/register?token=placeholder-invite-token"}`,
 			want: `{"invite_url":"***","registration_url":"***"}`,
 		},
 		{

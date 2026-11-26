@@ -21,7 +21,7 @@ func TestIMChannelResponseOmitsCredentials(t *testing.T) {
 		Mode:            "websocket",
 		OutputMode:      "stream",
 		KnowledgeBaseID: "kb-1",
-		Credentials:     im.NewCredentialsJSON([]byte(`{"bot_id":"bot-1","bot_secret":"SUPERSECRET"}`)),
+		Credentials:     im.NewCredentialsJSON([]byte(`{"bot_id":"bot-1","bot_secret":"placeholder-credential"}`)),
 		Enabled:         true,
 	}
 
@@ -30,7 +30,7 @@ func TestIMChannelResponseOmitsCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal response: %v", err)
 	}
-	if strings.Contains(string(body), "SUPERSECRET") {
+	if strings.Contains(string(body), "placeholder-credential") {
 		t.Fatalf("response leaked the credential: %s", body)
 	}
 	if strings.Contains(string(body), `"credentials"`) {

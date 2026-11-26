@@ -16,17 +16,17 @@ func TestRedactURLQuery(t *testing.T) {
 	}{
 		{
 			name: "wecom corpsecret",
-			in:   "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=corp-1&corpsecret=S3CRET",
+			in:   "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=corp-1&corpsecret=placeholder-credential",
 			want: "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=corp-1&corpsecret=%2A%2A%2A",
 		},
 		{
 			name: "access token",
-			in:   "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=S3CRET&debug=1",
+			in:   "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=placeholder-credential&debug=1",
 			want: "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=%2A%2A%2A&debug=1",
 		},
 		{
 			name: "dingtalk session webhook",
-			in:   "https://oapi.dingtalk.com/robot/sendBySession?session=S3CRET",
+			in:   "https://oapi.dingtalk.com/robot/sendBySession?session=placeholder-credential",
 			want: "https://oapi.dingtalk.com/robot/sendBySession?session=%2A%2A%2A",
 		},
 		{
@@ -47,7 +47,7 @@ func TestRedactURLQuery(t *testing.T) {
 			}
 		})
 	}
-	if got := RedactURLQuery("https://example.com/path?corpsecret=S3CRET"); strings.Contains(got, "S3CRET") {
+	if got := RedactURLQuery("https://example.com/path?corpsecret=placeholder-credential"); strings.Contains(got, "placeholder-credential") {
 		t.Fatalf("RedactURLQuery leaked the secret: %q", got)
 	}
 }
@@ -55,7 +55,7 @@ func TestRedactURLQuery(t *testing.T) {
 func TestRedactRequestErrorKeepsWrappingContext(t *testing.T) {
 	inner := &url.Error{
 		Op:  "Get",
-		URL: "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=corp-1&corpsecret=S3CRET",
+		URL: "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=corp-1&corpsecret=placeholder-credential",
 		Err: errors.New("dial refused"),
 	}
 	// Call sites redact the raw transport error, then wrap it; fmt.Errorf
@@ -66,7 +66,7 @@ func TestRedactRequestErrorKeepsWrappingContext(t *testing.T) {
 	if !strings.Contains(err.Error(), "request access token:") {
 		t.Fatalf("wrapping context was lost: %v", err)
 	}
-	if strings.Contains(err.Error(), "S3CRET") {
+	if strings.Contains(err.Error(), "placeholder-credential") {
 		t.Fatalf("error leaked the query secret: %v", err)
 	}
 	var uerr *url.Error
@@ -83,9 +83,9 @@ func TestRedactRequestErrorPassesThroughOtherErrors(t *testing.T) {
 }
 
 func TestSummarizeUpstreamBodyKeepsOnlyErrcodeAndMessage(t *testing.T) {
-	body := []byte(`{"errcode":40013,"errmsg":"invalid corpid","request":{"corpsecret":"S3CRET","debug":"S3CRET"}}`)
+	body := []byte(`{"errcode":40013,"errmsg":"invalid corpid","request":{"corpsecret":"placeholder-credential","debug":"placeholder-credential"}}`)
 	got := SummarizeUpstreamBody(body)
-	if strings.Contains(got, "S3CRET") {
+	if strings.Contains(got, "placeholder-credential") {
 		t.Fatalf("summary leaked the raw body: %q", got)
 	}
 	if !strings.Contains(got, "errcode=40013") || !strings.Contains(got, "invalid corpid") {
@@ -97,9 +97,9 @@ func TestSummarizeUpstreamBodyKeepsOnlyErrcodeAndMessage(t *testing.T) {
 }
 
 func TestSummarizeUpstreamBodyDingTalkShape(t *testing.T) {
-	body := []byte(`{"code":"InvalidAuthentication","message":"bad credentials","appSecret":"S3CRET"}`)
+	body := []byte(`{"code":"InvalidAuthentication","message":"bad credentials","appSecret":"placeholder-credential"}`)
 	got := SummarizeUpstreamBody(body)
-	if strings.Contains(got, "S3CRET") {
+	if strings.Contains(got, "placeholder-credential") {
 		t.Fatalf("summary leaked the raw body: %q", got)
 	}
 	if !strings.Contains(got, "InvalidAuthentication") || !strings.Contains(got, "bad credentials") {
@@ -108,8 +108,8 @@ func TestSummarizeUpstreamBodyDingTalkShape(t *testing.T) {
 }
 
 func TestSummarizeUpstreamBodyNonJSONKeepsLengthOnly(t *testing.T) {
-	got := SummarizeUpstreamBody([]byte("<html>proxy error S3CRET</html>"))
-	if strings.Contains(got, "S3CRET") || strings.Contains(got, "<html>") {
+	got := SummarizeUpstreamBody([]byte("<html>proxy error placeholder-credential</html>"))
+	if strings.Contains(got, "placeholder-credential") || strings.Contains(got, "<html>") {
 		t.Fatalf("summary leaked a non-JSON body: %q", got)
 	}
 	if !strings.Contains(got, "body_len=") {

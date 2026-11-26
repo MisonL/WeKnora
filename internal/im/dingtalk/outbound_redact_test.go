@@ -36,7 +36,7 @@ func jsonResponse(status int, body string) *http.Response {
 // The accessToken endpoint used to return the raw upstream body in its error,
 // and a proxy/gateway error page can echo the request (appKey/appSecret) back.
 func TestAccessTokenErrorOmitsUpstreamBodySecret(t *testing.T) {
-	const secret = "APP-SECRET-SUPERSECRET"
+	const secret = "APP-SECRET-placeholder-credential"
 	swapDingTalkHTTPClient(t, stubTransport(func(req *http.Request) (*http.Response, error) {
 		return jsonResponse(http.StatusBadRequest,
 			`{"code":"InvalidAuthentication","message":"bad credentials","request":{"appSecret":"`+secret+`"}}`), nil
@@ -65,7 +65,7 @@ func TestSessionWebhookErrorRedactsSessionCredential(t *testing.T) {
 	secutils.SetSSRFWhitelistFromRaw("oapi.dingtalk.com")
 	t.Cleanup(secutils.ResetSSRFWhitelistForTest)
 
-	const secret = "SESSION-SUPERSECRET"
+	const secret = "SESSION-placeholder-credential"
 	target := "https://oapi.dingtalk.com/robot/sendBySession?session=" + secret
 	swapDingTalkHTTPClient(t, stubTransport(func(req *http.Request) (*http.Response, error) {
 		return nil, &url.Error{Op: "Post", URL: req.URL.String(), Err: errors.New("timeout")}
@@ -83,7 +83,7 @@ func TestSessionWebhookErrorRedactsSessionCredential(t *testing.T) {
 }
 
 func TestDingTalkAPIErrorSummarizesUpstreamBody(t *testing.T) {
-	const secret = "UPSTREAM-BODY-SECRET"
+	const secret = "placeholder-upstream"
 	swapDingTalkHTTPClient(t, stubTransport(func(req *http.Request) (*http.Response, error) {
 		return jsonResponse(http.StatusInternalServerError,
 			`{"code":"InternalError","message":"boom","debug":"`+secret+`"}`), nil

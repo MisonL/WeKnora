@@ -176,7 +176,7 @@ func TestGinMiddlewareRedactsQueryInTraceMetadata(t *testing.T) {
 	})
 
 	req := httptest.NewRequest(http.MethodGet,
-		"/api/v1/knowledge-chat/sess-1?token=SUPERSECRET&next=%2Fhome", nil)
+		"/api/v1/knowledge-chat/sess-1?token=placeholder-credential&next=%2Fhome", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -184,7 +184,7 @@ func TestGinMiddlewareRedactsQueryInTraceMetadata(t *testing.T) {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
 	query, _ := observed["http.query"].(string)
-	if strings.Contains(query, "SUPERSECRET") {
+	if strings.Contains(query, "placeholder-credential") {
 		t.Fatalf("trace metadata leaked the query credential: %q", query)
 	}
 	if !strings.Contains(query, "next=%2Fhome") {
