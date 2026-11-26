@@ -51,13 +51,12 @@ func postAsIP(r *gin.Engine, path, ip string) int {
 	return w.Code
 }
 
-func TestLoginAndRefreshAreRateLimited(t *testing.T) {
+func TestLoginIsRateLimitedPerIP(t *testing.T) {
 	r := newAuthRateLimitRouter()
 	// The limiter is a process-wide singleton; use unique test-net IPs so
 	// repeated runs (-count=N) don't inherit a previous run's budget.
 	suffix := int(time.Now().UnixNano()%200) + 1
 	loginIP := fmt.Sprintf("203.0.113.%d", suffix)
-	refreshIP := fmt.Sprintf("203.0.113.%d", suffix+1)
 
 	// 30 requests per IP per minute; the 31st must be throttled.
 	for i := 0; i < 30; i++ {
@@ -68,15 +67,31 @@ func TestLoginAndRefreshAreRateLimited(t *testing.T) {
 	if code := postAsIP(r, "/api/v1/auth/login", loginIP); code != http.StatusTooManyRequests {
 		t.Fatalf("login request 31 status = %d, want 429", code)
 	}
+}
 
-	// The limiter is per IP: another IP still gets requests through.
-	// /auth/refresh is budgeted the same way as /auth/login.
+// Refresh has its own, larger bucket. Sharing login's meant a busy NAT could
+// exhaust it with login attempts and then sign every one of its users out, as
+// the SPA treats a failed refresh as a logout.
+func TestRefreshHasItsOwnLargerBudget(t *testing.T) {
+	r := newAuthRateLimitRouter()
+	suffix := int(time.Now().UnixNano()%200) + 1
+	ip := fmt.Sprintf("198.51.100.%d", suffix)
+
+	// Exhaust the login bucket for this IP first.
 	for i := 0; i < 30; i++ {
-		if code := postAsIP(r, "/api/v1/auth/refresh", refreshIP); code == http.StatusTooManyRequests {
-			t.Fatalf("refresh request %d was throttled too early", i+1)
-		}
+		_ = postAsIP(r, "/api/v1/auth/login", ip)
 	}
-	if code := postAsIP(r, "/api/v1/auth/refresh", refreshIP); code != http.StatusTooManyRequests {
-		t.Fatalf("refresh request 31 status = %d, want 429", code)
+	if code := postAsIP(r, "/api/v1/auth/login", ip); code != http.StatusTooManyRequests {
+		t.Fatalf("login request 31 status = %d, want 429", code)
+	}
+	// Refresh is unaffected by that exhaustion.
+	if code := postAsIP(r, "/api/v1/auth/refresh", ip); code == http.StatusTooManyRequests {
+		t.Fatal("exhausting the login bucket must not throttle refresh")
+	}
+	// Its own budget is larger than login's 30/min.
+	for i := 0; i < 100; i++ {
+		if code := postAsIP(r, "/api/v1/auth/refresh", ip); code == http.StatusTooManyRequests {
+			t.Fatalf("refresh request %d was throttled too early", i+2)
+		}
 	}
 }

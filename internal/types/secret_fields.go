@@ -50,6 +50,11 @@ func isSensitiveMCPHeader(name string) bool {
 	if strings.Contains(normalized, "authorization") || strings.HasSuffix(normalized, "apikey") {
 		return true
 	}
+	// Cookie is a standard authentication carrier (session=<secret>) and must
+	// be encrypted at rest like any other credential header.
+	if normalized == "cookie" {
+		return true
+	}
 	return strings.Contains(normalized, "token") || strings.Contains(normalized, "secret")
 }
 

@@ -182,8 +182,31 @@ func sanitizeBodyForPath(body, path string) string {
 		return out
 	}
 	out := sensitiveFieldRegex.ReplaceAllString(redacted, `$1:"***"`)
+	out = redactTruncatedCredentialContainers(out)
 	return redactExtraJSONFields(out, extra)
 }
+
+// redactTruncatedCredentialContainers masks a credentials/headers object in a
+// preview that is no longer valid JSON. The structured redactor replaces those
+// subtrees whole, but a truncated preview cannot be parsed, and the token regex
+// only knows scalar fields -- so an X-Session header would survive verbatim.
+// Everything from the key to the end of the preview is masked; the truncation
+// marker the caller appended is restored.
+func redactTruncatedCredentialContainers(body string) string {
+	suffix := ""
+	if strings.HasSuffix(body, bodyTruncatedMarker) {
+		body = strings.TrimSuffix(body, bodyTruncatedMarker)
+		suffix = bodyTruncatedMarker
+	}
+	body = credentialContainerTruncatedRegex.ReplaceAllString(body, `$1:"***"`)
+	return body + suffix
+}
+
+// credentialContainerTruncatedRegex matches a credentials/headers object that
+// runs to the end of a preview. Being non-JSON at this point, the object's
+// extent cannot be trusted, so the redaction is deliberately greedy.
+var credentialContainerTruncatedRegex = regexp.MustCompile(
+	`(?i)("(?:credentials|headers)(?:'|\\")?")\s*:\s*\{.*\z`)
 
 // redactExtraJSONFields applies the path-specific keys to a body that failed
 // JSON parsing (typically a truncated preview), using the same quote-aware

@@ -147,3 +147,25 @@ func TestParseSandboxTerminalTicketRejectsMissingExpiration(t *testing.T) {
 	_, err := ParseSandboxTerminalTicket(ticket)
 	require.Error(t, err)
 }
+
+// The attack Codex flagged does not need a race: the attacker rotates the
+// stolen token first, and the legitimate client's later use of the same token
+// hits the already-revoked row. Before, that path returned a plain rejection
+// and left the attacker's freshly minted session alive. It must revoke too.
+func TestRefreshTokenReplayOfAnAlreadyRevokedTokenRevokesAllSessions(t *testing.T) {
+	ctx := context.Background()
+	svc, tokenRepo, _, refresh := activeRefreshFixture(t)
+
+	// Attacker wins the rotation.
+	attackerAccess, attackerRefresh, err := svc.RefreshToken(ctx, refresh)
+	require.NoError(t, err)
+	tokenRepo.revokedUserIDs = nil // ignore anything recorded before the replay
+
+	// Victim replays the same (now revoked) token.
+	_, _, err = svc.RefreshToken(ctx, refresh)
+	require.Error(t, err)
+	require.Equal(t, []string{"user-1"}, tokenRepo.revokedUserIDs,
+		"a replay of an already-revoked refresh token must tear down the session it minted")
+	require.Contains(t, tokenRepo.tokens, attackerAccess)
+	require.NotNil(t, tokenRepo.tokens[attackerRefresh], "the reuse teardown is a DB-wide revoke; the row still exists")
+}

@@ -64,7 +64,12 @@ func (s *knowledgeService) UpsertFAQEntries(ctx context.Context,
 	// runs as the owner, but the task id is what the progress route checks
 	// against the caller's tenant, and minting it with the owner's would make
 	// the initiator's own poll a 404.
-	callerTenantID, _ := types.TenantIDFromContext(ctx)
+	//
+	// The execution tenant is already the KB owner here: the HTTP route's
+	// KBAccessWrite guard rewrote it before the handler ran, so
+	// TenantIDFromContext cannot see the initiator. The authorized identity
+	// survives that rewrite in the caller, which is what this needs.
+	callerTenantID := faqImportCallerTenant(ctx)
 
 	// 验证知识库是否存在且有效
 	kb, ctx, err := s.writableFAQKnowledgeBase(ctx, kbID)
@@ -81,6 +86,8 @@ func (s *knowledgeService) UpsertFAQEntries(ctx context.Context,
 		taskID = secutils.GenerateTaskID("faq_import", faqImportTaskTenant(callerTenantID, tenantID), kbID)
 	} else if err := secutils.ValidateTaskID(taskID); err != nil {
 		return "", werrors.NewBadRequestError("task_id 格式不合法")
+	} else if err := validateClientFAQTaskTenant(taskID, callerTenantID, tenantID); err != nil {
+		return "", err
 	}
 
 	// 记录任务入队时间
@@ -2031,7 +2038,7 @@ func (s *knowledgeService) deleteReplacedFAQChunks(ctx context.Context, taskID s
 	// the delete and carries OnlyIfDeleted, so it touches exactly the rows the
 	// delete reaches. A successful synchronous delete does not cancel it: the
 	// index delete is idempotent and may already have found the vectors gone.
-	s.enqueueFAQIndexDeleteFallback(ctx, tenantID, kb, plannedIDs, true)
+	s.enqueueFAQIndexDeleteFallback(ctx, tenantID, kb, plannedIDs, true, faqIndexDeleteFallbackDelay)
 	deletedIDs, deleteErr := s.chunkRepo.DeleteChunksIfUnchanged(ctx, tenantID, unchanged)
 	// The conditional delete runs in batches. When a later batch fails, the rows
 	// the earlier ones soft-deleted are already gone from every future plan, so
@@ -2045,7 +2052,7 @@ func (s *knowledgeService) deleteReplacedFAQChunks(ctx context.Context, taskID s
 		// The rows already committed by the batches that succeeded before the
 		// failure are soft-deleted. Hand them over explicitly alongside the
 		// pre-delete coverage above, which names the whole plan.
-		s.enqueueFAQIndexDeleteFallback(ctx, tenantID, kb, deletedIDs, true)
+		s.enqueueFAQIndexDeleteFallback(ctx, tenantID, kb, deletedIDs, true, 0)
 	}
 	deleted := make(map[string]struct{}, len(deletedIDs))
 	for _, id := range deletedIDs {
@@ -2068,7 +2075,7 @@ func (s *knowledgeService) deleteReplacedFAQChunks(ctx context.Context, taskID s
 			// deleteFAQChunkVectors returns before its own delete when the engine or
 			// the index list cannot be built, so the ids must be handed over here
 			// rather than only around the engine call.
-			s.enqueueFAQIndexDeleteFallback(ctx, tenantID, kb, deletedChunkIDs, true)
+			s.enqueueFAQIndexDeleteFallback(ctx, tenantID, kb, deletedChunkIDs, true, 0)
 		}
 	}
 	if deleteErr != nil {
@@ -2092,7 +2099,8 @@ func (s *knowledgeService) deleteReplacedFAQChunks(ctx context.Context, taskID s
 // gone. The async task deletes by chunk id, retries on its own, and is safe to
 // run against ids the synchronous attempt already removed.
 func (s *knowledgeService) enqueueFAQIndexDeleteFallback(
-	ctx context.Context, tenantID uint64, kb *types.KnowledgeBase, chunkIDs []string, onlyIfDeleted bool,
+	ctx context.Context, tenantID uint64, kb *types.KnowledgeBase, chunkIDs []string,
+	onlyIfDeleted bool, delay time.Duration,
 ) {
 	// The replaced rows of a replace import are not bounded by the import's
 	// entry cap -- they are whatever the knowledge base held -- so the id list
@@ -2105,12 +2113,13 @@ func (s *knowledgeService) enqueueFAQIndexDeleteFallback(
 		if end > len(chunkIDs) {
 			end = len(chunkIDs)
 		}
-		s.enqueueOneFAQIndexDeleteFallback(ctx, tenantID, kb, chunkIDs[start:end], onlyIfDeleted)
+		s.enqueueOneFAQIndexDeleteFallback(ctx, tenantID, kb, chunkIDs[start:end], onlyIfDeleted, delay)
 	}
 }
 
 func (s *knowledgeService) enqueueOneFAQIndexDeleteFallback(
-	ctx context.Context, tenantID uint64, kb *types.KnowledgeBase, chunkIDs []string, onlyIfDeleted bool,
+	ctx context.Context, tenantID uint64, kb *types.KnowledgeBase, chunkIDs []string,
+	onlyIfDeleted bool, delay time.Duration,
 ) {
 	if len(chunkIDs) == 0 || s.task == nil {
 		return
@@ -2136,8 +2145,26 @@ func (s *knowledgeService) enqueueOneFAQIndexDeleteFallback(
 		logger.Errorf(ctx, "FAQ import: cannot marshal index delete fallback: %v", err)
 		return
 	}
-	task := asynq.NewTask(types.TypeIndexDelete, payloadBytes,
-		asynq.Queue(types.QueueMaintenance), asynq.MaxRetry(10), asynq.Timeout(time.Hour))
+	options := []asynq.Option{
+		asynq.Queue(types.QueueMaintenance), asynq.MaxRetry(10), asynq.Timeout(time.Hour),
+	}
+	if delay > 0 {
+		// The pre-delete hand-over must not be consumed while the row delete is
+		// still running: it would find nothing deleted yet, finish, and leave
+		// the crash window it exists to close wide open. By the time it runs the
+		// delete phase is long over, so every id it still sees live is a row
+		// that was kept.
+		options = append(options, asynq.ProcessIn(delay))
+	}
+	taskType := types.TypeIndexDelete
+	if onlyIfDeleted {
+		// A distinct type is what keeps a consumer from a previous release
+		// from deleting vectors of rows this import never removed: it ignores
+		// the payload flag, and an unknown type is retried rather than run
+		// against the wrong semantics.
+		taskType = types.TypeIndexDeleteIfDeleted
+	}
+	task := asynq.NewTask(taskType, payloadBytes, options...)
 	if _, err := s.task.Enqueue(task); err != nil {
 		// Nothing retries this: the rows are already soft-deleted, so the
 		// import's own retry recomputes a plan that cannot see them. The ids go
@@ -2178,6 +2205,16 @@ func (s *knowledgeService) updateFAQImportProgressStatus(
 			CreatedAt:  time.Now().Unix(),
 			TenantID:   tenantIDFromContext(ctx),
 		}
+	} else if existingProgress != nil && existingProgress.InstanceID != "" &&
+		instanceID != "" && existingProgress.InstanceID != instanceID {
+		// The record belongs to another run of the same task id (a newer
+		// submission, or a retry admitted beside this one). This attempt's
+		// terminal state must not overwrite theirs: the initiator is polling
+		// the record of the run that is actually importing.
+		logger.Infof(ctx,
+			"FAQ import task %s: leaving progress record of instance %s alone",
+			taskID, existingProgress.InstanceID)
+		return nil
 	}
 
 	// Update progress fields
@@ -2386,6 +2423,34 @@ type faqImportLeaseHeldError struct{ TaskID string }
 
 func (e *faqImportLeaseHeldError) Error() string {
 	return "FAQ import lease already held"
+}
+
+// faqImportCallerTenant resolves the tenant that authorized the import. The
+// KB-scope guard rewrites the execution tenant to the KB owner, so the
+// initiator's tenant survives only in the captured caller.
+func faqImportCallerTenant(ctx context.Context) uint64 {
+	if caller := types.CallerFromContext(ctx); caller.TenantID != 0 {
+		return caller.TenantID
+	}
+	tenantID, _ := types.TenantIDFromContext(ctx)
+	return tenantID
+}
+
+// validateClientFAQTaskTenant refuses a client-chosen task id that embeds
+// another tenant. The id decides the progress key's tenant segment, so an
+// id minted elsewhere would let its submitter write (and overwrite) a record
+// under a tenant that does not own the import. Ids without an embedded
+// tenant stay keyed by the execution tenant, which is already the caller's
+// own scope.
+func validateClientFAQTaskTenant(taskID string, callerTenantID, executionTenantID uint64) error {
+	embedded, err := secutils.TaskTenantID(taskID)
+	if err != nil || embedded == 0 {
+		return nil
+	}
+	if embedded == callerTenantID || embedded == executionTenantID {
+		return nil
+	}
+	return werrors.NewBadRequestError("task_id 不属于当前空间")
 }
 
 // faqImportTaskTenant is the tenant stamped into an FAQ import's task id: the
@@ -4265,6 +4330,14 @@ const (
 // boundary probes) can shorten the window.
 var faqImportLeaseTTL = 10 * time.Minute
 
+// faqIndexDeleteFallbackDelay postpones the cleanup task a replace import
+// queues before its row delete. The task must not run while the delete phase
+// is still in flight: it would see those rows live, finish as a no-op, and
+// the crash window it exists to cover would reopen. The delete phase commits
+// in milliseconds; ten minutes later every id the task still sees live is a
+// row that was deliberately kept. A variable so tests can zero it.
+var faqIndexDeleteFallbackDelay = 10 * time.Minute
+
 // faqImportLeaseHeartbeatInterval is how often a running import refreshes its
 // lease while it works. Progress saves also renew, but they happen once per
 // batch: a batch that embeds and indexes slowly could outlive the lease, and
@@ -4636,10 +4709,26 @@ func (s *knowledgeService) GetFAQImportProgress(ctx context.Context, taskID stri
 	}
 	data, err := s.redisClient.Get(ctx, key).Bytes()
 	if err != nil {
-		if errors.Is(err, redis.Nil) {
+		if !errors.Is(err, redis.Nil) {
+			return nil, fmt.Errorf("failed to get FAQ import progress from Redis: %w", err)
+		}
+		// Records written before the key became tenant-scoped live under the
+		// legacy key with no tenant segment. Read them through so a task
+		// finished shortly before the upgrade is still visible for the rest of
+		// its TTL; the caller check below is unchanged, so the legacy key does
+		// not widen who can read it.
+		legacy := faqImportProgressKeyPrefix + taskID
+		if legacy == key {
 			return nil, werrors.NewNotFoundError("FAQ import task not found")
 		}
-		return nil, fmt.Errorf("failed to get FAQ import progress from Redis: %w", err)
+		legacyData, legacyErr := s.redisClient.Get(ctx, legacy).Bytes()
+		if legacyErr != nil {
+			if errors.Is(legacyErr, redis.Nil) {
+				return nil, werrors.NewNotFoundError("FAQ import task not found")
+			}
+			return nil, fmt.Errorf("failed to get FAQ import progress from Redis: %w", legacyErr)
+		}
+		data = legacyData
 	}
 
 	var progress types.FAQImportProgress

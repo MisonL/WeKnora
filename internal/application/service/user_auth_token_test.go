@@ -163,13 +163,13 @@ func (s *stubUserRepoForAuth) UpdateUserSystemAdmin(_ context.Context, id string
 	}
 	return nil
 }
-func (s *stubUserRepoForAuth) UpdateUserOIDCIdentity(_ context.Context, id, issuer, subject string) error {
+func (s *stubUserRepoForAuth) UpdateUserOIDCIdentity(_ context.Context, id, issuer, subject string) (bool, error) {
 	s.updateCalls++
 	if user := s.users[id]; user != nil {
 		user.OIDCIssuer = &issuer
 		user.OIDCSubject = &subject
 	}
-	return nil
+	return true, nil
 }
 func (s *stubUserRepoForAuth) DeleteUser(context.Context, string) error { return nil }
 func (s *stubUserRepoForAuth) ListUsers(context.Context, int, int) ([]*types.User, error) {

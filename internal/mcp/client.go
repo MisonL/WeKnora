@@ -161,6 +161,15 @@ func applyAuthHeaders(headers map[string]string, ac *types.MCPAuthConfig) {
 	for key, value := range ac.CustomHeaders {
 		headers[key] = value
 	}
+	// A value that is still ciphertext means its row could not be decrypted
+	// (SYSTEM_AES_KEY missing or rotated). Sending it would authenticate with
+	// ciphertext and fail upstream in a way that looks like a wrong key; drop
+	// it so the call fails for the truthful reason instead.
+	for key, value := range headers {
+		if strings.HasPrefix(value, "enc:v1:") {
+			delete(headers, key)
+		}
+	}
 }
 
 // OAuthRequiredError signals that the target MCP server requires OAuth

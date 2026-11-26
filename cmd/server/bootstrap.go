@@ -112,8 +112,10 @@ func bootstrapSystemAdmin(ctx context.Context, userSvc interfaces.UserService, e
 			bootstrapEnvVar, email, total, user.ID)
 		return
 	}
-	user.IsSystemAdmin = true
-	if err := userSvc.UpdateUser(ctx, user); err != nil {
+	// UpdateUser deliberately omits the platform-admin flag (a full-row save
+	// must not resurrect authorization state from a stale snapshot), so the
+	// promotion has to go through the dedicated setter.
+	if err := userSvc.SetUserSystemAdmin(ctx, user.ID, true); err != nil {
 		logger.Warnf(ctx,
 			"[bootstrap] %s=%s: failed to promote user %s: %v",
 			bootstrapEnvVar, email, user.ID, err)

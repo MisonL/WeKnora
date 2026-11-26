@@ -237,10 +237,9 @@ func RegisterAuthRoutes(r *gin.RouterGroup, handler *handler.AuthHandler, g *rba
 	publicAuthRL := middleware.PublicAuthRateLimit()
 	r.POST("/auth/register-by-invite", publicAuthRL, handler.RegisterByInvite)
 	r.POST("/auth/invitations/lookup", publicAuthRL, handler.LookupInvitationByToken)
-	// /auth/login and /auth/refresh accept a credential guess from an
-	// unauthenticated caller and are the classic password-spraying
-	// targets. They share the same per-IP budget as the share-link
-	// surfaces above.
+	// /auth/login accepts a credential guess from an unauthenticated caller
+	// and is the classic password-spraying target; it shares the per-IP
+	// budget with the share-link surfaces above.
 	r.POST("/auth/login", publicAuthRL, handler.Login)
 	r.POST("/auth/auto-setup", handler.AutoSetup)
 	r.GET("/auth/config", handler.GetAuthConfig)
@@ -250,7 +249,10 @@ func RegisterAuthRoutes(r *gin.RouterGroup, handler *handler.AuthHandler, g *rba
 	r.GET("/auth/oidc/callback", handler.OIDCRedirectCallback)
 	// /auth/oidc/start：直连 302 跳转到 OIDC 提供方，供前端无法走 JS 拉取 URL 的场景直接发起登录
 	r.GET("/auth/oidc/start", handler.OIDCStart)
-	r.POST("/auth/refresh", publicAuthRL, handler.RefreshToken)
+	// /auth/refresh bounds abuse on its own, larger bucket: sharing the login
+	// bucket let a busy shared NAT exhaust it, and a failed refresh is a
+	// logout in the SPA -- i.e. a 429 there signs out every user behind it.
+	r.POST("/auth/refresh", middleware.RefreshRateLimit(), handler.RefreshToken)
 	r.GET("/auth/validate", handler.ValidateToken)
 	r.POST("/auth/logout", handler.Logout)
 	// auth/me returns only the caller's own identity/profile, so it is safe

@@ -12,7 +12,10 @@ import (
 
 func newUserRepositoryTestDB(t *testing.T) (*gorm.DB, *userRepository) {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	// A shared-cache DSN keeps every pooled connection on one in-memory
+	// database; plain ":memory:" gives each connection its own, so a query
+	// can land on a connection that never saw the migration.
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
@@ -121,4 +124,34 @@ func TestUserColumnSetters(t *testing.T) {
 	require.Equal(t, "new-hash", stored.PasswordHash)
 	require.True(t, stored.IsSystemAdmin)
 	require.Zero(t, stored.TenantID)
+}
+
+// Two OIDC logins that both read an unbound account must not take turns
+// overwriting the binding. The conditional write is what makes the second one
+// lose; it has to report that it lost so the caller refuses instead of
+// silently moving the account to a second identity.
+func TestUpdateUserOIDCIdentityRefusesToOverwriteAnExistingBinding(t *testing.T) {
+	db, repo := newUserRepositoryTestDB(t)
+	ctx := context.Background()
+	user := &types.User{ID: "u2", Username: "bob", Email: "bob@example.com", TenantID: 1}
+	seedUser(t, db, user)
+
+	bound, err := repo.UpdateUserOIDCIdentity(ctx, "u2", "https://idp-a", "sub-a")
+	require.NoError(t, err)
+	require.True(t, bound)
+
+	// Same identity again is idempotent.
+	bound, err = repo.UpdateUserOIDCIdentity(ctx, "u2", "https://idp-a", "sub-a")
+	require.NoError(t, err)
+	require.True(t, bound)
+
+	// A different identity must not win.
+	bound, err = repo.UpdateUserOIDCIdentity(ctx, "u2", "https://idp-b", "sub-b")
+	require.NoError(t, err)
+	require.False(t, bound, "a second stale snapshot must not rebind the account")
+
+	reloaded, err := repo.GetUserByID(ctx, "u2")
+	require.NoError(t, err)
+	require.Equal(t, "https://idp-a", *reloaded.OIDCIssuer)
+	require.Equal(t, "sub-a", *reloaded.OIDCSubject)
 }

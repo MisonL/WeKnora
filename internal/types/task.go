@@ -81,7 +81,7 @@ var queueDefinitions = []QueueDefinition{
 	{Name: QueueMemory, Pool: WorkerPoolEnrichment, Weight: 1, SharedWeight: 1, TaskTypes: []string{TypeMemoryExtract}},
 	{Name: QueueSync, Pool: WorkerPoolMaintenance, Weight: 2, TaskTypes: []string{TypeDataSourceSync}},
 	{Name: QueueMaintenance, Pool: WorkerPoolMaintenance, Weight: 1, TaskTypes: []string{
-		TypeFAQImport, TypeKBClone, TypeIndexDelete, TypeKBDelete,
+		TypeFAQImport, TypeKBClone, TypeIndexDelete, TypeIndexDeleteIfDeleted, TypeKBDelete,
 		TypeKnowledgeListDelete, TypeKnowledgeListReparse, TypeKnowledgeMove,
 	}},
 	{Name: QueueWiki, Pool: WorkerPoolWiki, Weight: 1, TaskTypes: []string{TypeWikiIngest, TypeWikiFinalize}},
@@ -232,13 +232,19 @@ type WorkerServerStat struct {
 }
 
 const (
-	TypeChunkExtract             = "chunk:extract"
-	TypeDocumentProcess          = "document:process"           // 文档处理任务
-	TypeFAQImport                = "faq:import"                 // FAQ导入任务（包含dry run模式）
-	TypeQuestionGeneration       = "question:generation"        // 问题生成任务
-	TypeSummaryGeneration        = "summary:generation"         // 摘要生成任务
-	TypeKBClone                  = "kb:clone"                   // 知识库复制任务
-	TypeIndexDelete              = "index:delete"               // 索引删除任务
+	TypeChunkExtract       = "chunk:extract"
+	TypeDocumentProcess    = "document:process"    // 文档处理任务
+	TypeFAQImport          = "faq:import"          // FAQ导入任务（包含dry run模式）
+	TypeQuestionGeneration = "question:generation" // 问题生成任务
+	TypeSummaryGeneration  = "summary:generation"  // 摘要生成任务
+	TypeKBClone            = "kb:clone"            // 知识库复制任务
+	TypeIndexDelete        = "index:delete"        // 索引删除任务
+	// TypeIndexDeleteIfDeleted is the cleanup variant of index:delete: it
+	// only removes vectors whose chunk row is already soft-deleted. It has its
+	// own type so a producer can hand over ids before their row delete without
+	// a consumer that predates this release (which would ignore the flag and
+	// strip a still-live row's vectors) ever seeing the task.
+	TypeIndexDeleteIfDeleted     = "index:delete_if_deleted"
 	TypeKBDelete                 = "kb:delete"                  // 知识库删除任务
 	TypeKnowledgeListDelete      = "knowledge:list_delete"      // 批量删除知识任务
 	TypeKnowledgeListReparse     = "knowledge:list_reparse"     // 批量重解析知识任务

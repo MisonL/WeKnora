@@ -133,8 +133,8 @@ type User struct {
 	// prevents two local accounts from claiming the same external
 	// identity. Never serialise this pair to API responses — the subject
 	// is an external stable identifier and is not needed by clients.
-	OIDCIssuer  *string `json:"-" gorm:"type:varchar(255);uniqueIndex:uq_users_oidc_identity,priority:1"`
-	OIDCSubject *string `json:"-" gorm:"type:varchar(255);uniqueIndex:uq_users_oidc_identity,priority:2"`
+	OIDCIssuer  *string `json:"-" gorm:"column:oidc_issuer;type:varchar(255);uniqueIndex:uq_users_oidc_identity,priority:1"`
+	OIDCSubject *string `json:"-" gorm:"column:oidc_subject;type:varchar(255);uniqueIndex:uq_users_oidc_identity,priority:2"`
 	// Per-user UI/feature preferences.
 	// Stored as JSON (jsonb on Postgres, TEXT on SQLite) via the
 	// driver.Valuer / sql.Scanner methods on UserPreferences.

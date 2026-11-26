@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -67,5 +68,50 @@ func TestInvitationAcceptRetryAfterAddMemberFailure(t *testing.T) {
 	got, _ := memberSvc.GetMembership(ctx, "u-bob", 1)
 	if got == nil {
 		t.Fatal("membership row missing after retry")
+	}
+}
+
+// revokeRacingRepo simulates the admin's revoke committing between Accept's
+// read and its conditional claim.
+type revokeRacingRepo struct {
+	*fakeInvitationRepo
+}
+
+func (r *revokeRacingRepo) MarkStatusIfPending(
+	ctx context.Context, id uint64, status types.TenantInvitationStatus, respondedAt time.Time,
+) error {
+	if status == types.TenantInvitationStatusAccepted {
+		if err := r.fakeInvitationRepo.MarkStatusIfPending(
+			ctx, id, types.TenantInvitationStatusRevoked, respondedAt); err != nil {
+			return err
+		}
+		return gormErrRecordNotFound
+	}
+	return r.fakeInvitationRepo.MarkStatusIfPending(ctx, id, status, respondedAt)
+}
+
+// A revoke that lands first must win outright: the accept must not create a
+// membership the administrator just withdrew.
+func TestInvitationAcceptLosesToAConcurrentRevoke(t *testing.T) {
+	base := newFakeInvitationRepo()
+	racing := &revokeRacingRepo{fakeInvitationRepo: base}
+	memberSvc, _ := newServiceWithRepo()
+	svc := NewTenantInvitationService(racing, memberSvc, nil)
+	ctx := context.Background()
+
+	inv, err := svc.Create(ctx, 1, "u-bob", types.TenantRoleContributor, nil, "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if _, err := svc.Accept(ctx, inv.ID, "u-bob"); !errors.Is(err, ErrInvitationNotPending) {
+		t.Fatalf("accept = %v, want ErrInvitationNotPending", err)
+	}
+	if member, _ := memberSvc.GetMembership(ctx, "u-bob", 1); member != nil {
+		t.Fatalf("membership %+v must not exist after the revoke won", member)
+	}
+	row, _ := base.GetByID(ctx, inv.ID)
+	if row.Status != types.TenantInvitationStatusRevoked {
+		t.Fatalf("invitation status = %q, want revoked", row.Status)
 	}
 }

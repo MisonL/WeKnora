@@ -710,3 +710,110 @@ func TestFAQProgressOfASharedKBImportIsPollableByTheInitiator(t *testing.T) {
 		require.Error(t, err)
 	})
 }
+
+// The task id a shared-KB import mints must embed the initiator's tenant, not
+// the KB owner's: the progress route compares that tenant with the caller's,
+// and the KB-scope guard has already rewritten the execution tenant by the
+// time the handler runs. Deriving it from the execution tenant makes the
+// initiator's own poll a 404.
+func TestFAQImportTaskIDEmbedsTheInitiatorTenantForASharedKB(t *testing.T) {
+	f := newFAQWriteFixture(t)
+	// Fixture: caller tenant 1 acting inside tenant 7's knowledge base.
+	taskID, err := f.svc.UpsertFAQEntries(f.ctx, f.kb.ID, &types.FAQBatchUpsertPayload{
+		Mode: types.FAQBatchModeAppend, DryRun: true,
+		Entries: []types.FAQEntryPayload{{
+			StandardQuestion: "How do I reset the password?",
+			Answers:          []string{"Use the self-service page."},
+		}},
+	})
+	require.NoError(t, err)
+	embedded, err := utils.TaskTenantID(taskID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), embedded, "task id must carry the initiator tenant")
+
+	// And the initiator's own poll finds the record the submission wrote.
+	initiatorCtx := types.WithExecutionTenant(
+		types.WithCaller(context.Background(), types.Caller{TenantID: 1, UserID: "caller", Role: types.TenantRoleAdmin}), 1)
+	got, err := f.svc.GetFAQImportProgress(initiatorCtx, taskID)
+	require.NoError(t, err)
+	require.Equal(t, types.FAQImportStatusPending, got.Status)
+}
+
+// A client-chosen task id that embeds another tenant must be refused: the id
+// picks the progress key's tenant segment, so accepting it would let its
+// submitter write into (and overwrite) a record of a tenant that does not own
+// the import.
+func TestFAQImportRejectsForeignTaskID(t *testing.T) {
+	f := newFAQWriteFixture(t)
+	foreign := utils.GenerateTaskID("faq_import", 9, "kb")
+	_, err := f.svc.UpsertFAQEntries(f.ctx, f.kb.ID, &types.FAQBatchUpsertPayload{
+		TaskID: foreign, Mode: types.FAQBatchModeAppend, DryRun: true,
+		Entries: []types.FAQEntryPayload{{
+			StandardQuestion: "How do I reset the password?",
+			Answers:          []string{"Use the self-service page."},
+		}},
+	})
+	require.Error(t, err)
+
+	// The initiator's own tenant and the execution tenant both stay allowed.
+	// The admission lease allows one import per KB, so release it between
+	// attempts (this fixture runs without Redis, so its lease is in memory).
+	for _, tenant := range []uint64{1, 7} {
+		own := utils.GenerateTaskID("faq_import", tenant, "kb")
+		f.svc.memFAQRunningImport = sync.Map{}
+		_, err := f.svc.UpsertFAQEntries(f.ctx, f.kb.ID, &types.FAQBatchUpsertPayload{
+			TaskID: own, Mode: types.FAQBatchModeAppend, DryRun: true,
+			Entries: []types.FAQEntryPayload{{
+				StandardQuestion: "How do I reset the password?",
+				Answers:          []string{"Use the self-service page."},
+			}},
+		})
+		require.NoError(t, err, "tenant %d must be accepted", tenant)
+	}
+}
+
+// Records written before the progress key became tenant-scoped live under the
+// legacy key. They must stay readable for the rest of their TTL instead of
+// turning into 404s right after an upgrade.
+func TestLegacyProgressKeyStaysReadableAfterUpgrade(t *testing.T) {
+	f := newFAQWriteFixture(t)
+	mini := miniredis.RunT(t)
+	f.svc.redisClient = redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	t.Cleanup(func() { _ = f.svc.redisClient.Close() })
+
+	taskID := utils.GenerateTaskID("faq_import", 1, "kb")
+	record, err := json.Marshal(&types.FAQImportProgress{
+		TaskID: taskID, TenantID: 7, Status: types.FAQImportStatusCompleted, Message: "legacy",
+	})
+	require.NoError(t, err)
+	require.NoError(t, f.svc.redisClient.Set(context.Background(),
+		faqImportProgressKeyPrefix+taskID, record, faqImportProgressTTL).Err())
+
+	got, err := f.svc.GetFAQImportProgress(f.ctx, taskID)
+	require.NoError(t, err)
+	require.Equal(t, "legacy", got.Message)
+
+	foreign := types.WithExecutionTenant(context.Background(), 9)
+	_, err = f.svc.GetFAQImportProgress(foreign, taskID)
+	require.Error(t, err, "the legacy key must not widen who can read the record")
+}
+
+// A cleanup task that runs while the row delete is still in flight would find
+// nothing deleted, finish, and leave the crash window open. The producer
+// therefore delays it; the delete phase commits long before it becomes ready.
+func TestReplaceCleanupIsQueuedWithADelayAndItsOwnType(t *testing.T) {
+	f := newFAQWriteFixture(t)
+	kb := f.kb
+	s := f.svc
+	s.enqueueFAQIndexDeleteFallback(f.ctx, 7, kb, []string{"a", "b"}, true, faqIndexDeleteFallbackDelay)
+	require.NotEmpty(t, f.queue.tasks)
+	task := f.queue.tasks[len(f.queue.tasks)-1]
+	require.Equal(t, types.TypeIndexDeleteIfDeleted, task.Type())
+	var payload types.IndexDeletePayload
+	require.NoError(t, json.Unmarshal(task.Payload(), &payload))
+	require.True(t, payload.OnlyIfDeleted)
+
+	// The post-delete hand-overs stay immediate: their rows are already gone.
+	s.enqueueFAQIndexDeleteFallback(f.ctx, 7, kb, []string{"c"}, true, 0)
+	require.Len(t, f.queue.tasks, 2)
+}

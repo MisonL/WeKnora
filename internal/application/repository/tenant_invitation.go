@@ -265,6 +265,28 @@ func (r *tenantInvitationRepository) MarkStatusIfPending(
 	return nil
 }
 
+// RevertAcceptedToPending releases a claim taken by MarkStatusIfPending when
+// the membership write that follows failed. Only a row still in accepted
+// state is reverted: another writer that moved it on (declined/revoked) keeps
+// its outcome.
+func (r *tenantInvitationRepository) RevertAcceptedToPending(ctx context.Context, id uint64) error {
+	res := r.db.WithContext(ctx).
+		Model(&types.TenantInvitation{}).
+		Where("id = ? AND status = ?", id, types.TenantInvitationStatusAccepted).
+		Updates(map[string]any{
+			"status":       types.TenantInvitationStatusPending,
+			"responded_at": nil,
+			"updated_at":   time.Now(),
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
 // SweepExpired transitions all overdue pending rows to expired in a
 // single batch. We intentionally don't emit per-row audit events from
 // here — the original rbac.invitation_sent already lives in the audit

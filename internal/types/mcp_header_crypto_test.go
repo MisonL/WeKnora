@@ -2,6 +2,7 @@ package types
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -99,4 +100,22 @@ func TestMCPAuthConfigCustomHeadersLegacyPlaintext(t *testing.T) {
 	require.NoError(t, loaded.Scan(legacy))
 	assert.Equal(t, "Bearer legacy", loaded.CustomHeaders["Authorization"])
 	assert.Equal(t, "abc", loaded.CustomHeaders["X-Trace"])
+}
+
+// Cookie is a standard authentication carrier (session=<credential>); it must
+// be encrypted at rest like Authorization.
+func TestCookieHeaderIsEncryptedAtRest(t *testing.T) {
+	t.Setenv("SYSTEM_AES_KEY", strings.Repeat("k", 32))
+	h := MCPHeaders{"Cookie": "session=secret-value", "X-Trace": "plain"}
+	v, err := h.Value()
+	if err != nil {
+		t.Fatalf("Value: %v", err)
+	}
+	raw, _ := v.([]byte)
+	if strings.Contains(string(raw), "secret-value") {
+		t.Fatalf("cookie credential written in plaintext: %s", raw)
+	}
+	if !strings.Contains(string(raw), "plain") {
+		t.Fatalf("non-secret header must stay readable: %s", raw)
+	}
 }

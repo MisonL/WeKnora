@@ -157,7 +157,7 @@ func TestDeleteReplacedFAQChunksHandsOrphanedVectorsToTheIndexTask(t *testing.T)
 	// window; the second carries the same ids for the vector backend failure.
 	require.Len(t, enqueuer.tasks, 2, "the orphaned vectors must not be left for a plan that cannot see them")
 	for _, task := range enqueuer.tasks {
-		require.Equal(t, types.TypeIndexDelete, task.Type())
+		require.Equal(t, types.TypeIndexDeleteIfDeleted, task.Type())
 		var payload types.IndexDeletePayload
 		require.NoError(t, json.Unmarshal(task.Payload(), &payload))
 		require.True(t, payload.OnlyIfDeleted,

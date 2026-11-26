@@ -73,6 +73,13 @@ type TenantInvitationRepository interface {
 		respondedAt time.Time,
 	) error
 
+	// RevertAcceptedToPending hands an already-claimed invitation back to the
+	// pending state. Accept claims the row before creating the membership; when
+	// that write fails the claim has to be released, or one transient failure
+	// would consume the invitation for good. The conditional WHERE keeps a row
+	// some other writer has since moved (declined, revoked, expired) untouched.
+	RevertAcceptedToPending(ctx context.Context, id uint64) error
+
 	// SweepExpired transitions all pending rows whose expires_at is
 	// before `now` into the expired state. Returns the affected row
 	// count so callers can decide whether to emit per-row audit

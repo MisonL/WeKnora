@@ -311,8 +311,8 @@ func (r *cleanupUserRepo) UpdateUserTenantID(_ context.Context, id string, tenan
 }
 func (r *cleanupUserRepo) UpdateUserPasswordHash(context.Context, string, string) error { return nil }
 func (r *cleanupUserRepo) UpdateUserSystemAdmin(context.Context, string, bool) error    { return nil }
-func (r *cleanupUserRepo) UpdateUserOIDCIdentity(context.Context, string, string, string) error {
-	return nil
+func (r *cleanupUserRepo) UpdateUserOIDCIdentity(context.Context, string, string, string) (bool, error) {
+	return true, nil
 }
 func (r *cleanupUserRepo) DeleteUser(context.Context, string) error { return nil }
 func (r *cleanupUserRepo) ListUsers(context.Context, int, int) ([]*types.User, error) {

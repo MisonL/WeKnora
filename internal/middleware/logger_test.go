@@ -459,3 +459,16 @@ func TestLoggerRedactsResourceTokenAndPresignedSignature(t *testing.T) {
 		t.Fatalf("access log lost the resource path: %s", out)
 	}
 }
+
+// A request far over the preview cap is truncated before sanitisation, which
+// leaves invalid JSON. The structured redactor cannot run then, and the scalar
+// regex does not know the headers/credentials containers -- so a credential
+// header in the preview must still be masked by the fallback path.
+func TestTruncatedPreviewStillMasksCredentialContainers(t *testing.T) {
+	body := `{"service":{"headers":{"X-Session":"synthetic_secret"},"name":"` +
+		strings.Repeat("x", 400) + `","headers":{"Authorization":"Bearer synthetic_bearer"}}`
+	got := sanitizeBody(body)
+	if strings.Contains(got, "synthetic_secret") || strings.Contains(got, "synthetic_bearer") {
+		t.Fatalf("credential leaked through the truncated preview: %s", got)
+	}
+}

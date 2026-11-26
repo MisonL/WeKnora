@@ -80,7 +80,7 @@ func TestOIDCURLRejectsForeignRedirect(t *testing.T) {
 		{"protocol relative", "https://app.example", "//evil.example/callback"},
 		{"subdomain", "https://app.example", "https://evil.app.example/callback"},
 		{"userinfo trick", "https://app.example", "https://app.example@evil.example/callback"},
-		{"absolute with no configured base", "", "https://app.example/callback"},
+		{"no configured base, non-http scheme", "", "ftp://app.example/callback"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -100,5 +100,20 @@ func TestOIDCURLAllowsExplicitDefaultPort(t *testing.T) {
 	r, _ := newOIDCURLTestRouter(t, "https://app.example")
 	if w := callOIDCURL(t, r, "https://app.example:443/callback"); w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 for explicit default port (body=%s)", w.Code, w.Body.String())
+	}
+}
+
+// A deployment that never set FRONTEND_BASE_URL (the historical default) still
+// has a working OIDC login: the SPA submits an absolute URL built from
+// window.location.origin, and only the IdP's redirect-URI allow-list can
+// validate that origin. Refusing here made the upgrade break login outright.
+func TestOIDCURLAllowsAbsoluteRedirectWithoutAConfiguredBase(t *testing.T) {
+	r, captured := newOIDCURLTestRouter(t, "")
+	w := callOIDCURL(t, r, "https://app.example/callback")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	if *captured != "https://app.example/callback" {
+		t.Fatalf("redirect_uri = %q, want the submitted URL", *captured)
 	}
 }

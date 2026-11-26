@@ -81,6 +81,17 @@ func isNoAuthAPI(path string, method string) bool {
 // meaningful before a user belongs to any tenant. Every other authenticated
 // route remains tenant-scoped and returns TENANT_REQUIRED when the JWT and
 // request headers do not resolve a tenant.
+// isPlatformAdminPath reports whether the request targets the platform
+// administration surface, which is authorized by the system-admin flag rather
+// than by a role in whatever workspace the request carries. Checked ahead of
+// the workspace-role gate so an administrator who is not a member of the
+// request's workspace still reaches the route; the route's own
+// RequireSystemAdmin guard remains the authorization decision.
+func isPlatformAdminPath(path string) bool {
+	return strings.HasPrefix(path, "/api/v1/system/admin/") ||
+		path == "/api/v1/system/docreader/reconnect"
+}
+
 func isTenantOptionalAPI(path, method string) bool {
 	switch {
 	case path == "/api/v1/auth/me" && (method == http.MethodGet || method == http.MethodPut):
@@ -251,7 +262,12 @@ func authenticateJWTUser(
 	if targetTenantID == 0 {
 		// 无可用空间：身份级路由（/auth/me 等）放行为 tenantless 会话，
 		// 其余路由返回 TENANT_REQUIRED 让前端引导用户创建/加入空间。
+		// 平台管理接口例外：它按系统管理员标记授权，没有空间也应可达。
 		if isTenantOptionalAPI(c.Request.URL.Path, c.Request.Method) {
+			attachTenantlessUserContext(c, user)
+			return true
+		}
+		if isPlatformAdminPath(c.Request.URL.Path) && user.IsSystemAdmin {
 			attachTenantlessUserContext(c, user)
 			return true
 		}
@@ -280,6 +296,19 @@ func authenticateJWTUser(
 
 	// 解析当前空间内的角色 (issue #1303)
 	role, ok := resolveTenantRole(ctx, memberService, user, targetTenantID, crossTenantSwitch, cfg)
+	if !ok && isPlatformAdminPath(c.Request.URL.Path) && user.IsSystemAdmin {
+		// The platform administration surface is authorized by the
+		// system-admin flag, not by a role in the workspace the request
+		// happens to carry. Binding the two left an administrator who is not a
+		// member of that workspace unable to reach it at all. The route's own
+		// RequireSystemAdmin guard still enforces the flag; this only stops
+		// the workspace-role gate from rejecting the request earlier.
+		logger.Infof(ctx,
+			"[auth] system admin %s has no membership in tenant %d; admitting the platform-admin path %s",
+			user.ID, targetTenantID, c.Request.URL.Path)
+		role = types.TenantRoleAdmin
+		ok = true
+	}
 	if !ok {
 		// 没有 active membership（含已移除成员）即拒绝；resolveTenantRole
 		// 不再有 fail-open 分支。
@@ -351,7 +380,10 @@ func resolveTargetTenant(
 		}
 		// 检查用户是否有权限访问目标空间：自家空间、跨空间超管、或
 		// 有 active membership 行——三选一，由 IsTenantAccessible 统一判定。
-		if !IsTenantAccessible(ctx, user, parsedTenantID, memberService, cfg) {
+		// 平台管理接口再放行一类：系统管理员无论是否在此空间有成员关系都要
+		// 能到达，其授权由路由自己的 RequireSystemAdmin 守卫决定。
+		if !IsTenantAccessible(ctx, user, parsedTenantID, memberService, cfg) &&
+			!(user.IsSystemAdmin && isPlatformAdminPath(c.Request.URL.Path)) {
 			logger.Warnf(ctx, "User %s attempted to access tenant %d without permission", user.ID, parsedTenantID)
 			c.JSON(http.StatusForbidden, gin.H{
 				"error": "Forbidden: insufficient permissions to access target workspace",

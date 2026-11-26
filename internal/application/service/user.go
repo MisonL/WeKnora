@@ -932,8 +932,13 @@ func (s *userService) ChangePassword(ctx context.Context, userID, oldPassword, n
 	if err := s.userRepo.UpdateUserPasswordHash(ctx, userID, user.PasswordHash); err != nil {
 		return err
 	}
+	// Past this point the new password is live. Every outstanding session must
+	// die even when a later write fails: the caller sees the error and may
+	// retry, but a half-finished rotation that left old tokens valid would
+	// undercut the reason this rotation revokes anything.
 	if clearOidcOnly {
 		if err := s.userRepo.UpdateUserPreferencesOnly(ctx, userID, user.Preferences); err != nil {
+			s.revokeSessionsAfterPasswordChange(ctx, userID)
 			return err
 		}
 	}
@@ -941,6 +946,16 @@ func (s *userService) ChangePassword(ctx context.Context, userID, oldPassword, n
 	// Invalidate every outstanding session so a stolen token cannot
 	// survive a password rotation.
 	return s.tokenRepo.RevokeTokensByUserID(ctx, userID)
+}
+
+// revokeSessionsAfterPasswordChange tears the sessions down and reports a
+// failure in the log instead of the response: it runs on an error path where
+// the primary error is what the caller needs to see.
+func (s *userService) revokeSessionsAfterPasswordChange(ctx context.Context, userID string) {
+	if err := s.tokenRepo.RevokeTokensByUserID(context.WithoutCancel(ctx), userID); err != nil {
+		logger.Errorf(ctx,
+			"password changed for user %s but session revocation failed: %v", userID, err)
+	}
 }
 
 // AdminResetPassword replaces a user's password without checking the previous
@@ -1707,6 +1722,14 @@ func (s *userService) RefreshToken(
 		return "", "", fmt.Errorf("look up refresh token: %w", err)
 	}
 	if tokenRecord == nil || tokenRecord.IsRevoked {
+		// A revoked token presented again is the replay signal, not a plain
+		// rejection: the first holder already rotated it (or a rotation is
+		// racing this attempt), and the session those rotations minted must
+		// not outlive the leak. Tear everything down so a stolen token that
+		// beat the legitimate client cannot keep its new session.
+		if tokenRecord != nil {
+			s.revokeAllSessionsForReuse(ctx, userID)
+		}
 		return "", "", errors.New("refresh token is revoked")
 	}
 	if tokenRecord.TokenType != "refresh_token" {
@@ -1734,17 +1757,25 @@ func (s *userService) RefreshToken(
 		return "", "", fmt.Errorf("revoke refresh token: %w", err)
 	}
 	if !rotated {
-		if revokeErr := s.tokenRepo.RevokeTokensByUserID(ctx, userID); revokeErr != nil {
-			logger.Errorf(ctx,
-				"Refresh token reuse detected for user %s and session revocation failed: %v",
-				userID, revokeErr)
-		}
+		s.revokeAllSessionsForReuse(ctx, userID)
 		logger.Warnf(ctx, "Refresh token reuse detected for user %s; all sessions revoked", userID)
 		return "", "", errors.New("refresh token reuse detected")
 	}
 
 	// Generate new tokens
 	return s.GenerateTokens(ctx, user)
+}
+
+// revokeAllSessionsForReuse tears down every session of a user whose refresh
+// token was replayed. A failure is logged rather than surfaced: the caller is
+// already being rejected, and the rejection must not turn into a retryable
+// error that keeps the leaked token in circulation.
+func (s *userService) revokeAllSessionsForReuse(ctx context.Context, userID string) {
+	if err := s.tokenRepo.RevokeTokensByUserID(context.WithoutCancel(ctx), userID); err != nil {
+		logger.Errorf(ctx,
+			"Refresh token reuse detected for user %s and session revocation failed: %v",
+			userID, err)
+	}
 }
 
 // Logout invalidates every outstanding session for the user identified by
@@ -2105,12 +2136,19 @@ func (s *userService) bindOIDCIdentity(ctx context.Context, user *types.User, is
 	if issuer == "" || subject == "" {
 		return ErrOIDCMissingSubject
 	}
+	bound, err := s.userRepo.UpdateUserOIDCIdentity(ctx, user.ID, issuer, subject)
+	if err != nil {
+		return fmt.Errorf("failed to bind OIDC identity: %w", err)
+	}
+	if !bound {
+		// Between this request's read and its write another request bound the
+		// account to a different identity. Binding it anyway would move the
+		// account; two stale snapshots must not take turns overwriting.
+		return ErrOIDCIdentityConflict
+	}
 	user.OIDCIssuer = &issuer
 	user.OIDCSubject = &subject
 	user.UpdatedAt = time.Now()
-	if err := s.userRepo.UpdateUserOIDCIdentity(ctx, user.ID, issuer, subject); err != nil {
-		return fmt.Errorf("failed to bind OIDC identity: %w", err)
-	}
 	return nil
 }
 

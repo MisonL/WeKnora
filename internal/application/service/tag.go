@@ -423,11 +423,13 @@ func (s *knowledgeTagService) ProcessIndexDelete(ctx context.Context, t *asynq.T
 	logger.Infof(ctx, "Processing index delete task for %d chunks in KB %s", len(payload.ChunkIDs), payload.KnowledgeBaseID)
 
 	chunkIDs := payload.ChunkIDs
-	if payload.OnlyIfDeleted {
-		// A producer may enqueue this task before its row DELETE to cover a
-		// crash between the two. The ids are only known to be dead once their
-		// rows are actually soft-deleted: a row the delete never reached is
-		// still live and owns its vectors, so it must keep them.
+	// The dedicated cleanup type always means "only rows that are already
+	// gone": its producer queues the task before (or beside) the row delete.
+	if payload.OnlyIfDeleted || t.Type() == types.TypeIndexDeleteIfDeleted {
+		// The ids are only known to be dead once their rows are actually
+		// soft-deleted: a row the delete never reached is still live and owns
+		// its vectors, so it must keep them. An id still live when this runs
+		// is a row the producer deliberately kept.
 		if s.chunkRepo == nil {
 			return fmt.Errorf("cannot verify chunk deletion for index cleanup: chunk repository unavailable")
 		}

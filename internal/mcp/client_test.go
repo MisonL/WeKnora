@@ -132,3 +132,27 @@ func TestMCPTextPreview(t *testing.T) {
 		t.Fatalf("truncate: got %q", got)
 	}
 }
+
+// A header whose value is still ciphertext (SYSTEM_AES_KEY rotated/missing)
+// must be dropped before the request is built: sending ciphertext as the
+// credential authenticates with garbage and looks like a wrong key upstream.
+func TestApplyAuthHeadersDropsCiphertextValues(t *testing.T) {
+	headers := map[string]string{}
+	applyAuthHeaders(headers, &types.MCPAuthConfig{
+		AuthType: types.MCPAuthAPIKey,
+		APIKey:   "enc:v1:AAAA",
+		CustomHeaders: map[string]string{
+			"X-Session": "enc:v1:BBBB",
+			"X-Trace":   "plain",
+		},
+	})
+	if _, ok := headers["X-API-Key"]; ok {
+		t.Fatal("ciphertext API key must not be sent as a header")
+	}
+	if _, ok := headers["X-Session"]; ok {
+		t.Fatal("ciphertext custom header must not be sent")
+	}
+	if headers["X-Trace"] != "plain" {
+		t.Fatalf("non-secret header = %q, want plain", headers["X-Trace"])
+	}
+}

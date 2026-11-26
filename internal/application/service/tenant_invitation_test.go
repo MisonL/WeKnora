@@ -180,6 +180,20 @@ func (r *fakeInvitationRepo) MarkStatusIfPending(
 	return gormErrRecordNotFound
 }
 
+func (r *fakeInvitationRepo) RevertAcceptedToPending(
+	ctx context.Context, id uint64,
+) error {
+	for _, e := range r.rows {
+		if e.ID == id && e.Status == types.TenantInvitationStatusAccepted {
+			e.Status = types.TenantInvitationStatusPending
+			e.RespondedAt = nil
+			e.UpdatedAt = time.Now()
+			return nil
+		}
+	}
+	return gormErrRecordNotFound
+}
+
 func (r *fakeInvitationRepo) SweepExpired(
 	ctx context.Context, now time.Time,
 ) (int64, error) {

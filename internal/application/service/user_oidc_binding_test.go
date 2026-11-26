@@ -79,12 +79,18 @@ func (r *oidcBindingRepo) UpdateUser(_ context.Context, u *types.User) error {
 	return nil
 }
 
-func (r *oidcBindingRepo) UpdateUserOIDCIdentity(_ context.Context, id, issuer, subject string) error {
-	if u := r.users[id]; u != nil {
-		u.OIDCIssuer = &issuer
-		u.OIDCSubject = &subject
+func (r *oidcBindingRepo) UpdateUserOIDCIdentity(_ context.Context, id, issuer, subject string) (bool, error) {
+	u := r.users[id]
+	if u == nil {
+		return false, nil
 	}
-	return nil
+	if u.OIDCIssuer != nil && u.OIDCSubject != nil &&
+		!(*u.OIDCIssuer == issuer && *u.OIDCSubject == subject) {
+		return false, nil
+	}
+	u.OIDCIssuer = &issuer
+	u.OIDCSubject = &subject
+	return true, nil
 }
 
 func (r *oidcBindingRepo) UpdateUserPreferencesOnly(

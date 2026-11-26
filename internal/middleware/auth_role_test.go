@@ -3,7 +3,11 @@ package middleware
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -313,5 +317,58 @@ func TestResolveTenantRole_DemotedUserCannotReclaimViaOrphan(t *testing.T) {
 	got, ok := resolveTenantRole(context.Background(), svc, user, 5, false, cfgWithRBAC(true))
 	if !ok || got != types.TenantRoleOwner {
 		t.Fatalf("current policy allows orphan-tenant self-heal on home tenant, got (%v, %v)", got, ok)
+	}
+}
+
+// stubTenantService overrides only the lookups the auth path makes.
+type stubTenantService struct {
+	interfaces.TenantService
+	tenants map[uint64]*types.Tenant
+}
+
+func (s *stubTenantService) GetTenantByID(_ context.Context, id uint64) (*types.Tenant, error) {
+	if t, ok := s.tenants[id]; ok {
+		return t, nil
+	}
+	return nil, errors.New("tenant not found")
+}
+
+// A system administrator who is not a member of the workspace a request
+// carries must still reach the platform administration surface: that surface
+// is authorized by the admin flag (and its own route guard), not by workspace
+// membership. Binding the two locked the administrator out entirely.
+func TestSystemAdminReachesPlatformRoutesWithoutWorkspaceMembership(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	members := newFakeMemberService()
+	tenants := &stubTenantService{tenants: map[uint64]*types.Tenant{7: {ID: 7}}}
+	admin := &types.User{ID: "admin", TenantID: 7, IsSystemAdmin: true}
+	plain := &types.User{ID: "worker", TenantID: 7}
+
+	cases := []struct {
+		name   string
+		path   string
+		user   *types.User
+		status int
+	}{
+		{"admin on platform path", "/api/v1/system/admin/list", admin, http.StatusOK},
+		{"admin on docreader reconnect", "/api/v1/system/docreader/reconnect", admin, http.StatusOK},
+		{"admin on business path", "/api/v1/knowledge-bases", admin, http.StatusForbidden},
+		{"plain user on platform path", "/api/v1/system/admin/list", plain, http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodGet, tc.path, nil)
+			c.Request = c.Request.WithContext(context.Background())
+			c.Request.Header.Set("X-Tenant-ID", "7")
+			ok := authenticateJWTUser(c, tenants, members, cfgWithRBAC(true), tc.user, tc.user.TenantID)
+			if ok && rec.Code == http.StatusOK {
+				return
+			}
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d (ok=%v)", rec.Code, tc.status, ok)
+			}
+		})
 	}
 }

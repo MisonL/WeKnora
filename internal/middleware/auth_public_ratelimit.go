@@ -114,14 +114,35 @@ func (l *ipRateLimiter) cleanupLoop() {
 var publicAuthLimiter = newIPRateLimiter(
 	publicAuthRateLimitWindow, publicAuthRateLimitMax)
 
+// refreshRateLimitMax is the budget for /auth/refresh. Refresh is not a
+// credential-guessing surface in the same sense as login: the caller already
+// holds a signed token, so the limiter only bounds abuse. Sharing the login
+// bucket made a busy NAT exhaust the budget for legitimate refresh traffic,
+// and the SPA treats a failed refresh as a logout -- a 429 there logs out
+// every user behind that address. Its own, larger bucket keeps the two
+// independent.
+const refreshRateLimitMax = 120
+
+var refreshAuthLimiter = newIPRateLimiter(publicAuthRateLimitWindow, refreshRateLimitMax)
+
 // PublicAuthRateLimit returns a Gin middleware that rate-limits the
 // unauthenticated share-link endpoints by client IP. 429 is mapped
 // through the project's AppError type so it flows through the same
 // error middleware as the rest of the auth surface.
 func PublicAuthRateLimit() gin.HandlerFunc {
+	return rateLimitWith(publicAuthLimiter)
+}
+
+// RefreshRateLimit bounds /auth/refresh traffic without sharing the login
+// bucket (see refreshRateLimitMax).
+func RefreshRateLimit() gin.HandlerFunc {
+	return rateLimitWith(refreshAuthLimiter)
+}
+
+func rateLimitWith(limiter *ipRateLimiter) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ip := c.ClientIP()
-		if !publicAuthLimiter.allow(ip) {
+		if !limiter.allow(ip) {
 			c.Error(&apperrors.AppError{
 				Code:     apperrors.ErrTooManyRequests,
 				Message:  "too many requests; please retry shortly",

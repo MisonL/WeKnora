@@ -296,6 +296,8 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 
 	// Register index delete handler
 	mux.HandleFunc(types.TypeIndexDelete, params.TagService.ProcessIndexDelete)
+	// Cleanup variant: only touches vectors whose chunk row is already deleted.
+	mux.HandleFunc(types.TypeIndexDeleteIfDeleted, params.TagService.ProcessIndexDelete)
 
 	// Register KB delete handler
 	mux.HandleFunc(types.TypeKBDelete, params.KnowledgeBaseService.ProcessKBDelete)

@@ -372,7 +372,19 @@ func validateOIDCRedirectURI(cfg *config.Config, raw string) error {
 
 	base := frontendBaseURLFor(cfg)
 	if base == "" {
-		return stderrors.New("absolute redirect_uri requires a configured frontend base URL")
+		// Without a configured origin there is nothing to compare against. The
+		// SPA always submits an absolute URL built from window.location.origin,
+		// so refusing here would break OIDC login on every deployment that has
+		// not set FRONTEND_BASE_URL (it was optional before this check). The
+		// IdP's own redirect-URI allow-list is the authoritative gate for an
+		// absolute URL in that case; the relative-path checks above still
+		// apply, and the non-http scheme below is still refused.
+		switch strings.ToLower(target.Scheme) {
+		case "http", "https":
+			return nil
+		default:
+			return stderrors.New("redirect_uri must be an http or https URL")
+		}
 	}
 	baseURL, err := url.Parse(base)
 	if err != nil || baseURL.Host == "" {

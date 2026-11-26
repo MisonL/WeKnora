@@ -1107,7 +1107,8 @@ func matchesKnowledgeBase(
 ) bool {
 	// These cleanup tasks carry snapshots specifically so they can still run
 	// after the KB row has been soft-deleted. Removing them leaks resources.
-	if taskType == types.TypeKBDelete || taskType == types.TypeIndexDelete {
+	if taskType == types.TypeKBDelete || taskType == types.TypeIndexDelete ||
+		taskType == types.TypeIndexDeleteIfDeleted {
 		return false
 	}
 	var probe runtimeTaskPayloadProbe

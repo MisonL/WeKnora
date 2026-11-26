@@ -164,7 +164,7 @@ func TestDeleteReplacedFAQChunksHandsOverRowsDeletedBeforeAFailedBatch(t *testin
 		"the rows already deleted by an earlier batch have no other recovery path")
 	var taskIDs [][]string
 	for _, task := range enqueuer.tasks {
-		require.Equal(t, types.TypeIndexDelete, task.Type())
+		require.Equal(t, types.TypeIndexDeleteIfDeleted, task.Type())
 		var payload types.IndexDeletePayload
 		require.NoError(t, json.Unmarshal(task.Payload(), &payload))
 		require.True(t, payload.OnlyIfDeleted, "only rows that are actually soft-deleted may lose their vectors")

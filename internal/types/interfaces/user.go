@@ -155,8 +155,11 @@ type UserRepository interface {
 	UpdateUserPasswordHash(ctx context.Context, userID, passwordHash string) error
 	// UpdateUserSystemAdmin writes only is_system_admin.
 	UpdateUserSystemAdmin(ctx context.Context, userID string, isSystemAdmin bool) error
-	// UpdateUserOIDCIdentity writes only oidc_issuer / oidc_subject.
-	UpdateUserOIDCIdentity(ctx context.Context, userID, issuer, subject string) error
+	// UpdateUserOIDCIdentity writes only oidc_issuer / oidc_subject, and only
+	// while the row is still unbound (or already carries this exact identity).
+	// The boolean reports whether this call performed the transition; false
+	// means another request bound the account to a different identity first.
+	UpdateUserOIDCIdentity(ctx context.Context, userID, issuer, subject string) (bool, error)
 	// SetUserActive atomically changes status and revokes sessions on disable,
 	// preserving at least one active system administrator.
 	SetUserActive(ctx context.Context, userID, actorID string, active bool) (*types.User, error)

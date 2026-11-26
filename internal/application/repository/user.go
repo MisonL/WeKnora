@@ -229,17 +229,27 @@ func (r *userRepository) UpdateUserSystemAdmin(
 		}).Error
 }
 
-// UpdateUserOIDCIdentity writes only the OIDC binding columns.
+// UpdateUserOIDCIdentity writes only the OIDC binding columns, and only for a
+// row that is still unbound or already carries this exact identity: two
+// requests that both saw an unbound snapshot must not take turns overwriting
+// each other's binding. The boolean reports whether this call won that
+// transition.
 func (r *userRepository) UpdateUserOIDCIdentity(
 	ctx context.Context, userID, issuer, subject string,
-) error {
-	return r.db.WithContext(ctx).Model(&types.User{}).
+) (bool, error) {
+	res := r.db.WithContext(ctx).Model(&types.User{}).
 		Where("id = ?", userID).
+		Where(`(oidc_issuer IS NULL AND oidc_subject IS NULL) OR (oidc_issuer = ? AND oidc_subject = ?)`,
+			issuer, subject).
 		Updates(map[string]interface{}{
 			"oidc_issuer":  issuer,
 			"oidc_subject": subject,
 			"updated_at":   time.Now(),
-		}).Error
+		})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
 }
 
 // DeleteUser deletes a user
